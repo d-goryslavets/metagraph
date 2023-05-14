@@ -1398,8 +1398,7 @@ void QueryExecutor::query_reads(const std::string &file,
             // std::ignore = callback;
             // use AnnotatedDBG::get_overlapping_reads
 
-            // should it be like that?
-            auto result = anno_graph_.get_overlapping_reads(sequence.sequence, config_.auto_labels);
+            auto result = anno_graph_.get_overlapping_reads(sequence.sequence, !config_.label_based);
             std::string query_seq_copy = sequence.sequence;
             SeqSearchResult search_result(std::move(sequence), std::move(result));
             

@@ -688,7 +688,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, bool a
     result.reserve(rows.size());
 
     if (auto_labels) {
-        /* to be implemented*/
+        /* to be improved*/
         auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows);
 
         // since traces don't have unique labels, the index will be added as suffix to the label
