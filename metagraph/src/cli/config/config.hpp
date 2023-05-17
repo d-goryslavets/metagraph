@@ -155,6 +155,7 @@ class Config {
     std::vector<std::string> infbase_annotators;
     std::string outfbase;
     std::string infbase;
+    std::string manifest_file;
     std::string rename_instructions_file;
     std::string refpath;
     std::string suffix;

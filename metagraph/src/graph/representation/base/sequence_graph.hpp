@@ -2,6 +2,7 @@
 #define __SEQUENCE_GRAPH_HPP__
 
 #include <vector>
+#include <unordered_set>
 #include <string>
 #include <functional>
 #include <iostream>

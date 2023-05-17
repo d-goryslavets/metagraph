@@ -1398,11 +1398,41 @@ void QueryExecutor::query_reads(const std::string &file,
             // std::ignore = callback;
             // use AnnotatedDBG::get_overlapping_reads
 
-            auto result = anno_graph_.get_overlapping_reads(sequence.sequence, !config_.label_based);
-            std::string query_seq_copy = sequence.sequence;
-            SeqSearchResult search_result(std::move(sequence), std::move(result));
+            std::unordered_set<std::string> labels_of_reads_to_extract;
+
+            if (!config_.manifest_file.empty()) {
+
+                std::ifstream instream(config_.manifest_file);
+                if (!instream.is_open()) {
+                    logger->error("Cannot open manifest file '{}'", config_.manifest_file);
+                    exit(1);
+                }
+
+                std::string manifest_line;
+                while (std::getline(instream, manifest_line)) {
+                    labels_of_reads_to_extract.insert(manifest_line);
+                }
+                instream.close();
+
+                auto result = anno_graph_.get_overlapping_reads(sequence.sequence, labels_of_reads_to_extract, !config_.label_based);
+                std::string query_seq_copy = sequence.sequence;
+                SeqSearchResult search_result(std::move(sequence), std::move(result));
+
+                callback(query_seq_copy, search_result);
+            } else {
+
+                auto result = anno_graph_.get_overlapping_reads(sequence.sequence, labels_of_reads_to_extract, !config_.label_based);
+                std::string query_seq_copy = sequence.sequence;
+                SeqSearchResult search_result(std::move(sequence), std::move(result));
+
+                callback(query_seq_copy, search_result);
+            }
+
+            // auto result = anno_graph_.get_overlapping_reads(sequence.sequence, !config_.label_based);
+            // std::string query_seq_copy = sequence.sequence;
+            // SeqSearchResult search_result(std::move(sequence), std::move(result));
             
-            callback(query_seq_copy, search_result);
+            // callback(query_seq_copy, search_result);
 
         }, QuerySequence { seq_count++, std::string(kseq.name.s), std::string(kseq.seq.s) });
     }
