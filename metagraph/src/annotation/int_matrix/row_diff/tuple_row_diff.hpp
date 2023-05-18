@@ -31,10 +31,12 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     static_assert(std::is_convertible<BaseMatrix*, MultiIntMatrix*>::value);
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
-    TupleRowDiff() {}
+    // silly fix to prevent out of memory
+    static const uint64_t MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS = 10'000;
 
-    TupleRowDiff(const graph::DBGSuccinct *graph, BaseMatrix&& diff)
-        : diffs_(std::move(diff)) { graph_ = graph; }
+    template <typename... Args>
+    TupleRowDiff(const graph::DBGSuccinct *graph = nullptr, Args&&... args)
+        : diffs_(std::forward<Args>(args)...) { graph_ = graph; }
 
     bool get(Row i, Column j) const override;
     std::vector<Row> get_column(Column j) const override;
@@ -343,6 +345,14 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
 
     for (size_t j = 0; j < i.size(); ++j) {
         auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, initial_labels[j]);
+
+        if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+            rows_annotations.clear();
+            rd_ids.clear();
+            node_to_rd.clear();
+            rd_rows.clear();
+        }
+
         result.push_back(curr_res);
     }
 
@@ -377,6 +387,14 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
     for (size_t j = 0; j < i.size(); ++j) {
         std::unordered_set<uint64_t> labels_of_interest = manifest_labels[j];
         auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, labels_of_interest);
+
+        if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+            rows_annotations.clear();
+            rd_ids.clear();
+            node_to_rd.clear();
+            rd_rows.clear();
+        }
+
         result.push_back(curr_res);
     }
 
@@ -483,6 +501,14 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
             if (!rows_annotations.count(next_to_anno)) {
                 next_annotations = get_row_tuples(next_to_anno, rd_ids, node_to_rd, rd_rows,
                 rows_annotations, boss, rd_succ);
+
+                if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+                    rows_annotations.clear();
+                    rd_ids.clear();
+                    node_to_rd.clear();
+                    rd_rows.clear();
+                }
+
             } else {
                 // if we already decompressed the annotations for this node
                 // simply retrieve them from the map
@@ -576,6 +602,14 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
             if (!rows_annotations.count(previous_to_anno)) {
                 previous_annotations = get_row_tuples(previous_to_anno, rd_ids, node_to_rd, rd_rows,
                 rows_annotations, boss, rd_succ);
+
+                if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+                    rows_annotations.clear();
+                    rd_ids.clear();
+                    node_to_rd.clear();
+                    rd_rows.clear();
+                }
+
             } else {
                 previous_annotations = rows_annotations[previous_to_anno];
             }
