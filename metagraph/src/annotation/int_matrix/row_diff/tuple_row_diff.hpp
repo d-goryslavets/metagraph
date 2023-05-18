@@ -65,8 +65,14 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows, std::unordered_map<Column, std::vector<Row>> &reconstructed_reads) const;
 
     std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> get_traces_with_row_auto_labels(std::vector<Row> i) const;
+    // std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_auto_labels(Row i, std::unordered_map<Row, RowTuples> &rows_annotations,
+    // std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows) const;
+
+    std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> get_traces_with_row_auto_labels(std::vector<Row> i, std::vector<std::unordered_set<uint64_t>> manifest_labels) const;
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_auto_labels(Row i, std::unordered_map<Row, RowTuples> &rows_annotations, 
-    std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows) const;
+    std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest) const;
+
+    std::vector<std::unordered_set<uint64_t>> get_labels_of_rows(std::vector<Row> i) const;
     
 
     uint64_t num_columns() const override { return diffs_.num_columns(); }
@@ -270,6 +276,22 @@ void TupleRowDiff<BaseMatrix>::add_diff(const RowTuples &diff, RowTuples *row) {
 }
 
 template <class BaseMatrix>
+std::vector<std::unordered_set<uint64_t>> TupleRowDiff<BaseMatrix>
+::get_labels_of_rows(std::vector<Row> i) const {
+    std::vector<std::unordered_set<uint64_t>> result;
+    auto row_tuples = get_row_tuples(i);
+
+    for (auto &rowt : row_tuples) {
+        std::unordered_set<uint64_t> labels_set;
+        for (auto &[j, tuple] : rowt)
+            labels_set.insert(j);
+        result.push_back(labels_set);
+    }
+
+    return result;
+}
+
+template <class BaseMatrix>
 std::pair<std::unordered_map<MultiIntMatrix::Column, std::vector<MultiIntMatrix::Row>>, std::vector<std::vector<std::pair<MultiIntMatrix::Column, uint64_t>>>> TupleRowDiff<BaseMatrix>
 ::get_traces_with_row(std::vector<Row> i) const {
     assert(graph_ && "graph must be loaded");
@@ -317,8 +339,44 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
 
     std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> result;
 
-    for (Row &row_i : i) {
-        auto curr_res = get_traces_with_row_auto_labels(row_i, rows_annotations, rd_ids, node_to_rd, rd_rows);
+    auto initial_labels = get_labels_of_rows(i);
+
+    for (size_t j = 0; j < i.size(); ++j) {
+        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, initial_labels[j]);
+        result.push_back(curr_res);
+    }
+
+    // for (Row &row_i : i) {
+    //     auto curr_res = get_traces_with_row_auto_labels(row_i, rows_annotations, rd_ids, node_to_rd, rd_rows, {});
+    //     result.push_back(curr_res);
+    // }
+
+    return result;
+}
+
+template <class BaseMatrix>
+std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column, uint64_t>>> TupleRowDiff<BaseMatrix>
+::get_traces_with_row_auto_labels(std::vector<Row> i, std::vector<std::unordered_set<uint64_t>> manifest_labels) const {
+    assert(graph_ && "graph must be loaded");
+    assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
+    assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
+
+    // a map that stores decompressed annotations for the rows
+    std::unordered_map<Row, RowTuples> rows_annotations;
+
+    // diff rows annotating nodes along the row-diff paths
+    std::vector<Row> rd_ids;
+    // map row index to its index in |rd_rows|
+    VectorMap<Row, size_t> node_to_rd;
+
+    std::vector<RowTuples> rd_rows;
+    std::unordered_map<Column, std::vector<Row>> reconstructed_reads;
+
+    std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> result;
+
+    for (size_t j = 0; j < i.size(); ++j) {
+        std::unordered_set<uint64_t> labels_of_interest = manifest_labels[j];
+        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, labels_of_interest);
         result.push_back(curr_res);
     }
 
@@ -348,7 +406,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
 template <class BaseMatrix>
 std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
 ::get_traces_with_row_auto_labels(Row i, std::unordered_map<Row, RowTuples> &rows_annotations, std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, 
-std::vector<RowTuples> &rd_rows) const {
+std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest) const {
     assert(graph_ && "graph must be loaded");
     assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
@@ -374,12 +432,15 @@ std::vector<RowTuples> &rd_rows) const {
 
     // collect the coordinates of the start node in two structures
     for (auto &[j, tuple] : input_row_tuples) {
+        if (!labels_of_interest.count(j))
+            continue;
+
         for (uint64_t &c : tuple) {
-            // used to check if the graph has to be traversed more
+            // is used to check if the graph has to be traversed more
             // based on the coordinates shift
             coordinates_to_check_if_traverse_more[j].insert(c);
 
-            // used to collect all visited nodes and tracec the result paths
+            // is used to collect all visited nodes and trace the result paths
             reconstucted_paths[j][c] = i;
         }
     }
@@ -396,6 +457,9 @@ std::vector<RowTuples> &rd_rows) const {
 
         // collect visited node's coordinates into path reconstruction map
         for (auto & [j_cur_par, tuple_cur_par] : rows_annotations[current_parent]) {
+            if (!labels_of_interest.count(j_cur_par))
+                continue;
+
             for (uint64_t &c_cur_par : tuple_cur_par) {
                 reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
             }
@@ -428,6 +492,9 @@ std::vector<RowTuples> &rd_rows) const {
             // collect all coordinates of the next node for each label separately
             std::unordered_map<Column, std::set<uint64_t>> coordinates_of_the_next_node;
             for (auto & [j_next, tuple_next] : next_annotations) {
+                if (!labels_of_interest.count(j_next))
+                    continue;
+
                 for (uint64_t &c_next : tuple_next) {
                     coordinates_of_the_next_node[j_next].insert(c_next);
                 }
@@ -475,6 +542,9 @@ std::vector<RowTuples> &rd_rows) const {
 
     // and start with the coordinates of the input node
     for (auto &[j, tuple] : input_row_tuples) {
+        if (!labels_of_interest.count(j))
+            continue;
+
         for (uint64_t &c : tuple) {
             coordinates_to_check_if_traverse_more[j].insert(c);
         }
@@ -485,6 +555,9 @@ std::vector<RowTuples> &rd_rows) const {
         to_visit.pop_back();
 
         for (auto & [j_cur_child, tuple_cur_child] : rows_annotations[current_child]) {
+            if (!labels_of_interest.count(j_cur_child))
+                continue;
+
             for (uint64_t &c_cur_child : tuple_cur_child) {
                 reconstucted_paths[j_cur_child][c_cur_child] = current_child;
             }
@@ -509,6 +582,9 @@ std::vector<RowTuples> &rd_rows) const {
 
             std::unordered_map<Column, std::set<uint64_t>> coordinates_of_the_prev_node;
             for (auto &[j_prev, tuple_prev] : previous_annotations) {
+                if (!labels_of_interest.count(j_prev))
+                    continue;
+
                 for (uint64_t &c_prev : tuple_prev)
                     coordinates_of_the_prev_node[j_prev].insert(c_prev);
             }

@@ -5,6 +5,7 @@
 
 #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
 #include "annotation/int_matrix/base/int_matrix.hpp"
+#include "annotation/binary_matrix/multi_brwt/brwt.hpp"
 #include "graph/representation/canonical_dbg.hpp"
 #include "common/utils/simd_utils.hpp"
 #include "common/aligned_vector.hpp"
@@ -25,6 +26,7 @@ using mtg::annot::matrix::MultiIntMatrix;
 using mtg::annot::matrix::TupleRowDiff;
 using mtg::annot::matrix::TupleCSCMatrix;
 using mtg::annot::binmat::ColumnMajor;
+using mtg::annot::binmat::BRWT;
 
 typedef AnnotatedDBG::Label Label;
 typedef std::pair<Label, size_t> StringCountPair;
@@ -679,8 +681,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
     }
 
     const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
-
-    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<binmat::BRWT>> *>(&annotator_->get_matrix());
+    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
     if (!tuple_row_diff) {
         logger->error("k-mer coordinates are not indexed in this annotator");
         exit(1);
@@ -693,7 +694,10 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
         /* to be improved*/
 
         if (manifest_labels.empty()) {
+
+            logger->trace("Extracting reads...");
             auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows);
+            logger->trace("Spelling paths...");
 
             for (size_t i = 0; i < traces.size(); ++i) {
                 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> row_result;
@@ -712,24 +716,37 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
                 result.push_back(row_result);
             }
         } else {
-            auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows);
+            std::vector<std::unordered_set<uint64_t>> initial_labels = tuple_row_diff->get_labels_of_rows(rows);
+            std::vector<std::unordered_set<uint64_t>> acceptable_initial_labels;
 
-            for (size_t i = 0; i < traces.size(); ++i) {
-                std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> row_result;
-                for (auto & [row_trace, j, input_start_pos_in_ref] : traces[i]) {
-                    Label label = annotator_->get_label_encoder().decode(j);
+            for (auto & labels_set : initial_labels) {
+                std::unordered_set<uint64_t> acceptable_labels_set;
+
+                for (auto & encoded_lab : labels_set) {
+                    Label label = annotator_->get_label_encoder().decode(encoded_lab);
 
                     bool label_is_present_in_the_manifest = false;
-
                     for (const std::string &manifest_sublabel : manifest_labels) {
-                        if (label.find(manifest_sublabel) != std::string::npos) {
+                        if (label.find(manifest_sublabel) != std::string::npos && !manifest_sublabel.empty()) {
                             label_is_present_in_the_manifest = true;
                             break;
                         }
                     }
 
-                    if (!label_is_present_in_the_manifest)
-                        continue;
+                    if (label_is_present_in_the_manifest)
+                        acceptable_labels_set.insert(encoded_lab);
+                }
+                acceptable_initial_labels.push_back(acceptable_labels_set);
+            }
+
+            logger->trace("Extracting reads...");
+            auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows, acceptable_initial_labels);
+            logger->trace("Spelling paths...");
+
+            for (size_t i = 0; i < traces.size(); ++i) {
+                std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> row_result;
+                for (auto & [row_trace, j, input_start_pos_in_ref] : traces[i]) {
+                    Label label = annotator_->get_label_encoder().decode(j);
 
                     std::vector<node_index> trace_to_graph_index;
                     trace_to_graph_index.reserve(row_trace.size());
