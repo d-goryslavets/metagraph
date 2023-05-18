@@ -44,7 +44,7 @@ class Config {
     bool query_counts = false;
     bool query_coords = false;
     bool query_reads = false;
-    bool auto_labels = false;
+    bool label_based = false;
     bool verbose_output = false;
     bool filter_present = false;
     bool dump_text_anno = false;
@@ -156,6 +156,7 @@ class Config {
     std::vector<std::string> infbase_annotators;
     std::string outfbase;
     std::string infbase;
+    std::string manifest_file;
     std::string rename_instructions_file;
     std::string refpath;
     std::string suffix;
