@@ -32,7 +32,7 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     // silly fix to prevent out of memory
-    static const uint64_t MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS = 10'000;
+    static const size_t MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS = 1'000;
 
     template <typename... Args>
     TupleRowDiff(const graph::DBGSuccinct *graph = nullptr, Args&&... args)
@@ -346,7 +346,7 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
     for (size_t j = 0; j < i.size(); ++j) {
         auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, initial_labels[j]);
 
-        if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+        if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
             rows_annotations.clear();
             rd_ids.clear();
             node_to_rd.clear();
@@ -388,7 +388,7 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
         std::unordered_set<uint64_t> labels_of_interest = manifest_labels[j];
         auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, labels_of_interest);
 
-        if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+        if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
             rows_annotations.clear();
             rd_ids.clear();
             node_to_rd.clear();
@@ -473,13 +473,34 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
         Row current_parent = to_visit.back();
         to_visit.pop_back();
 
-        // collect visited node's coordinates into path reconstruction map
-        for (auto & [j_cur_par, tuple_cur_par] : rows_annotations[current_parent]) {
-            if (!labels_of_interest.count(j_cur_par))
-                continue;
+        if (rows_annotations.count(current_parent)) {
+            // collect visited node's coordinates into path reconstruction map
+            for (auto & [j_cur_par, tuple_cur_par] : rows_annotations[current_parent]) {
+                if (!labels_of_interest.count(j_cur_par))
+                    continue;
 
-            for (uint64_t &c_cur_par : tuple_cur_par) {
-                reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
+                for (uint64_t &c_cur_par : tuple_cur_par) {
+                    reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
+                }
+            }
+        } else {
+            RowTuples current_parent_annot = get_row_tuples(current_parent, rd_ids, node_to_rd, rd_rows,
+            rows_annotations, boss, rd_succ);
+
+            for (auto & [j_cur_par, tuple_cur_par] : current_parent_annot) {
+                if (!labels_of_interest.count(j_cur_par))
+                    continue;
+
+                for (uint64_t &c_cur_par : tuple_cur_par) {
+                    reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
+                }
+            }
+
+            if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
+                rows_annotations.clear();
+                rd_ids.clear();
+                node_to_rd.clear();
+                rd_rows.clear();
             }
         }
 
@@ -502,7 +523,7 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
                 next_annotations = get_row_tuples(next_to_anno, rd_ids, node_to_rd, rd_rows,
                 rows_annotations, boss, rd_succ);
 
-                if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+                if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
                     rows_annotations.clear();
                     rd_ids.clear();
                     node_to_rd.clear();
@@ -580,12 +601,33 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
         Row current_child = to_visit.back();
         to_visit.pop_back();
 
-        for (auto & [j_cur_child, tuple_cur_child] : rows_annotations[current_child]) {
-            if (!labels_of_interest.count(j_cur_child))
-                continue;
+        if (rows_annotations.count(current_child)) {
+            for (auto & [j_cur_child, tuple_cur_child] : rows_annotations[current_child]) {
+                if (!labels_of_interest.count(j_cur_child))
+                    continue;
 
-            for (uint64_t &c_cur_child : tuple_cur_child) {
-                reconstucted_paths[j_cur_child][c_cur_child] = current_child;
+                for (uint64_t &c_cur_child : tuple_cur_child) {
+                    reconstucted_paths[j_cur_child][c_cur_child] = current_child;
+                }
+            }
+        } else {
+            RowTuples current_child_annot = get_row_tuples(current_child, rd_ids, node_to_rd, rd_rows,
+            rows_annotations, boss, rd_succ);
+
+            for (auto & [j_cur_child, tuple_cur_child] : current_child_annot) {
+                if (!labels_of_interest.count(j_cur_child))
+                    continue;
+
+                for (uint64_t &c_cur_par : tuple_cur_child) {
+                    reconstucted_paths[j_cur_child][c_cur_par] = current_child;
+                }
+            }
+
+            if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
+                rows_annotations.clear();
+                rd_ids.clear();
+                node_to_rd.clear();
+                rd_rows.clear();
             }
         }
 
@@ -603,7 +645,7 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
                 previous_annotations = get_row_tuples(previous_to_anno, rd_ids, node_to_rd, rd_rows,
                 rows_annotations, boss, rd_succ);
 
-                if (rows_annotations.size() >= MAX_VERTICES_WITH_DECOMPRESSED_ANNOTATIONS) {
+                if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
                     rows_annotations.clear();
                     rd_ids.clear();
                     node_to_rd.clear();
