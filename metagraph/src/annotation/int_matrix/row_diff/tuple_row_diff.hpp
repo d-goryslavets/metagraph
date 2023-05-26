@@ -6,6 +6,8 @@
 #include <cassert>
 #include <string>
 #include <vector>
+#include <queue>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -32,6 +34,9 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     static const size_t MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS = 1'000;
+
+    // check graph traversal in batches
+    static const uint64_t TRAVERSAL_BATCH_SIZE = 1'000;
 
     TupleRowDiff() {}
 
@@ -413,24 +418,20 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
     assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
 
-    const graph::boss::BOSS &boss = graph_->get_boss();
-    const bit_vector &rd_succ = fork_succ_.size() ? fork_succ_ : boss.get_last();
+    std::ignore = rows_annotations;
+    std::ignore = rd_ids;
+    std::ignore = rd_rows;
+    std::ignore = node_to_rd;
+
+    // const graph::boss::BOSS &boss = graph_->get_boss();
+    // const bit_vector &rd_succ = fork_succ_.size() ? fork_succ_ : boss.get_last();
 
     std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths;
-
-    // each label corresponds to a sample which can contain multiple reads
     std::unordered_map<Column, std::set<uint64_t>> coordinates_to_check_if_traverse_more;
 
-    RowTuples input_row_tuples;
+    mtg::common::logger->trace("Getting annotations of starts node");
 
-    if (!rows_annotations.count(i)) {
-        input_row_tuples = get_row_tuples(i, rd_ids, node_to_rd, rd_rows,
-        rows_annotations, boss, rd_succ);
-    } else {
-        // if we already decompressed the annotations for this node
-        // then simply retrieve them from the map
-        input_row_tuples = rows_annotations[i];
-    }
+    RowTuples input_row_tuples = get_row_tuples(i);
 
     // collect the coordinates of the start node in two structures
     for (auto &[j, tuple] : input_row_tuples) {
@@ -447,238 +448,544 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
         }
     }
 
+    std::unordered_map<Column, std::set<uint64_t>> ends_of_reads;
+
+    mtg::common::logger->trace("Getting initial ends of reads");
+
+    for (auto & [j, coords] : reconstucted_paths) {
+        auto node_1 = graph::AnnotatedSequenceGraph::anno_to_graph_index(coords.begin()->second);
+        auto coord_1 = coords.begin()->first;
+        for (auto iter_map = std::next(coords.begin()); iter_map != coords.end(); ++iter_map) {
+            auto node_2 = graph::AnnotatedSequenceGraph::anno_to_graph_index(iter_map->second);
+            auto coord_2 = iter_map->first;
+
+            // check if an edge exists between the current and next node
+            bool edge_exists = false;
+            graph_->adjacent_outgoing_nodes(node_1, [&](auto adj_outg_node) {
+                if (adj_outg_node == node_2) {
+                    edge_exists = true;
+                    return;
+                }
+            });
+
+            // if edge does not exist, then this is the end of the read
+            if (!((coord_2 == (coord_1 + SHIFT)) && edge_exists)) {
+                ends_of_reads[j].insert(coord_1);
+            }
+
+            node_1 = node_2;
+            coord_1 = coord_2;           
+        }
+
+        ends_of_reads[j].insert(coord_1);
+    }
+
+
+    // std::cout << "Starting DFS forwards\n";
+
     // stack for the DFS traversal
     // (std::vector is used because it has to be cleared after forward traversal)
-    std::vector<Row> to_visit;
+    // std::queue<Row> to_visit;
+    // to_visit.push(i);
+    std::deque<Row> to_visit;
     to_visit.push_back(i);
 
-    while (!to_visit.empty()) {
-        // pick a node from the stack
-        Row current_parent = to_visit.back();
-        to_visit.pop_back();
+    std::unordered_set<Row> visited_nodes_forward;
+    uint64_t batches_count = 0;
 
-        if (rows_annotations.count(current_parent)) {
-            // collect visited node's coordinates into path reconstruction map
-            for (auto & [j_cur_par, tuple_cur_par] : rows_annotations[current_parent]) {
-                if (!labels_of_interest.count(j_cur_par))
-                    continue;
+    std::unordered_map<Column, std::set<uint64_t>> all_discovered_coordinates;
 
-                for (uint64_t &c_cur_par : tuple_cur_par) {
-                    reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
-                }
-            }
-        } else {
-            RowTuples current_parent_annot = get_row_tuples(current_parent, rd_ids, node_to_rd, rd_rows,
-            rows_annotations, boss, rd_succ);
+    mtg::common::logger->trace("Traversing graph forwards");
 
-            for (auto & [j_cur_par, tuple_cur_par] : current_parent_annot) {
-                if (!labels_of_interest.count(j_cur_par))
-                    continue;
+    while (true) {
+        uint64_t traversed_nodes_count = 0;
 
-                for (uint64_t &c_cur_par : tuple_cur_par) {
-                    reconstucted_paths[j_cur_par][c_cur_par] = current_parent;
-                }
-            }
+        // set of rows in the current batch to decompresse the annotations for
+        std::unordered_set<Row> batch_of_rows_set;
 
-            if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
-                rows_annotations.clear();
-                rd_ids.clear();
-                node_to_rd.clear();
-                rd_rows.clear();
+        // std::cout << "Starting traversing batch " << batches_count << '\n';
+        // std::cout << "to_visit.size() = " << to_visit.size() << '\n';
+
+        while (!to_visit.empty()) {
+            // Row current_parent = to_visit.front();
+            // to_visit.pop();
+            Row current_parent = to_visit.front();
+            to_visit.pop_front();
+
+            if (visited_nodes_forward.count(current_parent))
+                continue;
+            
+            batch_of_rows_set.insert(current_parent);
+            traversed_nodes_count++;
+
+            graph::AnnotatedSequenceGraph::node_index current_parent_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_parent);
+
+            graph_->call_outgoing_kmers(current_parent_to_graph, [&](auto next, char c) {
+                if (c == graph::boss::BOSS::kSentinel)
+                    return;
+                // add adjacent outgoing nodes to the stack for further traversal
+                Row next_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
+                // to_visit.push(next_to_anno);
+                to_visit.push_back(next_to_anno);
+            } );
+
+
+            visited_nodes_forward.insert(current_parent);
+
+            // if we reached the batch size then stop the current batch traversal
+            if (traversed_nodes_count >= TRAVERSAL_BATCH_SIZE) {
+                break;
             }
         }
 
-        graph::AnnotatedSequenceGraph::node_index current_parent_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_parent);
+        batches_count++;        
 
-        // sets of increased coordinates found in the adj. outgoing nodes
-        std::unordered_map<Column, std::set<uint64_t>> sets_to_update_cur_coords_with;
-        
-        // for each adjacent outgoing k-mer 
-        graph_->call_outgoing_kmers(current_parent_to_graph, [&](auto next, char c) {
-            if (c == graph::boss::BOSS::kSentinel)
-                return;
-            
-            Row next_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
-            RowTuples next_annotations;
+        // convert a set of visited rows to vector
+        std::vector<Row> batch_of_rows;
+        batch_of_rows.reserve(batch_of_rows_set.size());
+        batch_of_rows.insert(batch_of_rows.end(),
+        batch_of_rows_set.begin(), batch_of_rows_set.end());
 
-            // if the annotations for the child node are not decompressed,
-            // build rd-path and decompress them manunally
-            if (!rows_annotations.count(next_to_anno)) {
-                next_annotations = get_row_tuples(next_to_anno, rd_ids, node_to_rd, rd_rows,
-                rows_annotations, boss, rd_succ);
+        // std::cout << "batch size = " << batch_of_rows.size() << '\n';
 
-                if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
-                    rows_annotations.clear();
-                    rd_ids.clear();
-                    node_to_rd.clear();
-                    rd_rows.clear();
-                }
+        // std::cout << "Getting annotations for rows in a batch" << '\n';
 
-            } else {
-                // if we already decompressed the annotations for this node
-                // simply retrieve them from the map
-                next_annotations = rows_annotations[next_to_anno];
-            }
-            
-            // collect all coordinates of the next node for each label separately
-            std::unordered_map<Column, std::set<uint64_t>> coordinates_of_the_next_node;
-            for (auto & [j_next, tuple_next] : next_annotations) {
+        // decompress the annotations for the current batch of nodes
+        std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
+
+        // new coordinates discovered in the current batch of nodes
+        // std::unordered_map<Column, std::set<uint64_t>> new_coordinates_batch;
+
+        // std::cout << "Collecting discovered coordinates" << '\n';
+        // collect all new discovered coordinates
+        for (size_t qqq = 0; qqq < batch_of_rows.size(); ++qqq) {
+            for (auto & [j_next, tuple_next] : batch_annotations[qqq]) {
                 if (!labels_of_interest.count(j_next))
                     continue;
 
                 for (uint64_t &c_next : tuple_next) {
-                    coordinates_of_the_next_node[j_next].insert(c_next);
+                    // new_coordinates_batch[j_next].insert(c_next);
+                    all_discovered_coordinates[j_next].insert(c_next);
+                    reconstucted_paths[j_next][c_next] = batch_of_rows[qqq];
                 }
-            }
-
-            // collect those coordinates that are increased by SHIFT value
-            // with respect to the current coordinates set
-            std::unordered_map<Column, std::set<uint64_t>> coordinates_to_check_if_traverse_more_updated;
-            for (auto & [j_all, c_all] : coordinates_to_check_if_traverse_more) {
-                for (const uint64_t &c_all_one : c_all) {
-                    if (coordinates_of_the_next_node[j_all].count(c_all_one + SHIFT)) {
-                        coordinates_to_check_if_traverse_more_updated[j_all].insert(c_all_one + SHIFT);
-                    }
-                }
-            }
-
-            // if there is at least one shifted coordinate then the next node is acceptable to be
-            // added to the stack and traversed later
-            if (!coordinates_to_check_if_traverse_more_updated.empty()) {
-                to_visit.push_back(next_to_anno);
-
-                // also, collect the shifted coordinates to update the current coordinates set
-                for (auto & [j_check, cs_check] : coordinates_to_check_if_traverse_more_updated) {
-                    sets_to_update_cur_coords_with[j_check].insert(cs_check.begin(), cs_check.end());
-                }
-            }
-        } );
-
-        // update the current coordinates set with the increased coordinates of the adj. outgoing nodes
-        for (auto & [cur_j_set, cur_set_to_up] : sets_to_update_cur_coords_with) {
-            for (auto & cur_c_to_up : cur_set_to_up) {
-                coordinates_to_check_if_traverse_more[cur_j_set].erase(cur_c_to_up - SHIFT);
-                coordinates_to_check_if_traverse_more[cur_j_set].insert(cur_c_to_up);
             }
         }
+
+        // std::cout << "New coordinates from batch : ";
+        // for (auto & [j_qq, set_qq] : new_coordinates_batch) {
+        //     std::cout << " Column = " << j_qq << "  new coord size = " << set_qq.size() << " ; "; 
+        // }
+        // std::cout << std::endl;
+        
+        // std::cout << "Updating reads ends" << '\n';
+
+        // update reads ends
+        for (auto & [j_end, coords_ends] : ends_of_reads) {
+            for (auto & c_end : coords_ends) {
+                auto c_end_cur = c_end;
+                bool replace_read_end = false;
+
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_end][c_end_cur]);
+                while (all_discovered_coordinates[j_end].count(c_end_cur + SHIFT)) {
+                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_end][c_end_cur + SHIFT]);
+
+                    bool edge_exists = false;
+                    graph_->adjacent_outgoing_nodes(end_node_old, [&](auto adj_outg_node) {
+                        if (adj_outg_node == end_node_new) {
+                            edge_exists = true;
+                            return;
+                        }
+                    });
+
+                    // if edge exists, then read has its continuation => we have to traverse the graph more
+                    if (edge_exists) {
+                        end_node_old = end_node_new;
+                        replace_read_end = true;
+                        c_end_cur += SHIFT;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (replace_read_end) {
+                    ends_of_reads[j_end].erase(c_end);
+                    ends_of_reads[j_end].insert(c_end_cur);
+                }
+            }
+        }
+
+        // check if graph has to be traversed more 
+        // by checking if there are continuations of the reads after the known ends
+
+        // std::cout << "Checking if traverse more" << '\n';
+
+        // std::cout << "Ends of reads size : ";
+        // for (auto & [j_qq, ends_qq] : ends_of_reads) {
+        //     std::cout << " COlumn = " << j_qq << "  ends size = " << ends_qq.size() << " ; ";
+        // }
+        // std::cout << '\n';
+
+        bool has_to_be_traversed_more = false;
+
+        for (auto & [j_end, coords_ends] : ends_of_reads) {
+            for (auto & c_end : coords_ends) {
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_end][c_end]);
+
+                graph_->call_outgoing_kmers(end_node_old, [&](auto adj_outg_node, char c) {
+                    // std::ignore = c;
+                    if (c == graph::boss::BOSS::kSentinel)
+                        return;
+                    
+                    Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
+                    RowTuples outg_annotataions = get_row_tuples(adj_outg_to_anno);
+
+                    std::set<uint64_t> coordinates_of_the_adj_outg_node;
+                    for (auto &[j_next, tuple_next] : outg_annotataions) {
+                        if (!labels_of_interest.count(j_next) || j_next != j_end)
+                            continue;
+
+                        for (uint64_t &c_next : tuple_next)
+                            coordinates_of_the_adj_outg_node.insert(c_next);
+                    }
+
+                    if (coordinates_of_the_adj_outg_node.count(c_end + SHIFT) && !visited_nodes_forward.count(c_end + SHIFT)) {
+                        has_to_be_traversed_more = true;
+                        // reconstucted_paths[j_end][c_end + SHIFT] = adj_outg_to_anno;
+                        to_visit.push_front(adj_outg_to_anno);
+                        return;
+                    }
+                });
+
+                if (has_to_be_traversed_more)
+                    break;
+            }
+
+            if (has_to_be_traversed_more)
+                break;
+        }
+
+        if (!has_to_be_traversed_more)
+            break;  
     }
 
-    // DFS backwards is similar to the DFS forwards
-    to_visit.clear();
-    to_visit.push_back(i);
 
-    // free the current coordinates maps
-    // coordinates_to_check_if_traverse_more.clear();
-    std::unordered_map<Column, std::set<uint64_t>>().swap(coordinates_to_check_if_traverse_more);
+    mtg::common::logger->trace("Traversed batches count {}", batches_count);
 
-    // and start with the coordinates of the input node
+    // std::cout << "Preparing for the backwards traversal" << '\n';
+
+    std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths_backwards;
+    // collect the coordinates of the start node in two structures
     for (auto &[j, tuple] : input_row_tuples) {
         if (!labels_of_interest.count(j))
             continue;
 
         for (uint64_t &c : tuple) {
-            coordinates_to_check_if_traverse_more[j].insert(c);
+            // is used to collect all visited nodes and trace the result paths
+            reconstucted_paths_backwards[j][c] = i;
         }
     }
 
-    while (!to_visit.empty()) {
-        Row current_child = to_visit.back();
-        to_visit.pop_back();
 
-        if (rows_annotations.count(current_child)) {
-            // collect visited node's coordinates into path reconstruction map
-            for (auto & [j_cur_child, tuple_cur_child] : rows_annotations[current_child]) {
-                if (!labels_of_interest.count(j_cur_child))
-                    continue;
+    // std::cout << "Initializing starts of the reads" << '\n';
 
-                for (uint64_t &c_cur_child : tuple_cur_child) {
-                    reconstucted_paths[j_cur_child][c_cur_child] = current_child;
+    mtg::common::logger->trace("Getting initial starts of the reads");
+
+    std::unordered_map<Column, std::set<uint64_t>> starts_of_reads;
+
+
+    for (auto & [j, coords] : reconstucted_paths_backwards) {
+        auto node_1 = graph::AnnotatedSequenceGraph::anno_to_graph_index(coords.rbegin()->second);
+        auto coord_1 = coords.rbegin()->first;
+
+        for (auto iter_map = std::next(coords.rbegin()); iter_map != coords.rend(); ++iter_map) {
+            auto node_2 = graph::AnnotatedSequenceGraph::anno_to_graph_index(iter_map->second);
+            auto coord_2 = iter_map->first;
+
+            // check if an edge exists between the current and next node
+            bool edge_exists = false;
+            graph_->adjacent_incoming_nodes(node_1, [&](auto adj_inc_node) {
+                if (adj_inc_node == node_2) {
+                    edge_exists = true;
+                    return;
                 }
-            }
-        } else {
-            RowTuples current_child_annot = get_row_tuples(current_child, rd_ids, node_to_rd, rd_rows,
-            rows_annotations, boss, rd_succ);
+            });
 
-            for (auto & [j_cur_child, tuple_cur_child] : current_child_annot) {
-                if (!labels_of_interest.count(j_cur_child))
-                    continue;
 
-                for (uint64_t &c_cur_par : tuple_cur_child) {
-                    reconstucted_paths[j_cur_child][c_cur_par] = current_child;
-                }
+            // if edge does not exist, then this is the end of the read
+            if (!((coord_2 == (coord_1 - SHIFT)) && edge_exists)) {
+                starts_of_reads[j].insert(coord_1);
             }
 
-            if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
-                rows_annotations.clear();
-                rd_ids.clear();
-                node_to_rd.clear();
-                rd_rows.clear();
-            }
+            node_1 = node_2;
+            coord_1 = coord_2;           
         }
 
-        graph::AnnotatedSequenceGraph::node_index current_child_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_child);
-        std::unordered_map<Column, std::set<uint64_t>> sets_to_update_cur_coords_with;
+        starts_of_reads[j].insert(coord_1);
+    }
 
-        graph_->call_incoming_kmers(current_child_to_graph, [&](auto previous, char c) {
-            if (c == graph::boss::BOSS::kSentinel)
-                return;
-            
-            Row previous_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(previous);
-            RowTuples previous_annotations;
+    // std::cout << "Starting DFS backwards\n";
 
-            if (!rows_annotations.count(previous_to_anno)) {
-                previous_annotations = get_row_tuples(previous_to_anno, rd_ids, node_to_rd, rd_rows,
-                rows_annotations, boss, rd_succ);
+    // traverse the graph backwards
+    // to_visit = std::queue<Row>();
+    // to_visit.push(i);
+    to_visit = std::deque<Row>();
+    to_visit.push_back(i);
 
-                if (rows_annotations.size() >= MAX_ROWS_WITH_DECOMPRESSED_ANNOTATIONS) {
-                    rows_annotations.clear();
-                    rd_ids.clear();
-                    node_to_rd.clear();
-                    rd_rows.clear();
-                }
+    std::unordered_set<Row> visited_nodes_backward;
+    uint64_t batches_count_backwards = 0;
 
-            } else {
-                previous_annotations = rows_annotations[previous_to_anno];
+    mtg::common::logger->trace("Traversing graph backwards");
+
+    while (true) {
+
+        uint64_t traversed_nodes_count = 0;
+
+        // set of rows in the current batch to decompresse the annotations for
+        std::unordered_set<Row> batch_of_rows_set;
+
+        // std::cout << "Started traversing a new batch " << batches_count_backwards << '\n';
+        // std::cout << "to_visit.size() = " << to_visit.size() << '\n';
+
+        while (!to_visit.empty()) {
+            // Row current_child = to_visit.front();
+            // to_visit.pop();
+            Row current_child = to_visit.front();
+            to_visit.pop_front();
+
+            if (visited_nodes_backward.count(current_child)) {
+                continue;
             }
 
-            std::unordered_map<Column, std::set<uint64_t>> coordinates_of_the_prev_node;
-            for (auto &[j_prev, tuple_prev] : previous_annotations) {
+            batch_of_rows_set.insert(current_child);
+            traversed_nodes_count++;
+
+            graph::AnnotatedSequenceGraph::node_index current_child_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_child);
+
+            graph_->call_incoming_kmers(current_child_to_graph, [&](auto prev, char c) {
+                if (c == graph::boss::BOSS::kSentinel)
+                    return;
+                // add adjacent outgoing nodes to the stack for further traversal
+                Row prev_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(prev);
+                // to_visit.push(prev_to_anno);
+                to_visit.push_back(prev_to_anno);
+            } );
+
+            visited_nodes_backward.insert(current_child);
+
+            if (traversed_nodes_count >= TRAVERSAL_BATCH_SIZE) {
+                break;
+            }
+        }
+        
+
+        batches_count_backwards++;
+
+        // convert a set of visited rows to vector
+        std::vector<Row> batch_of_rows;
+        batch_of_rows.reserve(batch_of_rows_set.size());
+        batch_of_rows.insert(batch_of_rows.end(),
+        batch_of_rows_set.begin(), batch_of_rows_set.end());
+
+        std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
+
+        // std::unordered_map<Column, std::set<uint64_t>> new_coordinates_batch;
+
+
+        // std::cout << "Collecting discovered coordinates" << '\n';
+
+        // collect all new discovered coordinates
+        for (size_t qqq = 0; qqq < batch_of_rows.size(); ++qqq) {
+            for (auto & [j_prev, tuple_prev] : batch_annotations[qqq]) {
                 if (!labels_of_interest.count(j_prev))
                     continue;
 
-                for (uint64_t &c_prev : tuple_prev)
-                    coordinates_of_the_prev_node[j_prev].insert(c_prev);
-            }
-
-            std::unordered_map<Column, std::set<uint64_t>> coordinates_to_check_if_traverse_more_updated;
-            for (auto & [j_all, c_all] : coordinates_to_check_if_traverse_more) {
-                for (const uint64_t &c_all_one : c_all) {
-                    if (c_all_one == 0)
-                        continue;
-
-                    if (coordinates_of_the_prev_node[j_all].count(c_all_one - SHIFT)) {
-                        coordinates_to_check_if_traverse_more_updated[j_all].insert(c_all_one - SHIFT);
-                    }
+                for (uint64_t &c_prev : tuple_prev) {
+                    // new_coordinates_batch[j_prev].insert(c_prev);
+                    all_discovered_coordinates[j_prev].insert(c_prev);
+                    reconstucted_paths[j_prev][c_prev] = batch_of_rows[qqq];
                 }
-            }
-
-            if (!coordinates_to_check_if_traverse_more_updated.empty()) {
-                to_visit.push_back(previous_to_anno);
-                for (auto & [j_check, cs_check] : coordinates_to_check_if_traverse_more_updated) {
-                    sets_to_update_cur_coords_with[j_check].insert(cs_check.begin(), cs_check.end());
-                }
-            }
-        } );
-
-        for (auto & [cur_j_set, cur_set_to_up] : sets_to_update_cur_coords_with) {
-            for (auto & cur_c_to_up : cur_set_to_up) {
-                coordinates_to_check_if_traverse_more[cur_j_set].erase(cur_c_to_up + SHIFT);
-                coordinates_to_check_if_traverse_more[cur_j_set].insert(cur_c_to_up);
             }
         }
+
+        // std::cout << "Discovered coordinates sizes : \n";
+        // for (auto & [qweqwe, qweqweqwe] : new_coordinates_batch) {
+        //     std::cout << " Column = " << qweqwe << " new coord set size() = " << qweqweqwe.size() << '\n';
+        // }
+        // std::cout << '\n';
+
+
+        // std::cout << "Updating reads starts" << '\n';
+
+        // update reads starts
+        for (auto & [j_start, coords_starts] : starts_of_reads) {
+            for (auto & c_start : coords_starts) {
+                if (c_start == 0)
+                    continue;
+                auto c_end_cur = c_start;
+                bool replace_read_end = false;
+
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_start][c_end_cur]);
+                while (all_discovered_coordinates[j_start].count(c_end_cur - SHIFT)) {
+                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_start][c_end_cur - SHIFT]);
+
+                    bool edge_exists = false;
+                    graph_->adjacent_incoming_nodes(end_node_old, [&](auto adj_inc_node) {
+                        if (adj_inc_node == end_node_new) {
+                            edge_exists = true;
+                            return;
+                        }
+                    });
+
+                    // if edge exists, then read has its continuation => we have to traverse the graph more
+                    if (edge_exists) {
+                        end_node_old = end_node_new;
+                        replace_read_end = true;
+                        c_end_cur -= SHIFT;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (replace_read_end) {
+                    starts_of_reads[j_start].erase(c_start);
+                    starts_of_reads[j_start].insert(c_end_cur);
+                }
+            }
+        }
+
+
+        
+        // check if graph has to be traversed more 
+        // by checking if there are continuations of the reads after the known ends
+
+        // std::cout << "Checking if graph has to be traversed more backwards" << '\n';
+
+        bool has_to_be_traversed_more = false;
+        for (auto & [j_end, coords_ends] : starts_of_reads) {
+            for (auto & c_end : coords_ends) {
+                if (c_end == 0)
+                    continue;
+
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_end][c_end]);
+
+                graph_->call_incoming_kmers(end_node_old, [&](auto adj_outg_node, char c) {
+                    // std::ignore = c;
+                    if (c == graph::boss::BOSS::kSentinel)
+                        return;
+                    
+                    Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
+                    RowTuples outg_annotataions = get_row_tuples(adj_outg_to_anno);
+
+                    std::set<uint64_t> coordinates_of_the_adj_outg_node;
+                    for (auto &[j_next, tuple_next] : outg_annotataions) {
+                        if (!labels_of_interest.count(j_next) || j_next != j_end)
+                            continue;
+
+                        for (uint64_t &c_next : tuple_next)
+                            coordinates_of_the_adj_outg_node.insert(c_next);
+                    }
+
+                    if (coordinates_of_the_adj_outg_node.count(c_end - SHIFT) && !visited_nodes_backward.count(c_end - SHIFT)) {
+                        has_to_be_traversed_more = true;
+                        to_visit.push_front(adj_outg_to_anno);
+                        return;
+                    }
+                });
+
+                if (has_to_be_traversed_more)
+                    break;
+            }
+
+            if (has_to_be_traversed_more)
+                break;
+        }
+
+        if (!has_to_be_traversed_more)
+            break;
+
     }
 
+
+    // std::cout << "Reads starts : \n";
+    // for (auto & [j, weqwe] : starts_of_reads) {
+    //     std::cout << "Column = " << j << " : ";
+    //     for (auto & qqq : weqwe) {
+    //         std::cout << qqq << ", ";
+    //     }
+    //     std::cout << '\n';
+    // }
+
+    // std::cout << "Reads ends : \n";
+    // for (auto & [j, weqwe] : ends_of_reads) {
+    //     std::cout << "Column = " << j << " : ";
+    //     for (auto & qqq : weqwe) {
+    //         std::cout << qqq << ", ";
+    //     }
+    //     std::cout << '\n';
+    // }
+
     // reconstruct the paths
+
+    // not sure about that
+    // std::cout << "reads starts and ends: \n";
+    // for (auto & [j_reads, reads_ends] : ends_of_reads) {
+    //     std::cout << "Column = " << j_reads << '\n';
+    //     std::cout << " ends : ";
+    //     for (auto & qwe : reads_ends) {
+    //         std::cout << qwe << ", ";
+    //     }
+    //     std::cout << "\nstarts : ";
+    //     for (auto & qwe : starts_of_reads[j_reads]) {
+    //         std::cout << qwe << ", ";
+    //     }
+    //     std::cout << '\n';
+    //     // assert(reads_ends.size() == starts_of_reads[j_reads].size());
+    // }
+
+    // std::cout << "Explicitly check incoming nodes of the start node : \n";
+
+    // for (auto & [j_qwe, j_starts] : starts_of_reads) {
+    //     std::cout << " Column = " << j_qwe << " : ";
+    //     for (auto & qqqq : j_starts) {
+
+    //         auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstucted_paths[j_qwe][qqqq]);
+
+    //         bool exists_prev = false;
+
+    //         graph_->call_incoming_kmers(end_node_old, [&](auto adj_outg_node, char c) {
+    //             if (c == graph::boss::BOSS::kSentinel)
+    //                 return;
+                
+    //             Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
+    //             RowTuples outg_annotataions = get_row_tuples(adj_outg_to_anno);
+
+    //             std::set<uint64_t> coordinates_of_the_adj_outg_node;
+    //             for (auto &[j_next, tuple_next] : outg_annotataions) {
+    //                 if (!labels_of_interest.count(j_next) || j_next != j_qwe)
+    //                     continue;
+
+    //                 for (uint64_t &c_next : tuple_next)
+    //                     coordinates_of_the_adj_outg_node.insert(c_next);
+    //             }
+                
+    //             if (coordinates_of_the_adj_outg_node.count(qqqq - SHIFT) && !visited_nodes_backward.count(adj_outg_to_anno))
+    //                 exists_prev = true;
+    //         });
+            
+    //         std::cout << "For coord = " << qqqq << " exists prev = " << exists_prev << '\n';
+    //     }
+    // }
+
+    // std::cout << '\n';
+
+
+    mtg::common::logger->trace("Traversed batches backwards {}", batches_count_backwards);
+
+
+    std::cout << "Number of visited nodes forwards = " << visited_nodes_forward.size() << "   ;   backward = " << visited_nodes_backward.size() << '\n';
+
+
+    mtg::common::logger->trace("Reconstructing paths...");
 
     // traces where separate reads don't have distinct labels
     std::unordered_map<Column, std::vector<std::pair<Row, uint64_t>>> traces_unlabeled;
@@ -690,6 +997,32 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
 
     // extract reads from walks which have jumps in coordinates
     std::vector<std::tuple<std::vector<std::pair<Row, uint64_t>>, Column, uint64_t>> result_coords;
+    
+
+    // for (auto & [j_st, coords_st] : starts_of_reads) {
+    //     assert(coords_st.size() == ends_of_reads[j_st].size());
+    //     auto it_start = coords_st.begin();
+    //     auto it_end = ends_of_reads[j_st].begin();
+
+    //     uint64_t cur_read_start_coord = *it_start;
+    //     std::vector<std::pair<Row, uint64_t>> curr_read_trace_coords;
+
+    //     while (it_start != coords_st.end() && it_end != ends_of_reads[j_st].end()) {
+    //         curr_read_trace_coords.clear();
+    //         cur_read_start_coord = *it_start;
+
+    //         for (uint64_t cur_read_coord_ind = cur_read_start_coord; cur_read_coord_ind <= *it_end; ++cur_read_coord_ind) {
+    //             curr_read_trace_coords.push_back(std::make_pair(reconstucted_paths[j_st][cur_read_coord_ind], cur_read_coord_ind));
+    //         }
+
+    //         result_coords.push_back(std::make_tuple(curr_read_trace_coords, j_st, cur_read_start_coord));
+
+    //         it_start++;
+    //         it_end++;
+    //     }
+
+    //     result_coords.push_back(std::make_tuple(curr_read_trace_coords, j_st, cur_read_start_coord));
+    // }
 
     for (auto & [j, trace_with_jumps] : traces_unlabeled) {
         uint64_t curr_read_start_coord = trace_with_jumps.front().second;
