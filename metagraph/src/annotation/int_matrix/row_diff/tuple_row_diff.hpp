@@ -77,7 +77,7 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
 
     std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> get_traces_with_row_auto_labels(std::vector<Row> i, std::vector<std::unordered_set<uint64_t>> manifest_labels) const;
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_auto_labels(Row i, std::unordered_map<Row, RowTuples> &rows_annotations, 
-    std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest) const;
+    std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest, std::unordered_map<Column, std::vector<std::vector<std::pair<Row, uint64_t>>>> &reconstructed_reads) const;
 
     std::vector<std::unordered_set<uint64_t>> get_labels_of_rows(std::vector<Row> i) const;
     
@@ -342,14 +342,14 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
     VectorMap<Row, size_t> node_to_rd;
 
     std::vector<RowTuples> rd_rows;
-    std::unordered_map<Column, std::vector<Row>> reconstructed_reads;
+    std::unordered_map<Column, std::vector<std::vector<std::pair<Row, uint64_t>>>> reconstructed_reads;
 
     std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> result;
 
     auto initial_labels = get_labels_of_rows(i);
 
     for (size_t j = 0; j < i.size(); ++j) {
-        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, initial_labels[j]);
+        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, initial_labels[j], reconstructed_reads);
         result.push_back(curr_res);
     }
 
@@ -377,13 +377,13 @@ std::vector<std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMat
     VectorMap<Row, size_t> node_to_rd;
 
     std::vector<RowTuples> rd_rows;
-    std::unordered_map<Column, std::vector<Row>> reconstructed_reads;
+    std::unordered_map<Column, std::vector<std::vector<std::pair<Row, uint64_t>>>> reconstructed_reads;
 
     std::vector<std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>> result;
 
     for (size_t j = 0; j < i.size(); ++j) {
         std::unordered_set<uint64_t> labels_of_interest = manifest_labels[j];
-        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, labels_of_interest);
+        auto curr_res = get_traces_with_row_auto_labels(i[j], rows_annotations, rd_ids, node_to_rd, rd_rows, labels_of_interest, reconstructed_reads);
         result.push_back(curr_res);
     }
 
@@ -413,7 +413,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
 template <class BaseMatrix>
 std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
 ::get_traces_with_row_auto_labels(Row i, std::unordered_map<Row, RowTuples> &rows_annotations, std::vector<Row> &rd_ids, VectorMap<Row, size_t> &node_to_rd, 
-std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest) const {
+std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest, std::unordered_map<Column, std::vector<std::vector<std::pair<Row, uint64_t>>>> &reconstructed_reads) const {
     assert(graph_ && "graph must be loaded");
     assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
@@ -423,11 +423,16 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
     std::ignore = rd_rows;
     std::ignore = node_to_rd;
 
+    std::vector<std::tuple<std::vector<std::pair<Row, uint64_t>>, Column, uint64_t>> final_result;
+    std::unordered_map<Column, std::set<std::pair<uint64_t, uint64_t>>> already_reconstruced_reads_ends;
+    std::unordered_map<Column, std::unordered_set<uint64_t>> added_reads_before_traversal_start_coordinates;
+
     // const graph::boss::BOSS &boss = graph_->get_boss();
     // const bit_vector &rd_succ = fork_succ_.size() ? fork_succ_ : boss.get_last();
 
     std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths;
-    std::unordered_map<Column, std::set<uint64_t>> coordinates_to_check_if_traverse_more;
+    // std::unordered_map<Column, std::set<uint64_t>> coordinates_to_check_if_traverse_more;
+    std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths_backwards;
 
     mtg::common::logger->trace("Getting annotations of starts node");
 
@@ -439,13 +444,55 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
             continue;
 
         for (uint64_t &c : tuple) {
+
+            bool already_in_the_read = false;
+
+            for (auto & already_reconstruced_read : reconstructed_reads[j]) {
+                uint64_t first_coord_of_read = already_reconstruced_read.front().second;
+                uint64_t last_coord_of_read = already_reconstruced_read.back().second;
+
+                // if current coordinates falls in the already reconstructed read coordinate range
+                if ((c >= first_coord_of_read && c <= last_coord_of_read)) {
+                    already_in_the_read = true;
+
+                    if (!already_reconstruced_reads_ends[j].count(std::make_pair(first_coord_of_read, last_coord_of_read))) {
+                        final_result.push_back(std::make_tuple(already_reconstruced_read, j, c - first_coord_of_read));
+                        already_reconstruced_reads_ends[j].insert(std::make_pair(first_coord_of_read, last_coord_of_read));
+
+                        added_reads_before_traversal_start_coordinates[j].insert(already_reconstruced_read.front().second);
+                    }
+
+                    // if we found the read, no need to iterate more (maybe :))
+                    break;
+                }
+            }
+
+            if (already_in_the_read)
+                continue;
+
             // is used to check if the graph has to be traversed more
             // based on the coordinates shift
-            coordinates_to_check_if_traverse_more[j].insert(c);
+            // upd 26 may we don't need that as the check must 
+            // be performed based on the all discovered coordinates (not the ones from the current batch)
+            // coordinates_to_check_if_traverse_more[j].insert(c);
 
             // is used to collect all visited nodes and trace the result paths
             reconstucted_paths[j][c] = i;
+            reconstucted_paths_backwards[j][c] = i;
         }
+    }
+
+    if (reconstucted_paths.empty()) {
+        std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> final_final_result;
+        for (auto & [read_trace, read_label, cur_pos] : final_result) {
+            std::vector<Row> cur_trace_rows;
+            for (auto & el : read_trace) {
+                cur_trace_rows.push_back(el.first);
+            }
+            final_final_result.push_back(std::make_tuple(cur_trace_rows, read_label, cur_pos));
+        }
+
+        return final_final_result;
     }
 
     std::unordered_map<Column, std::set<uint64_t>> ends_of_reads;
@@ -673,17 +720,18 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
 
     // std::cout << "Preparing for the backwards traversal" << '\n';
 
-    std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths_backwards;
-    // collect the coordinates of the start node in two structures
-    for (auto &[j, tuple] : input_row_tuples) {
-        if (!labels_of_interest.count(j))
-            continue;
+    // do this at the very forward traversal stage
+    // std::unordered_map<Column, std::map<uint64_t, Row>> reconstucted_paths_backwards;
+    // // collect the coordinates of the start node in two structures
+    // for (auto &[j, tuple] : input_row_tuples) {
+    //     if (!labels_of_interest.count(j))
+    //         continue;
 
-        for (uint64_t &c : tuple) {
-            // is used to collect all visited nodes and trace the result paths
-            reconstucted_paths_backwards[j][c] = i;
-        }
-    }
+    //     for (uint64_t &c : tuple) {
+    //         // is used to collect all visited nodes and trace the result paths
+    //         reconstucted_paths_backwards[j][c] = i;
+    //     }
+    // }
 
 
     // std::cout << "Initializing starts of the reads" << '\n';
@@ -1073,11 +1121,12 @@ std::vector<RowTuples> &rd_rows, std::unordered_set<uint64_t> labels_of_interest
     }
 
     // save only reads that contain the input node
-    std::vector<std::tuple<std::vector<std::pair<Row, uint64_t>>, Column, uint64_t>> final_result;
+    // std::vector<std::tuple<std::vector<std::pair<Row, uint64_t>>, Column, uint64_t>> final_result;
     for (auto & [read_trace, read_label, read_start_coord] : result_coords) { 
         for (size_t cur_pos = 0; cur_pos < read_trace.size(); ++cur_pos) {
-            if (read_trace[cur_pos].first == i) {
+            if (read_trace[cur_pos].first == i && !added_reads_before_traversal_start_coordinates[read_label].count(read_trace.front().second)) {
                 final_result.push_back(std::make_tuple(read_trace, read_label, cur_pos));
+                reconstructed_reads[read_label].push_back(read_trace);
                 break;
             }
         }
