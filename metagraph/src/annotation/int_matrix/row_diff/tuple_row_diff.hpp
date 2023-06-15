@@ -34,7 +34,7 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     // check graph traversal in batches
-    static const uint64_t TRAVERSAL_BATCH_SIZE = 3'000;
+    static const uint64_t TRAVERSAL_BATCH_SIZE = 1'000;
 
     TupleRowDiff() {}
 
@@ -45,6 +45,7 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
     std::vector<Row> get_column(Column j) const override;
     RowTuples get_row_tuples(Row i) const override;
     std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows) const override;
+    std::vector<RowTuples> get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
 
     RowTuples get_row_tuples(Row i, std::vector<Row> &rd_ids,
     VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows,
@@ -92,6 +93,7 @@ class TupleRowDiff : public binmat::IRowDiff, public MultiIntMatrix {
   private:
     static void decode_diffs(RowTuples *diffs);
     static void add_diff(const RowTuples &diff, RowTuples *row);
+    static void add_diff_labeled(const RowTuples &diff, RowTuples *row, std::unordered_set<Column> labels_of_interest);
 
     BaseMatrix diffs_;
 };
@@ -160,6 +162,46 @@ TupleRowDiff<BaseMatrix>::get_row_tuples(const std::vector<Row> &row_ids) const 
         for (++it ; it != rd_paths_trunc[i].rend(); ++it) {
             std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
             add_diff(rd_rows[*it], &result);
+            // replace diff row with full reconstructed annotation
+            rd_rows[*it] = result;
+        }
+        assert(std::all_of(result.begin(), result.end(),
+                           [](auto &p) { return p.second.size(); }));
+    }
+
+    return rows;
+}
+
+template <class BaseMatrix>
+std::vector<MultiIntMatrix::RowTuples>
+TupleRowDiff<BaseMatrix>::get_row_tuples_labeled(const std::vector<Row> &row_ids, std::unordered_set<Column> labels_of_interest) const {
+    assert(graph_ && "graph must be loaded");
+    assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
+    assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
+
+    // get row-diff paths
+    auto [rd_ids, rd_paths_trunc] = get_rd_ids(row_ids);
+
+    std::vector<RowTuples> rd_rows = diffs_.get_row_tuples_labeled(rd_ids, labels_of_interest);
+    for (auto &row : rd_rows) {
+        decode_diffs(&row);
+    }
+
+    rd_ids = std::vector<Row>();
+
+    // reconstruct annotation rows from row-diff
+    std::vector<RowTuples> rows(row_ids.size());
+
+    for (size_t i = 0; i < row_ids.size(); ++i) {
+        RowTuples &result = rows[i];
+
+        auto it = rd_paths_trunc[i].rbegin();
+        std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
+        result = rd_rows[*it];
+        // propagate back and reconstruct full annotations for predecessors
+        for (++it ; it != rd_paths_trunc[i].rend(); ++it) {
+            std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
+            add_diff_labeled(rd_rows[*it], &result, labels_of_interest);
             // replace diff row with full reconstructed annotation
             rd_rows[*it] = result;
         }
@@ -259,6 +301,55 @@ void TupleRowDiff<BaseMatrix>::add_diff(const RowTuples &diff, RowTuples *row) {
                                                   it2->second.begin(), it2->second.end(),
                                                   std::back_inserter(result.back().second));
                 }
+                ++it;
+                ++it2;
+            }
+        }
+        std::copy(it, row->end(), std::back_inserter(result));
+        std::copy(it2, diff.end(), std::back_inserter(result));
+
+        row->swap(result);
+    }
+
+    assert(std::is_sorted(row->begin(), row->end()));
+    for (auto &[j, tuple] : *row) {
+        assert(std::is_sorted(tuple.begin(), tuple.end()));
+        for (uint64_t &c : tuple) {
+            c -= SHIFT;
+        }
+    }
+}
+
+template <class BaseMatrix>
+void TupleRowDiff<BaseMatrix>::add_diff_labeled(const RowTuples &diff, RowTuples *row, std::unordered_set<Column> labels_of_interest) {
+    assert(std::is_sorted(row->begin(), row->end()));
+    assert(std::is_sorted(diff.begin(), diff.end()));
+
+    if (diff.size()) {
+        RowTuples result;
+        result.reserve(row->size() + diff.size());
+
+        auto it = row->begin();
+        auto it2 = diff.begin();
+        while (it != row->end() && it2 != diff.end()) {
+            if (it->first < it2->first) {
+                if (labels_of_interest.count(it->first))
+                    result.push_back(*it);
+                ++it;
+            } else if (it->first > it2->first) {
+                if (labels_of_interest.count(it2->first))
+                    result.push_back(*it2);
+                ++it2;
+            } else if (it->first == it2->first && labels_of_interest.count(it2->first)) {
+                if (it2->second.size()) {
+                    result.emplace_back(it->first, Tuple{});
+                    std::set_symmetric_difference(it->second.begin(), it->second.end(),
+                                                  it2->second.begin(), it2->second.end(),
+                                                  std::back_inserter(result.back().second));
+                }
+                ++it;
+                ++it2;
+            } else {
                 ++it;
                 ++it2;
             }
@@ -431,6 +522,8 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         }
     }
 
+    input_row_tuples = RowTuples();
+
     // case when all the reads that contain current row are already reconstructed
     if (reconstructed_paths.empty()) {
         return result;
@@ -438,6 +531,9 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
 
     std::unordered_map<Column, std::set<uint64_t>> ends_of_reads;
     std::unordered_map<Column, std::set<uint64_t>> starts_of_reads;
+
+    std::unordered_map<Column, std::set<uint64_t>> ends_of_reads_final;
+    std::unordered_map<Column, std::set<uint64_t>> starts_of_reads_final;
 
     mtg::common::logger->trace("Getting initial starts and ends of the reads");
 
@@ -466,7 +562,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
             }
 
             node_1 = node_2;
-            coord_1 = coord_2;           
+            coord_1 = coord_2;
         }
         ends_of_reads[j].insert(coord_1);
 
@@ -510,9 +606,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
     mtg::common::logger->trace("Traversing the graph forwards");
     while (true) {
         uint64_t traversed_nodes_count = 0;
-
-        // set of rows in the current batch to decompress the annotations for
-        std::unordered_set<Row> batch_of_rows_set;
+        std::vector<Row> batch_of_rows;
 
         while (!to_visit.empty()) {
             // Row current_parent = to_visit.front();
@@ -523,7 +617,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
             if (visited_nodes_forward.count(current_parent))
                 continue;
             
-            batch_of_rows_set.insert(current_parent);
+            batch_of_rows.push_back(current_parent);
             traversed_nodes_count++;
 
             graph::AnnotatedSequenceGraph::node_index current_parent_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_parent);
@@ -547,26 +641,23 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
 
         batches_count++;        
 
-        // convert a set of visited rows to vector
-        std::vector<Row> batch_of_rows;
-        batch_of_rows.reserve(batch_of_rows_set.size());
-        batch_of_rows.insert(batch_of_rows.end(),
-        batch_of_rows_set.begin(), batch_of_rows_set.end());
-
-        batch_of_rows_set = std::unordered_set<Row>();
-
         // decompress the annotations for the current batch of rows
-        std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
+        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, labels_of_interest);
+
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
             for (auto & [j_next, tuple_next] : batch_annotations[batch_i]) {
-                if (!labels_of_interest.count(j_next))
+                if (!labels_of_interest.count(j_next)) {
+                    tuple_next = Tuple();
                     continue;
+                }
 
                 for (uint64_t &c_next : tuple_next) {
                     all_discovered_coordinates[j_next].insert(c_next);
                     reconstructed_paths[j_next][c_next] = batch_of_rows[batch_i];
                 }
+
+                tuple_next = Tuple();
             }
         }
 
@@ -574,6 +665,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         batch_of_rows = std::vector<Row>();
 
         // update reads ends
+        std::unordered_map<Column, std::vector<std::pair<uint64_t, uint64_t>>> ends_to_update;
         for (auto & [j_end, coords_ends] : ends_of_reads) {
             for (auto & c_end : coords_ends) {
                 auto c_end_cur = c_end;
@@ -602,9 +694,15 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
                 }
 
                 if (replace_read_end) {
-                    ends_of_reads[j_end].erase(c_end);
-                    ends_of_reads[j_end].insert(c_end_cur);
+                    ends_to_update[j_end].push_back(std::make_pair(c_end, c_end_cur));
                 }
+            }
+        }
+
+        for (auto & [j_to_update, old_new_ends_to_update] : ends_to_update) {
+            for (auto & [c_end_old, c_end_updated] : old_new_ends_to_update) {
+                ends_of_reads[j_to_update].erase(c_end_old);
+                ends_of_reads[j_to_update].insert(c_end_updated);
             }
         }
 
@@ -612,6 +710,8 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         // by checking if there are continuations of the reads after the known ends
 
         to_visit = std::deque<Row>(); // collect in the queue only the known ends of the reads
+
+        std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
         for (auto & [j_end, coords_ends] : ends_of_reads) {
             for (auto & c_end : coords_ends) {
                 auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
@@ -622,28 +722,148 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
                         return;
                     
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
-                    RowTuples outg_annotataions = get_row_tuples(adj_outg_to_anno);
-
-                    std::set<uint64_t> coordinates_of_the_adj_outg_node;
-                    for (auto &[j_next, tuple_next] : outg_annotataions) {
-                        if (!labels_of_interest.count(j_next) || j_next != j_end)
-                            continue;
-
-                        for (uint64_t &c_next : tuple_next)
-                            coordinates_of_the_adj_outg_node.insert(c_next);
-                    }
-
-                    if (coordinates_of_the_adj_outg_node.count(c_end + SHIFT)) {
-                        to_visit.push_front(adj_outg_to_anno);
-                        return;
-                    }
+                    batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
                 });
             }
         }
 
+        std::vector<Row> batch_of_rows_to_check_if_traverse_more;
+        batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
+        batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
+        batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
+        batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
+
+        std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
+        std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
+        size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
+
+        for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
+            size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+
+            std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
+            batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
+
+            std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, labels_of_interest);
+            // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+
+            for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
+                for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
+                    if (!labels_of_interest.count(j_to_check)) {
+                        tuple_to_check = Tuple();
+                        continue;
+                    }
+
+                    for (auto & c_to_check : tuple_to_check) {
+                        coordinates_of_the_successors[j_to_check].insert(c_to_check);
+                        successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
+                    }
+                    tuple_to_check = Tuple();
+                }
+            }
+            batch_part_annotations = std::vector<RowTuples>();
+        }
+
+        for (auto & [j_end, coords_ends] : ends_of_reads) {
+            for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
+                if (coordinates_of_the_successors[j_end].count(*it_end_coords + SHIFT)) {
+                    to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
+                    visited_nodes_forward.erase(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
+                    ++it_end_coords;
+                } else {
+                    ends_of_reads_final[j_end].insert(*it_end_coords);
+                    it_end_coords = coords_ends.erase(it_end_coords);
+                }
+            }
+        }
+
+        // mtg::common::logger->trace("Reduced ends of reads {}; current found true ends {} ; current potential ends {}", ends_of_reads_size_before - ends_of_reads_size_after, found_true_ends_at_this_step, ends_of_reads_size_after);
+
+        // clean up reconstructed paths:
+        std::vector<Column> labels_to_clean_up;
+        for (auto & [j_clean_up, coords_and_rows_clean_up] : reconstructed_paths) {
+            if ((ends_of_reads[j_clean_up].empty() && ends_of_reads_final[j_clean_up].empty()) || starts_of_reads[j_clean_up].empty()) {
+                labels_to_clean_up.push_back(j_clean_up);
+                continue;
+            }
+
+            uint64_t max_end_of_read;
+            uint64_t min_start_of_read = *(starts_of_reads[j_clean_up].begin());
+
+            if (ends_of_reads_final[j_clean_up].empty()) {
+                max_end_of_read = *(ends_of_reads[j_clean_up].rbegin());
+            } else if (ends_of_reads[j_clean_up].empty()) {
+                max_end_of_read = *(ends_of_reads_final[j_clean_up].rbegin());
+            } else {
+                max_end_of_read = std::max(*(ends_of_reads[j_clean_up].rbegin()), *(ends_of_reads_final[j_clean_up].rbegin()));
+            }
+
+            for (auto it_clean_up = coords_and_rows_clean_up.rbegin(); it_clean_up != coords_and_rows_clean_up.rend(); ) {
+                if (it_clean_up->first > max_end_of_read) {
+                    it_clean_up = decltype(it_clean_up)(coords_and_rows_clean_up.erase(std::next(it_clean_up).base()));
+                } else {
+                    break;
+                }
+            }
+            for (auto it_clean_up = coords_and_rows_clean_up.begin(); it_clean_up != coords_and_rows_clean_up.end(); ) {
+                if (it_clean_up->first < min_start_of_read) {
+                    it_clean_up = coords_and_rows_clean_up.erase(it_clean_up);
+                } else {
+                    break;
+                }
+            }
+
+        }
+
+        for (auto & j_clean_up : labels_to_clean_up) {
+            reconstructed_paths.erase(j_clean_up);
+        }
+
+        // clean up all discovered coordinates
+        labels_to_clean_up = std::vector<Column>();
+        for (auto & [j_to_clean_discovered_coords, discovered_coords] : all_discovered_coordinates) {
+            if ((ends_of_reads[j_to_clean_discovered_coords].empty() && ends_of_reads_final[j_to_clean_discovered_coords].empty()) || starts_of_reads[j_to_clean_discovered_coords].empty()) {
+                labels_to_clean_up.push_back(j_to_clean_discovered_coords);
+                continue;
+            }
+
+            uint64_t max_end_of_read;
+            uint64_t min_start_of_read = *(starts_of_reads[j_to_clean_discovered_coords].begin());
+
+            if (ends_of_reads_final[j_to_clean_discovered_coords].empty()) {
+                max_end_of_read = *(ends_of_reads[j_to_clean_discovered_coords].rbegin());
+            } else if (ends_of_reads[j_to_clean_discovered_coords].empty()) {
+                max_end_of_read = *(ends_of_reads_final[j_to_clean_discovered_coords].rbegin());
+            } else {
+                max_end_of_read = std::max(*(ends_of_reads[j_to_clean_discovered_coords].rbegin()), *(ends_of_reads_final[j_to_clean_discovered_coords].rbegin()));
+            }
+
+            for (auto it_clean_up = discovered_coords.rbegin(); it_clean_up != discovered_coords.rend(); ) {
+                if (*it_clean_up > max_end_of_read) {
+                    it_clean_up = decltype(it_clean_up)(discovered_coords.erase(std::next(it_clean_up).base()));
+                } else {
+                    break;
+                }
+            }
+            for (auto it_clean_up = discovered_coords.begin(); it_clean_up != discovered_coords.end(); ) {
+                if (*it_clean_up < min_start_of_read) {
+                    it_clean_up = discovered_coords.erase(it_clean_up);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (auto & j_clean_up : labels_to_clean_up) {
+            all_discovered_coordinates.erase(j_clean_up);
+        }
+
+
         if (to_visit.empty())
             break;
     }
+
+    ends_of_reads = ends_of_reads_final;
+    ends_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
 
     mtg::common::logger->trace("Traversed batches forwards count {}", batches_count);
 
@@ -661,7 +881,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         uint64_t traversed_nodes_count = 0;
 
         // set of rows in the current batch to decompress the annotations for
-        std::unordered_set<Row> batch_of_rows_set;
+        std::vector<Row> batch_of_rows;
         while (!to_visit.empty()) {
             // Row current_child = to_visit.front();
             // to_visit.pop();
@@ -672,7 +892,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
                 continue;
             }
 
-            batch_of_rows_set.insert(current_child);
+            batch_of_rows.push_back(current_child);
             traversed_nodes_count++;
 
             graph::AnnotatedSequenceGraph::node_index current_child_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(current_child);
@@ -695,26 +915,23 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         
         batches_count_backwards++;
 
-        // convert a set of visited rows to vector
-        std::vector<Row> batch_of_rows;
-        batch_of_rows.reserve(batch_of_rows_set.size());
-        batch_of_rows.insert(batch_of_rows.end(),
-        batch_of_rows_set.begin(), batch_of_rows_set.end());
-
-        batch_of_rows_set = std::unordered_set<Row>();
-
-        std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
+        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, labels_of_interest);
+        // std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
 
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
             for (auto & [j_prev, tuple_prev] : batch_annotations[batch_i]) {
-                if (!labels_of_interest.count(j_prev))
+                if (!labels_of_interest.count(j_prev)) {
+                    tuple_prev = Tuple();
                     continue;
+                }
 
                 for (uint64_t &c_prev : tuple_prev) {
                     all_discovered_coordinates[j_prev].insert(c_prev);
                     reconstructed_paths[j_prev][c_prev] = batch_of_rows[batch_i];
                 }
+
+                tuple_prev = Tuple();
             }
         }
 
@@ -722,6 +939,7 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         batch_of_rows = std::vector<Row>();
 
         // update reads starts
+        std::unordered_map<Column, std::vector<std::pair<uint64_t, uint64_t>>> starts_to_update;
         for (auto & [j_start, coords_starts] : starts_of_reads) {
             for (auto & c_start : coords_starts) {
                 if (c_start == 0)
@@ -752,9 +970,15 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
                 }
 
                 if (replace_read_end) {
-                    starts_of_reads[j_start].erase(c_start);
-                    starts_of_reads[j_start].insert(c_end_cur);
+                    starts_to_update[j_start].push_back(std::make_pair(c_start, c_end_cur));
                 }
+            }
+        }
+
+        for (auto & [j_to_update, old_new_ends_to_update] : starts_to_update) {
+            for (auto & [c_end_old, c_end_updated] : old_new_ends_to_update) {
+                starts_of_reads[j_to_update].erase(c_end_old);
+                starts_of_reads[j_to_update].insert(c_end_updated);
             }
         }
 
@@ -762,11 +986,10 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
         // by checking if there are continuations of the reads after the known ends
 
         to_visit = std::deque<Row>();
+        std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
+
         for (auto & [j_end, coords_ends] : starts_of_reads) {
             for (auto & c_end : coords_ends) {
-                if (c_end == 0)
-                    continue;
-
                 auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
 
                 graph_->call_incoming_kmers(end_node_old, [&](auto adj_outg_node, char c) {
@@ -775,23 +998,138 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
                         return;
                     
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
-                    RowTuples outg_annotataions = get_row_tuples(adj_outg_to_anno);
-
-                    std::set<uint64_t> coordinates_of_the_adj_outg_node;
-                    for (auto &[j_next, tuple_next] : outg_annotataions) {
-                        if (!labels_of_interest.count(j_next) || j_next != j_end)
-                            continue;
-
-                        for (uint64_t &c_next : tuple_next)
-                            coordinates_of_the_adj_outg_node.insert(c_next);
-                    }
-
-                    if (coordinates_of_the_adj_outg_node.count(c_end - SHIFT)) {
-                        to_visit.push_front(adj_outg_to_anno);
-                        return;
-                    }
+                    batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
                 });
             }
+        }
+
+        std::vector<Row> batch_of_rows_to_check_if_traverse_more;
+        batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
+        batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
+        batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
+        batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
+
+        std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
+        std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
+        size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
+
+        for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
+            size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+
+            std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
+            batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
+
+            std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, labels_of_interest);
+            // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+
+            for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
+                for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
+                    if (!labels_of_interest.count(j_to_check)) {
+                        tuple_to_check = Tuple();
+                        continue;
+                    }
+
+                    for (auto & c_to_check : tuple_to_check) {
+                        coordinates_of_the_successors[j_to_check].insert(c_to_check);
+                        successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
+                    }
+                    tuple_to_check = Tuple();
+                }
+            }
+            batch_part_annotations = std::vector<RowTuples>();
+        }
+
+        for (auto & [j_end, coords_ends] : starts_of_reads) {
+            for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
+                if (*it_end_coords == 0) {
+                    starts_of_reads_final[j_end].insert(*it_end_coords);
+                    it_end_coords = coords_ends.erase(it_end_coords);
+                } else if (coordinates_of_the_successors[j_end].count(*it_end_coords - SHIFT)) {
+                    to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
+                    visited_nodes_backward.erase(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
+                    ++it_end_coords;
+                } else {
+                    starts_of_reads_final[j_end].insert(*it_end_coords);
+                    it_end_coords = coords_ends.erase(it_end_coords);
+                }
+            }
+        }
+
+        // clean up reconstructed paths:
+        std::vector<Column> labels_to_clean_up;
+        for (auto & [j_clean_up, coords_and_rows_clean_up] : reconstructed_paths) {
+            if ((starts_of_reads[j_clean_up].empty() && starts_of_reads_final[j_clean_up].empty()) || ends_of_reads[j_clean_up].empty()) {
+                labels_to_clean_up.push_back(j_clean_up);
+                continue;
+            }
+
+            uint64_t min_start_of_read;
+            uint64_t max_end_of_read = *(ends_of_reads[j_clean_up].rbegin());
+
+            if (starts_of_reads_final[j_clean_up].empty()) {
+                min_start_of_read = *(starts_of_reads[j_clean_up].begin());
+            } else if (starts_of_reads[j_clean_up].empty()) {
+                min_start_of_read = *(starts_of_reads_final[j_clean_up].begin());
+            } else {
+                min_start_of_read = std::min(*(starts_of_reads[j_clean_up].begin()), *(starts_of_reads_final[j_clean_up].begin()));
+            }
+            for (auto it_clean_up = coords_and_rows_clean_up.rbegin(); it_clean_up != coords_and_rows_clean_up.rend(); ) {
+                if (it_clean_up->first > max_end_of_read) {
+                    it_clean_up = decltype(it_clean_up)(coords_and_rows_clean_up.erase(std::next(it_clean_up).base()));
+                } else {
+                    break;
+                }
+            }
+            for (auto it_clean_up = coords_and_rows_clean_up.begin(); it_clean_up != coords_and_rows_clean_up.end(); ) {
+                if (it_clean_up->first < min_start_of_read) {
+                    it_clean_up = coords_and_rows_clean_up.erase(it_clean_up);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (auto & j_clean_up : labels_to_clean_up) {
+            reconstructed_paths.erase(j_clean_up);
+        }
+
+        // clean up all discovered coordinates
+        labels_to_clean_up = std::vector<Column>();
+        for (auto & [j_to_clean_discovered_coords, discovered_coords] : all_discovered_coordinates) {
+            if (ends_of_reads[j_to_clean_discovered_coords].empty() || (starts_of_reads[j_to_clean_discovered_coords].empty() && starts_of_reads_final[j_to_clean_discovered_coords].empty())) {
+                labels_to_clean_up.push_back(j_to_clean_discovered_coords);
+                continue;
+            }
+
+            uint64_t min_start_of_read;
+            uint64_t max_end_of_read = *(ends_of_reads[j_to_clean_discovered_coords].rbegin());
+
+            if (starts_of_reads_final[j_to_clean_discovered_coords].empty()) {
+                min_start_of_read = *(starts_of_reads[j_to_clean_discovered_coords].begin());
+            } else if (starts_of_reads[j_to_clean_discovered_coords].empty()) {
+                min_start_of_read = *(starts_of_reads_final[j_to_clean_discovered_coords].begin());
+            } else {
+                min_start_of_read = std::min(*(starts_of_reads[j_to_clean_discovered_coords].begin()), *(starts_of_reads_final[j_to_clean_discovered_coords].begin()));
+            }
+
+            for (auto it_clean_up = discovered_coords.rbegin(); it_clean_up != discovered_coords.rend(); ) {
+                if (*it_clean_up > max_end_of_read) {
+                    it_clean_up = decltype(it_clean_up)(discovered_coords.erase(std::next(it_clean_up).base()));
+                } else {
+                    break;
+                }
+            }
+            for (auto it_clean_up = discovered_coords.begin(); it_clean_up != discovered_coords.end(); ) {
+                if (*it_clean_up < min_start_of_read) {
+                    it_clean_up = discovered_coords.erase(it_clean_up);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (auto & j_clean_up : labels_to_clean_up) {
+            all_discovered_coordinates.erase(j_clean_up);
         }
 
         if (to_visit.empty())
@@ -799,12 +1137,15 @@ std::vector<std::tuple<std::vector<MultiIntMatrix::Row>, MultiIntMatrix::Column,
 
     }
 
+    starts_of_reads = starts_of_reads_final;
+    starts_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
+
     // reconstruct the paths
     mtg::common::logger->trace("Traversed batches backwards count {}", batches_count_backwards);
     mtg::common::logger->trace("Reconstructing the paths...");
 
     for (auto & [j_st, coords_st] : starts_of_reads) {
-        assert(coords_st.size() == ends_of_reads[j_st].size());
+        // assert(coords_st.size() == ends_of_reads[j_st].size());
         auto it_start = coords_st.begin();
         auto it_end = ends_of_reads[j_st].begin();
 

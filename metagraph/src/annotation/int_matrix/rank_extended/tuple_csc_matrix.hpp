@@ -49,6 +49,9 @@ class TupleCSCMatrix : public MultiIntMatrix {
     std::vector<RowTuples>
     get_row_tuples(const std::vector<Row> &rows) const;
 
+    std::vector<RowTuples>
+    get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
+
     uint64_t num_columns() const { return binary_matrix_.num_columns(); }
     uint64_t num_rows() const { return binary_matrix_.num_rows(); }
     uint64_t num_relations() const { return binary_matrix_.num_relations(); }
@@ -154,6 +157,33 @@ TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(const std::vector<Row
         row_tuples[i].reserve(column_ranks[i].size());
         for (auto [j, r] : column_ranks[i]) {
             assert(r >= 1 && "matches can't have zero-rank");
+            size_t begin = delimiters_[j].select1(r) + 1 - r;
+            size_t end = delimiters_[j].select1(r + 1) - r;
+            Tuple tuple;
+            tuple.reserve(end - begin);
+            for (size_t t = begin; t < end; ++t) {
+                tuple.push_back(column_values_[j][t]);
+            }
+            row_tuples[i].emplace_back(j, std::move(tuple));
+        }
+    }
+    return row_tuples;
+}
+
+template <class BaseMatrix, class Values, class Delims>
+inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
+TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const {
+    const auto &column_ranks = binary_matrix_.get_column_ranks(rows);
+    std::vector<RowTuples> row_tuples(rows.size());
+    // TODO: reshape?
+    for (size_t i = 0; i < rows.size(); ++i) {
+        row_tuples[i].reserve(column_ranks[i].size());
+        for (auto [j, r] : column_ranks[i]) {
+            assert(r >= 1 && "matches can't have zero-rank");
+            if (!labels_of_interest.count(j)) {
+                row_tuples[i].emplace_back(j, Tuple());
+                continue;
+            }
             size_t begin = delimiters_[j].select1(r) + 1 - r;
             size_t end = delimiters_[j].select1(r + 1) - r;
             Tuple tuple;
