@@ -654,11 +654,12 @@ AnnotatedDBG::get_overlapping_reads(std::string_view sequence, std::unordered_se
         return {};
 
     std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes, manifest_labels, auto_labels);
+    const char query_identifier = sequence[7];
+    return get_overlapping_reads(nodes, manifest_labels, auto_labels, query_identifier);
 }
 
 std::vector<std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::unordered_set<std::string> manifest_labels, bool auto_labels) const {
+AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::unordered_set<std::string> manifest_labels, bool auto_labels, const char query_identifier) const {
     
     if (!nodes.size())
         return {};    
@@ -715,6 +716,8 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
                 result.push_back(row_result);
             }
         } else {
+	
+	    logger->trace("Getting initial labels that match manifest, query id = {}", query_identifier);
             std::vector<std::unordered_set<uint64_t>> initial_labels = tuple_row_diff->get_labels_of_rows(rows);
             std::vector<std::unordered_set<uint64_t>> acceptable_initial_labels;
 
@@ -738,9 +741,9 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
                 acceptable_initial_labels.push_back(acceptable_labels_set);
             }
 
-            logger->trace("Extracting reads...");
+            logger->trace("Extracting reads... query id = {}", query_identifier);
             auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows, acceptable_initial_labels);
-            logger->trace("Spelling paths...");
+            logger->trace("Spelling paths... query id = {}", query_identifier);
 
             for (size_t i = 0; i < traces.size(); ++i) {
                 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> row_result;
@@ -758,6 +761,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
                 }
                 result.push_back(row_result);
             }
+	    logger->trace("Paths spelled. query id = {}", query_identifier);
         }
     } else {
         auto [reads_paths, traces] = tuple_row_diff->get_traces_with_row(rows);
