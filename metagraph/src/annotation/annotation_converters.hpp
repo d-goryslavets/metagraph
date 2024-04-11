@@ -10,16 +10,8 @@
 namespace mtg {
 namespace annot {
 
-template <typename Label>
-class RowCompressed;
-
 template <typename LabelType>
-class MultiLabelEncoded;
-
-
-template <class StaticAnnotation, typename Label>
-typename std::unique_ptr<StaticAnnotation>
-convert(RowCompressed<Label>&& annotation);
+class MultiLabelAnnotation;
 
 
 template <typename Label>
@@ -27,6 +19,15 @@ class ColumnCompressed;
 
 template <class StaticAnnotation, typename Label>
 std::unique_ptr<StaticAnnotation> convert(ColumnCompressed<Label>&& annotation);
+
+template <class StaticAnnotation, typename Label>
+void convert(ColumnCompressed<Label>&& annotation, const std::string &outfbase) {
+    convert<StaticAnnotation, Label>(std::move(annotation))->serialize(outfbase);
+}
+
+template <>
+void convert<RowFlatAnnotator, std::string>(ColumnCompressed<std::string>&& annotator,
+                                            const std::string &outfbase);
 
 template <class StaticAnnotation>
 std::unique_ptr<StaticAnnotation> convert(const std::string &filename);
@@ -64,27 +65,31 @@ convert_to_BRWT(const std::vector<std::string> &annotation_files,
                 size_t num_threads = 1,
                 const std::filesystem::path &tmp_dir = "");
 
-void relax_BRWT(binmat::BRWT *annotation, size_t relax_max_arity, size_t num_threads = 1);
+void relax_BRWT(matrix::BRWT *annotation, size_t relax_max_arity, size_t num_threads = 1);
 
 template <class StaticAnnotation>
 std::unique_ptr<StaticAnnotation>
 convert_to_RbBRWT(const std::vector<std::string> &annotation_files,
                   size_t max_brwt_arity);
 
-template <class ToAnnotation, typename Label>
-void merge(std::vector<std::unique_ptr<MultiLabelEncoded<Label>>>&& annotators,
-           const std::vector<std::string> &filenames,
-           const std::string &outfile);
+// For RowDiffDisk/RowDiffDiskCoord/RowDiffRowFlat/RowDiffRowSparse -Annotator
+template <class RowDiffAnnotator>
+void convert_to_row_diff(const std::vector<std::string> &files,
+                         const std::string &anchors_file_fbase,
+                         const std::string &outfbase,
+                         size_t num_threads,
+                         size_t mem_bytes);
 
+void merge_row_compressed(const std::vector<std::string> &filenames,
+                          const std::string &outfile);
+
+void merge_brwt(const std::vector<std::string> &filenames,
+                const std::string &outfile);
+
+// transform to RowCompressed<Label>
 template <typename Label>
 void convert_to_row_annotator(const ColumnCompressed<Label> &annotator,
-                              const std::string &outfbase,
-                              size_t num_threads = 1);
-
-template <typename Label>
-void convert_to_row_annotator(const ColumnCompressed<Label> &annotator,
-                              RowCompressed<Label> *target,
-                              size_t num_threads = 1);
+                              const std::string &outfbase);
 
 /**
  * Sparsifies annotations in #ColumnCompressed format by storing diffs between sucessive
@@ -124,21 +129,7 @@ void convert_to_row_diff(const std::vector<std::string> &files,
 void convert_row_diff_to_col_compressed(const std::vector<std::string> &files,
                                         const std::string &outfbase);
 
-/**
- * Converts a RowDiff annotation into RowDiff<RowSparse>.
- */
-std::unique_ptr<RowDiffRowSparseAnnotator>
-convert_row_diff_to_RowDiffSparse(const std::vector<std::string> &filenames);
-
-/**
- * Wraps an existing annotation (e.g. BRWT) into a RowDiff annotation. Typically this
- * happens when transforming RowDiff columns back to column compress, manipulate the
- * column compressed into some other format, and then wrapping the result back into a
- * RowDiff.
- */
-void wrap_in_row_diff(MultiLabelEncoded<std::string> &&anno,
-                      const std::string &graph_file,
-                      const std::string &out_file);
+std::pair<std::string, std::string> get_anchors_and_fork_fnames(const std::string &fbase);
 
 template <class Annotator>
 StaticBinRelAnnotator<matrix::TupleCSCMatrix<typename Annotator::binary_matrix_type>, std::string>

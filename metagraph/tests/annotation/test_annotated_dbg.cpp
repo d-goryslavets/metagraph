@@ -39,14 +39,6 @@ void check_labels(const AnnotatedDBG &anno_graph,
             EXPECT_EQ(labels_present.size(), anno_graph.get_labels(index).size());
             EXPECT_EQ(convert_to_set(labels_present),
                       convert_to_set(anno_graph.get_labels(index)));
-
-            for (const auto &label : labels_present) {
-                EXPECT_TRUE(anno_graph.has_label(index, label));
-            }
-
-            for (const auto &label : labels_not_present) {
-                EXPECT_FALSE(anno_graph.has_label(index, label));
-            }
         }
     );
 
@@ -57,7 +49,6 @@ void check_labels(const AnnotatedDBG &anno_graph,
             [&](const auto &index) {
                 ASSERT_NE(SequenceGraph::npos, index);
                 cur_indices.insert(index);
-                EXPECT_TRUE(anno_graph.has_label(index, label));
             }
         );
         std::vector<SequenceGraph::node_index> diff;
@@ -1001,7 +992,8 @@ typedef ::testing::Types<std::pair<DBGBitmap, annot::ColumnCompressed<>>,
                          std::pair<DBGHashOrdered, annot::RowFlatAnnotator>,
                          std::pair<DBGHashFast, annot::RowFlatAnnotator>,
                          std::pair<DBGSuccinct, annot::RowFlatAnnotator>,
-                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>
+                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>,
+                         std::pair<DBGSuccinct, annot::RowDiffDiskAnnotator>
                         > GraphAnnotationPairTypes;
 TYPED_TEST_SUITE(AnnotatedDBGTest, GraphAnnotationPairTypes);
 
@@ -1012,7 +1004,8 @@ typedef ::testing::Types<std::pair<DBGHashString, annot::ColumnCompressed<>>,
                          std::pair<DBGSuccinct, annot::ColumnCompressed<>>,
                          std::pair<DBGHashString, annot::RowFlatAnnotator>,
                          std::pair<DBGSuccinct, annot::RowFlatAnnotator>,
-                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>
+                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>,
+                         std::pair<DBGSuccinct, annot::RowDiffDiskAnnotator>
                         > GraphWithNAnnotationPairTypes;
 TYPED_TEST_SUITE(AnnotatedDBGWithNTest, GraphWithNAnnotationPairTypes);
 
@@ -1026,7 +1019,8 @@ typedef ::testing::Types<std::pair<DBGBitmap, annot::ColumnCompressed<>>,
                          std::pair<DBGBitmap, annot::RowFlatAnnotator>,
                          std::pair<DBGHashOrdered, annot::RowFlatAnnotator>,
                          std::pair<DBGHashFast, annot::RowFlatAnnotator>,
-                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>
+                         std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>,
+                         std::pair<DBGSuccinct, annot::RowDiffDiskAnnotator>
                         > GraphNoNAnnotationPairTypes;
 TYPED_TEST_SUITE(AnnotatedDBGNoNTest, GraphNoNAnnotationPairTypes);
 #endif
@@ -1127,28 +1121,28 @@ TYPED_TEST(AnnotatedDBGWithNTest, get_labels) {
                   anno_graph->get_labels(seq_third, 1. * (seq_third.size() - (k + 1) + 1 - (k + 2))
                                                             / (seq_third.size() - (k + 1) + 1) - 1e-9));
 #else
-        EXPECT_EQ(std::vector<std::string> { "Second" },
-                  anno_graph->get_labels(seq_second, 1));
-        EXPECT_EQ(std::vector<std::string> { "Third" },
-                  anno_graph->get_labels(seq_third, 1));
+        EXPECT_EQ(convert_to_set({ "Second" }),
+                  convert_to_set(anno_graph->get_labels(seq_second, 1)));
+        EXPECT_EQ(convert_to_set({ "Third" }),
+                  convert_to_set(anno_graph->get_labels(seq_third, 1)));
 #endif
 
-        EXPECT_EQ(std::vector<std::string>({ "First", "Third" }),
-                  anno_graph->get_labels(seq_first, 0));
+        EXPECT_EQ(convert_to_set({ "First", "Third" }),
+                  convert_to_set(anno_graph->get_labels(seq_first, 0)));
 #if _DNA_GRAPH
-        EXPECT_EQ(k == 1 ? std::vector<std::string>({ "Second", "Third" })
-                         : std::vector<std::string> { "Second" },
-                  anno_graph->get_labels(seq_second, 0));
-        EXPECT_EQ(k == 1 ? std::vector<std::string>({ "First", "Second", "Third" })
-                         : std::vector<std::string>({ "First", "Third" }),
-                  anno_graph->get_labels(seq_third, 0));
+        EXPECT_EQ(k == 1 ? convert_to_set({ "Second", "Third" })
+                         : convert_to_set({ "Second" }),
+                  convert_to_set(anno_graph->get_labels(seq_second, 0)));
+        EXPECT_EQ(k == 1 ? convert_to_set({ "First", "Second", "Third" })
+                         : convert_to_set({ "First", "Third" }),
+                  convert_to_set(anno_graph->get_labels(seq_third, 0)));
 #else
         EXPECT_EQ(k <= 3 ? std::vector<std::string>({ "Second", "Third" })
                          : std::vector<std::string> { "Second" },
                   anno_graph->get_labels(seq_second, 0));
-        EXPECT_EQ(k <= 3 ? std::vector<std::string>({ "First", "Second", "Third" })
-                         : std::vector<std::string>({ "First", "Third" }),
-                  anno_graph->get_labels(seq_third, 0));
+        EXPECT_EQ(k <= 3 ? convert_to_set({ "First", "Second", "Third" })
+                         : convert_to_set({ "First", "Third" }),
+                  convert_to_set(anno_graph->get_labels(seq_third, 0)));
 #endif
     }
 }

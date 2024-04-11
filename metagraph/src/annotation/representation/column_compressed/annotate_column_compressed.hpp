@@ -7,6 +7,7 @@
 #include <lru_cache_policy.hpp>
 
 #include "common/vectors/bit_vector.hpp"
+#include "common/vectors/bit_vector_adaptive.hpp"
 #include "common/vector.hpp"
 #include "common/sorted_vector.hpp"
 #include "annotation/representation/base/annotation.hpp"
@@ -22,11 +23,11 @@ namespace annot {
  *  Then, any subset of the public const methods can be called concurrently.
  */
 template <typename Label = std::string>
-class ColumnCompressed : public MultiLabelEncoded<Label> {
+class ColumnCompressed : public MultiLabelAnnotation<Label> {
   public:
-    typedef binmat::ColumnMajor binary_matrix_type;
-    using Index = typename MultiLabelEncoded<Label>::Index;
-    using VLabels = typename MultiLabelEncoded<Label>::VLabels;
+    typedef matrix::ColumnMajor binary_matrix_type;
+    using Index = typename MultiLabelAnnotation<Label>::Index;
+    using VLabels = typename MultiLabelAnnotation<Label>::VLabels;
 
     // |swap_dir| specifies a location on disk for tempprary buffers during the
     // column construction. If empty, no swap is used and all is stored in RAM.
@@ -59,8 +60,6 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
 
     ~ColumnCompressed();
 
-    void set(Index i, const VLabels &labels) override;
-
     void add_labels(const std::vector<Index> &indices,
                     const VLabels &labels) override;
     // for each label and index 'indices[i]' add count 'counts[i]'
@@ -73,9 +72,6 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
     void add_label_coords(const std::vector<std::pair<Index, uint64_t>> &coords,
                           const VLabels &labels) override;
 
-    bool has_label(Index i, const Label &label) const override;
-    bool has_labels(Index i, const VLabels &labels) const override;
-
     void serialize(const std::string &filename) const override;
     bool load(const std::string &filename) override;
     // the order of the columns may be changed when merging multiple annotators
@@ -87,7 +83,7 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
                            const ColumnCallback &callback,
                            size_t num_threads = 1);
     static size_t read_num_labels(const std::string &filename);
-    static LabelEncoder<Label> load_label_encoder(const std::string &filename);
+    static LabelEncoder<Label> read_label_encoder(const std::string &filename);
 
     using ValuesCallback = std::function<void(uint64_t offset,
                                               const Label &,
@@ -103,6 +99,15 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
     static void load_columns_and_values(const std::vector<std::string> &filenames,
                                         const ColumnsValuesCallback &callback,
                                         size_t num_threads = 1);
+
+    using ColumnsDelimsValuesCallback = std::function<void(uint64_t offset,
+                                                      const Label &,
+                                                      std::unique_ptr<bit_vector>&&,
+                                                      bit_vector_smart&&,
+                                                      sdsl::int_vector<>&&)>;
+    static void load_columns_delims_and_values(const std::vector<std::string> &filenames,
+                                               const ColumnsDelimsValuesCallback &callback,
+                                               size_t num_threads = 1);
 
     // Dump columns to separate files in human-readable format
     bool dump_columns(const std::string &prefix, size_t num_threads = 1) const;
@@ -127,13 +132,13 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
      * Warning: The returned object doesn't own its data and will become invalid when the
      * current object is destroyed.
      */
-    const binmat::ColumnMajor& get_matrix() const override;
+    const matrix::ColumnMajor& get_matrix() const override;
 
     /**
      * Returns the current annotation matrix. The data is moved into the return value,
      * which leaves the current object empty.
      */
-    std::unique_ptr<binmat::ColumnMajor> release_matrix();
+    std::unique_ptr<matrix::ColumnMajor> release_matrix();
 
     std::string file_extension() const override { return kExtension; }
 
@@ -156,7 +161,7 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
     const std::string swap_dir_;
     const uint64_t buffer_size_bytes_;
 
-    binmat::ColumnMajor matrix_;
+    matrix::ColumnMajor matrix_;
     std::vector<std::unique_ptr<bit_vector>> &bitmatrix_ { matrix_.data() };
 
     mutable std::mutex bitmap_conversion_mu_;
@@ -175,7 +180,7 @@ class ColumnCompressed : public MultiLabelEncoded<Label> {
     std::vector<uint64_t> max_coord_; // stores max coord stored in |coords_|
     size_t max_chunks_open_;
 
-    using MultiLabelEncoded<Label>::label_encoder_;
+    using MultiLabelAnnotation<Label>::label_encoder_;
 };
 
 } // namespace annot

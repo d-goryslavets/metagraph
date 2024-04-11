@@ -7,14 +7,12 @@ from tempfile import TemporaryDirectory
 import glob
 import os
 import gzip
-from base import TestingBase
+from base import TestingBase, METAGRAPH, TEST_DATA_DIR
 
 
 """Test graph construction"""
 
-METAGRAPH = './metagraph'
 PROTEIN_MODE = os.readlink(METAGRAPH).endswith("_Protein")
-TEST_DATA_DIR = os.path.dirname(os.path.realpath(__file__)) + '/../tests/data'
 
 graph_file_extension = {'succinct': '.dbg',
                         'bitmap': '.bitmapdbg',
@@ -50,6 +48,44 @@ class TestBuildWeighted(TestingBase):
         )
 
         res = subprocess.run([construct_command], shell=True)
+        self.assertEqual(res.returncode, 0)
+
+        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(res.returncode, 0)
+        out = res.stdout.decode().split('\n')[2:]
+        self.assertEqual('k: 20', out[0])
+        self.assertEqual('nodes (k): 591997', out[1])
+        self.assertEqual('mode: basic', out[2])
+        self.assertEqual('nnz weights: 591997', out[3])
+        self.assertEqual('avg weight: 2.48587', out[4])
+
+    @parameterized.expand([repr for repr in BUILDS if not (repr == 'bitmap' and PROTEIN_MODE)])
+    def test_simple_all_graphs_contigs(self, build):
+        representation, tmp_dir = build_params[build]
+
+        construct_command = '{exe} build --mask-dummy \
+                --graph {repr} -k 20 --count-kmers --disk-swap {tmp_dir} -o {outfile} {input}'.format(
+            exe=METAGRAPH,
+            repr=representation,
+            tmp_dir=tmp_dir,
+            outfile=self.tempdir.name + '/graph_',
+            input=TEST_DATA_DIR + '/transcripts_1000.fa'
+        )
+
+        res = subprocess.run([construct_command], shell=True)
+        self.assertEqual(res.returncode, 0)
+
+        command = f'{METAGRAPH} transform --to-fasta \
+                -o {self.tempdir.name}/graph_ {self.tempdir.name}/graph_{graph_file_extension[representation]}'
+
+        res = subprocess.run([command], shell=True)
+        self.assertEqual(res.returncode, 0)
+
+        command = f'{METAGRAPH} build --mask-dummy \
+                --graph {representation} -k 20 --count-kmers --disk-swap {tmp_dir} \
+                -o {self.tempdir.name}/graph {self.tempdir.name}/graph_.fasta.gz'
+
+        res = subprocess.run([command], shell=True)
         self.assertEqual(res.returncode, 0)
 
         res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])

@@ -45,9 +45,6 @@ Config::AnnotationType parse_annotation_type(const std::string &filename) {
     } else if (utils::ends_with(filename, annot::RowDiffBRWTAnnotator::kExtension)) {
         return Config::AnnotationType::RowDiffBRWT;
 
-    } else if (utils::ends_with(filename, annot::BinRelWT_sdslAnnotator::kExtension)) {
-        return Config::AnnotationType::BinRelWT_sdsl;
-
     } else if (utils::ends_with(filename, annot::BinRelWTAnnotator::kExtension)) {
         return Config::AnnotationType::BinRelWT;
 
@@ -57,8 +54,20 @@ Config::AnnotationType parse_annotation_type(const std::string &filename) {
     } else if (utils::ends_with(filename, annot::RowSparseAnnotator::kExtension)) {
         return Config::AnnotationType::RowSparse;
 
-    } else if (utils::ends_with(filename, annot::RowDiffRowSparseAnnotator ::kExtension)) {
+    } else if (utils::ends_with(filename, annot::RowDiffRowFlatAnnotator::kExtension)) {
+        return Config::AnnotationType::RowDiffRowFlat;
+
+    } else if (utils::ends_with(filename, annot::RowDiffRowSparseAnnotator::kExtension)) {
         return Config::AnnotationType::RowDiffRowSparse;
+
+    } else if (utils::ends_with(filename, annot::RowDiffDiskAnnotator::kExtension)) {
+        return Config::AnnotationType::RowDiffDisk;
+
+    } else if (utils::ends_with(filename, annot::IntRowDiffDiskAnnotator::kExtension)) {
+        return Config::AnnotationType::IntRowDiffDisk;
+
+    } else if (utils::ends_with(filename, annot::RowDiffDiskCoordAnnotator::kExtension)) {
+        return Config::AnnotationType::RowDiffDiskCoord;
 
     } else if (utils::ends_with(filename, annot::RainbowfishAnnotator::kExtension)) {
         return Config::AnnotationType::RBFish;
@@ -78,7 +87,7 @@ Config::AnnotationType parse_annotation_type(const std::string &filename) {
     }
 }
 
-std::unique_ptr<annot::MultiLabelEncoded<std::string>>
+std::unique_ptr<annot::MultiLabelAnnotation<std::string>>
 initialize_annotation(Config::AnnotationType anno_type,
                       size_t column_compressed_num_columns_cached,
                       bool row_compressed_sparse,
@@ -86,8 +95,9 @@ initialize_annotation(Config::AnnotationType anno_type,
                       const std::string &swap_dir,
                       double memory_available_gb,
                       uint8_t count_width,
-                      size_t max_chunks_open) {
-    std::unique_ptr<annot::MultiLabelEncoded<std::string>> annotation;
+                      size_t max_chunks_open,
+                      size_t RA_ivbuffer_size) {
+    std::unique_ptr<annot::MultiLabelAnnotation<std::string>> annotation;
 
     switch (anno_type) {
         case Config::ColumnCompressed: {
@@ -110,6 +120,18 @@ initialize_annotation(Config::AnnotationType anno_type,
             annotation.reset(new annot::RowSparseAnnotator());
             break;
         }
+        case Config::RowDiffDisk: {
+            annotation.reset(new annot::RowDiffDiskAnnotator({}, nullptr, RA_ivbuffer_size));
+            break;
+        }
+        case Config::IntRowDiffDisk: {
+            annotation.reset(new annot::IntRowDiffDiskAnnotator({}, nullptr, RA_ivbuffer_size));
+            break;
+        }
+        case Config::RowDiffDiskCoord: {
+            annotation.reset(new annot::RowDiffDiskCoordAnnotator({}, nullptr, RA_ivbuffer_size));
+            break;
+        }
         case Config::BRWT: {
             annotation.reset(new annot::MultiBRWTAnnotator());
             break;
@@ -118,12 +140,12 @@ initialize_annotation(Config::AnnotationType anno_type,
             annotation.reset(new annot::RowDiffBRWTAnnotator());
             break;
         }
-        case Config::RowDiffRowSparse: {
-            annotation.reset(new annot::RowDiffRowSparseAnnotator());
+        case Config::RowDiffRowFlat: {
+            annotation.reset(new annot::RowDiffRowFlatAnnotator());
             break;
         }
-        case Config::BinRelWT_sdsl: {
-            annotation.reset(new annot::BinRelWT_sdslAnnotator());
+        case Config::RowDiffRowSparse: {
+            annotation.reset(new annot::RowDiffRowSparseAnnotator());
             break;
         }
         case Config::BinRelWT: {

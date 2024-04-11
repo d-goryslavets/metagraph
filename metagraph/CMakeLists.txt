@@ -65,6 +65,7 @@ enableCCache()
 if(BUILD_STATIC)
   set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
   set(BUILD_SHARED_LIBS OFF)
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -124,7 +125,11 @@ endif()
 if(APPLE)
   # add path to system libraries but avoid cross-compilation errors
   include_directories(SYSTEM /usr/local/include)
+  include_directories(SYSTEM /opt/homebrew/include)
   link_directories(/usr/local/lib)
+  if(EXISTS /opt/homebrew/lib)
+    link_directories(/opt/homebrew/lib)
+  endif()
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag(-Wno-poison-system-directories SUPPORT_NO_POISON_SYS_DIR)
   if(SUPPORT_NO_POISON_SYS_DIR)
@@ -146,7 +151,9 @@ try_compile(MODE_TI
 )
 if(MODE_TI)
   add_definitions(-DMODE_TI)
-  add_compile_options(-mcx16)
+  if(NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")
+      add_compile_options(-mcx16)
+  endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -253,25 +260,37 @@ link_directories(
 include_directories(
  PUBLIC
   external-libraries/KMC/kmc_api
-  external-libraries/DYNAMIC/include
   external-libraries/sdsl-lite/include
-  external-libraries/ips4o
-  external-libraries/eigen
-  external-libraries/caches/include
   external-libraries/hopscotch-map/include
   external-libraries/ordered-map/include
-  external-libraries/binrel_wt/include
-  external-libraries/asio/asio/include
   external-libraries/cpp_progress_bar
   external-libraries/Priority-Deque
   external-libraries/rollinghashcpp
   external-libraries/spdlog/include
   external-libraries/zlib
-  external-libraries/Simple-Web-Server
   external-libraries/sdust
+  external-libraries/simde-no-tests
   ${PROJECT_SOURCE_DIR}/src
 )
 
+# TODO: move ASIO out of here once it replaces sprintf with snprintf
+include_directories(
+  PUBLIC SYSTEM
+  external-libraries/asio/asio/include
+)
+
+add_library(ips4o INTERFACE)
+target_include_directories(ips4o INTERFACE external-libraries/ips4o)
+
+add_library(caches INTERFACE)
+target_include_directories(caches INTERFACE external-libraries/caches/include)
+
+add_library(eigen INTERFACE)
+target_include_directories(eigen INTERFACE external-libraries/eigen)
+target_compile_options(eigen INTERFACE -Wno-unused-but-set-variable -Wno-unused-parameter)
+
+
+set(Boost_USE_STATIC_LIBS ON)
 findFolly()
 if(FOLLY_FOUND)
   add_definitions(-D_USE_FOLLY -DUSE_JEMALLOC)
@@ -288,6 +307,8 @@ endif()
 
 # makes ASIO not depend on boost
 add_definitions(-DASIO_STANDALONE -DUSE_STANDALONE_ASIO)
+set(USE_STANDALONE_ASIO ON)
+set(ASIO_PATH external-libraries/asio/asio)
 
 # assume built-in pthreads on MacOS
 IF(APPLE)
@@ -298,12 +319,15 @@ IF(APPLE)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
 ENDIF()
 add_subdirectory(external-libraries/spdlog)
+add_subdirectory(external-libraries/DYNAMIC)
 add_subdirectory(external-libraries/zlib)
 target_compile_options(zlib
   PRIVATE
     -Wno-unused-variable
     -Wno-sign-compare
     -Wno-implicit-fallthrough
+    -Wno-deprecated-non-prototype
+    -Wno-unknown-warning-option
 )
 
 add_library(progress_bar STATIC
@@ -317,17 +341,16 @@ add_library(mersenne_twister STATIC
 add_library(sdust STATIC
   external-libraries/sdust/sdust.c
 )
+
 target_compile_options(sdust PRIVATE -Wall -Wc++-compat -Wno-error)
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
-  "${CMAKE_SOURCE_DIR}/external-libraries/binrel_wt/cmake/modules"
+include(ExternalProject)
+ExternalProject_Add(HTSLIB
+  SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib
+  CONFIGURE_COMMAND autoreconf -i ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib && ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib/configure --prefix=${CMAKE_BINARY_DIR}/external-libraries/htslib --disable-libcurl --disable-bz2 --disable-lzma
 )
-set(BRWT_INCLUDE_TESTS OFF)
-set(BRWT_INCLUDE_DOCS OFF)
-add_subdirectory(
-  external-libraries/binrel_wt EXCLUDE_FROM_ALL
-)
-brwt_target_link_flags(brwt -lsdsl)
+link_directories(${CMAKE_BINARY_DIR}/external-libraries/htslib/lib)
+include_directories(${CMAKE_BINARY_DIR}/external-libraries/htslib/include)
 
 set(OTHER_COMPILER_FLAGS "")
 get_directory_property(DIRECTORY_DEFINITIONS COMPILE_DEFINITIONS)
@@ -372,6 +395,7 @@ file(GLOB metagraph_cli_files
   "src/cli/*/*/*.cpp"
 )
 add_library(metagraph-cli STATIC ${metagraph_cli_files})
+add_dependencies(metagraph-core HTSLIB)
 
 add_executable(metagraph "src/main.cpp")
 set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_ALPHABET}")
@@ -380,12 +404,15 @@ set(METALIBS ${METALIBS}
   -lKMC
   -lhts zlib
   -lsdsl
-  brwt
   jsoncpp_lib
   progress_bar
   mersenne_twister
   sdust
   spdlog::spdlog
+  XXSDS_DYNAMIC
+  ips4o
+  caches
+  eigen
 )
 if(APPLE)
   set(METALIBS ${METALIBS} ${OpenMP_CXX_LIBRARIES})
@@ -395,11 +422,9 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR NOT ${CMAKE_SYSTEM_NAME} MATCHES "Dar
 endif()
 
 if(BUILD_STATIC AND NOT APPLE)
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
-  set(OPENSSL_USE_STATIC_LIBS TRUE)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libstdc++ -static-libgcc")
   find_package(OpenSSL REQUIRED)
-  find_package(BZip2 REQUIRED)
-  set(METALIBS ${METALIBS} -llzma -lcurl -lssl -lcrypto -lbz2)
+  set(METALIBS ${METALIBS} -lssl -lcrypto -lgomp -lrt -ldl -Wl,--whole-archive -lpthread -Wl,--no-whole-archive)
 endif()
 
 # check for std::filesystem::temp_directory_path
@@ -450,7 +475,8 @@ if(NOT CPPNOFS)
 endif()
 
 target_link_libraries(metagraph-core ${METALIBS})
-target_link_libraries(metagraph-cli PRIVATE metagraph-core)
+add_subdirectory(external-libraries/Simple-Web-Server)
+target_link_libraries(metagraph-cli PRIVATE metagraph-core simple-web-server)
 target_link_libraries(metagraph metagraph-core metagraph-cli)
 
 add_custom_target(link_target ALL
@@ -462,26 +488,6 @@ add_custom_target(link_target ALL
 
 add_dependencies(metagraph link_target)
 
-
-#-------------------
-# Experiments
-#-------------------
-file(GLOB experiment_files
-  "experiments/*.cpp"
-)
-list(FILTER experiment_files EXCLUDE REGEX ".*\\._.*")
-
-include_directories(
-  experiments
-  external-libraries/tclap/include
-)
-
-link_directories(
-  external-libraries/sdsl-lite/lib
-)
-add_executable(run_experiments ${experiment_files})
-
-target_link_libraries(run_experiments metagraph-core metagraph-cli)
 
 #-------------------
 # install library
@@ -531,7 +537,7 @@ target_include_directories(unit_tests PRIVATE "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(unit_tests PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 target_link_libraries(unit_tests gtest_main gtest gmock metagraph-core metagraph-cli)
 
-target_compile_options(unit_tests PRIVATE -Wno-undefined-var-template ${DEATH_TEST_FLAG})
+target_compile_options(unit_tests PRIVATE -Wno-uninitialized ${DEATH_TEST_FLAG})
 
 #-------------------
 # Benchmarks
@@ -548,7 +554,7 @@ add_executable(benchmarks ${benchmark_files})
 target_compile_definitions(benchmarks PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 target_link_libraries(benchmarks benchmark_main benchmark metagraph-core metagraph-cli -lsdsl)
 
-target_compile_options(benchmarks PRIVATE -Wno-undefined-var-template)
+target_compile_options(benchmarks PRIVATE)
 
 #-------------------
 # Tests
@@ -592,23 +598,3 @@ file(INSTALL "${PROJECT_BINARY_DIR}/CMakeFiles/integration_tests"
                    GROUP_READ GROUP_EXECUTE
                    WORLD_READ WORLD_EXECUTE
 )
-
-#-------------------
-# Python interfaces
-#-------------------
-if(PYTHON_INTERFACE)
-  FIND_PACKAGE(SWIG REQUIRED)
-  INCLUDE(${SWIG_USE_FILE})
-
-  FIND_PACKAGE(PythonLibs)
-  INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_PATH})
-
-  SET(CMAKE_SWIG_FLAGS "")
-
-  file(GLOB interface_files "interfaces/*.i")
-
-  SET_SOURCE_FILES_PROPERTIES(${interface_files} PROPERTIES CPLUSPLUS ON)
-
-  SWIG_ADD_LIBRARY(metagraph LANGUAGE python SOURCES ${interface_files})
-  SWIG_LINK_LIBRARIES(metagraph metagraph-core ${METALIBS} ${PYTHON_LIBRARIES})
-endif()

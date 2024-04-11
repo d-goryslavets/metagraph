@@ -6,7 +6,7 @@
 
 namespace mtg {
 namespace annot {
-namespace binmat {
+namespace matrix {
 
 RowSparse::RowSparse(const std::function<void(const RowCallback &)> &call_rows,
                      uint64_t num_columns,
@@ -37,16 +37,11 @@ RowSparse::RowSparse(const std::function<void(const RowCallback &)> &call_rows,
     utils::remove_temp_dir(tmp_dir);
 }
 
-bool RowSparse::get(Row row, Column column) const {
-    SetBitPositions set_bits = get_row(row);
-    SetBitPositions::iterator v = std::lower_bound(set_bits.begin(), set_bits.end(), column);
-    return v != set_bits.end() && *v == column;
-}
-
 std::vector<BinaryMatrix::Row> RowSparse::get_column(Column column) const {
     std::vector<Row> result;
     for (Row row = 0; row < num_rows(); ++row) {
-        if (get(row, column))
+        SetBitPositions set_bits = get_row(row);
+        if (std::binary_search(set_bits.begin(), set_bits.end(), column))
             result.push_back(row);
     }
     return result;
@@ -85,6 +80,6 @@ void RowSparse::serialize(std::ostream &f) const  {
     boundary_.serialize(f);
 }
 
-} // namespace binmat
+} // namespace matrix
 } // namespace annot
 } // namespace mtg

@@ -22,16 +22,20 @@ anno_file_extension = {'column': '.column.annodbg',
                        'brwt_coord': '.brwt_coord.annodbg',
                        'row_diff_coord': '.row_diff_coord.annodbg',
                        'row_diff_brwt_coord': '.row_diff_brwt_coord.annodbg',
+                       'row_diff_disk_coord': '.row_diff_disk_coord.annodbg',
                        'row': '.row.annodbg',
                        'row_diff': '.row_diff.annodbg',
                        'row_sparse': '.row_sparse.annodbg',
                        'row_diff_brwt': '.row_diff_brwt.annodbg',
+                       'row_diff_disk': '.row_diff_disk.annodbg',
+                       'row_diff_flat': '.row_diff_flat.annodbg',
                        'row_diff_sparse': '.row_diff_sparse.annodbg',
                        'row_diff_sparse_noswap': '.row_diff_sparse.annodbg',
                        'rb_brwt': '.rb_brwt.annodbg',
                        'brwt': '.brwt.annodbg',
                        'int_brwt': '.int_brwt.annodbg',
                        'row_diff_int_brwt': '.row_diff_int_brwt.annodbg',
+                       'row_diff_int_disk': '.row_diff_int_disk.annodbg',
                        'rbfish': '.rbfish.annodbg',
                        'flat': '.flat.annodbg'}
 
@@ -39,6 +43,10 @@ GRAPH_TYPES = [graph_type for graph_type, _ in graph_file_extension.items()]
 ANNO_TYPES = [anno_type for anno_type, _ in anno_file_extension.items()]
 
 NUM_THREADS = 4
+
+MEMORY_MAPPING = True
+MMAP_FLAG = ' --mmap' if MEMORY_MAPPING else ''
+
 
 def product(graph_types, anno_types):
     result  = []
@@ -89,7 +97,7 @@ class TestQuery(TestingBase):
         if cls.with_bloom:
             convert_command = f'{METAGRAPH} transform -o {cls.tempdir.name}/graph \
                                 --initialize-bloom --bloom-fpp 0.1 \
-                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}'
+                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}' + MMAP_FLAG
             res = subprocess.run([convert_command], shell=True)
             assert(res.returncode == 0)
 
@@ -127,22 +135,22 @@ class TestQuery(TestingBase):
         assert(f'representation: {cls.anno_repr}' == out[3])
 
     def test_query(self):
-        query_command = '{exe} query -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137140)
 
-        query_command = '{exe} query --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 136959)
@@ -150,46 +158,46 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_query_both(self):
         """query graph (fwd and reverse)"""
-        query_command = '{exe} query --fwd-and-reverse -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 261390)
 
-        query_command = '{exe} query --fwd-and-reverse --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 260215)
 
     def test_query_parallel(self):
         """query graph (multi-threaded)"""
-        query_command = '{exe} query -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137140)
 
-        query_command = '{exe} query --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 136959)
@@ -197,35 +205,35 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_query_both_parallel(self):
         """query graph (fwd and reverse, multi-threaded)"""
-        query_command = '{exe} query --fwd-and-reverse -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 261390)
 
-        query_command = '{exe} query --fwd-and-reverse --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 260215)
 
     def test_query_with_align(self):
-        query_command = '{exe} query --align -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -233,12 +241,12 @@ class TestQuery(TestingBase):
         else:
             self.assertEqual(len(res.stdout), 12244)
 
-        query_command = '{exe} query --align --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -247,13 +255,13 @@ class TestQuery(TestingBase):
             self.assertEqual(len(res.stdout), 12350)
 
         # align to graph (multi-threaded)
-        query_command = '{exe} query --align -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -261,13 +269,13 @@ class TestQuery(TestingBase):
         else:
             self.assertEqual(len(res.stdout), 12244)
 
-        query_command = '{exe} query --align --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -278,45 +286,45 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_query_with_align_both(self):
         """align to graph (fwd and reverse multi-threaded)"""
-        query_command = '{exe} query --fwd-and-reverse --align -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse --align -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 24567)
 
-        query_command = '{exe} query --fwd-and-reverse --align --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --fwd-and-reverse --align --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 24779)
 
     def test_batch_query(self):
-        query_command = '{exe} query --fast -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137140)
 
-        query_command = '{exe} query --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 136959)
@@ -324,46 +332,46 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_batch_query_both(self):
         """query graph (fwd and reverse)"""
-        query_command = '{exe} query --fast --fwd-and-reverse -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 261390)
 
-        query_command = '{exe} query --fast --fwd-and-reverse --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 260215)
 
     def test_batch_query_parallel(self):
         """query graph (multi-threaded)"""
-        query_command = '{exe} query --fast -i {graph} -a {annotation} -p {num_threads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 -i {graph} -a {annotation} -p {num_threads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_threads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137140)
 
-        query_command = '{exe} query --fast --count-labels -i {graph} -a {annotation} -p {num_threads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --query-mode matches -i {graph} -a {annotation} -p {num_threads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_threads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 136959)
@@ -371,35 +379,35 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_batch_query_both_parallel(self):
         """query graph (fwd and reverse, multi-threaded)"""
-        query_command = '{exe} query --fast --fwd-and-reverse -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 261390)
 
-        query_command = '{exe} query --fast --fwd-and-reverse --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 260215)
 
     def test_batch_query_with_align(self):
-        query_command = '{exe} query --align --fast -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -407,7 +415,7 @@ class TestQuery(TestingBase):
         else:
             self.assertEqual(len(res.stdout), 12244)
 
-        query_command = '{exe} query --align --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
@@ -421,13 +429,13 @@ class TestQuery(TestingBase):
             self.assertEqual(len(res.stdout), 12350)
 
         # align to graph (multi-threaded)
-        query_command = '{exe} query --align --fast -i {graph} -a {annotation} -p {num_threads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align -i {graph} -a {annotation} -p {num_threads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_threads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -435,13 +443,13 @@ class TestQuery(TestingBase):
         else:
             self.assertEqual(len(res.stdout), 12244)
 
-        query_command = '{exe} query --align --fast --count-labels -i {graph} -a {annotation} -p {num_threads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align --query-mode matches -i {graph} -a {annotation} -p {num_threads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_threads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         if DNA_MODE:
@@ -452,45 +460,45 @@ class TestQuery(TestingBase):
     @unittest.skipIf(PROTEIN_MODE, "Reverse sequences for Protein alphabets are not defined")
     def test_batch_query_with_align_both(self):
         """align to graph (fwd and reverse multi-threaded)"""
-        query_command = '{exe} query --fast --fwd-and-reverse --align -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse --align -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 24567)
 
-        query_command = '{exe} query --fast --fwd-and-reverse --align --count-labels -i {graph} -a {annotation} -p {num_theads} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --fwd-and-reverse --align --query-mode matches -i {graph} -a {annotation} -p {num_theads} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa',
             num_theads=NUM_THREADS
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 24779)
 
     def test_batch_query_with_tiny_batch(self):
-        query_command = '{exe} query --fast --batch-size 100 -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137140)
 
-        query_command = '{exe} query --fast --batch-size 100 --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 136959)
@@ -499,19 +507,19 @@ class TestQuery(TestingBase):
         if not self.anno_repr.endswith('_coord'):
             self.skipTest('annotation does not support coordinates')
 
-        query_command = f'{METAGRAPH} query --query-coords \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 0.05 {TEST_DATA_DIR}/transcripts_100.fa'
+                            --min-kmers-fraction-label 0.05 {TEST_DATA_DIR}/transcripts_100.fa' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 139268)
 
-        query_command = f'{METAGRAPH} query --query-coords \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 0.95 {TEST_DATA_DIR}/transcripts_100.fa'
+                            --min-kmers-fraction-label 0.95 {TEST_DATA_DIR}/transcripts_100.fa' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
@@ -521,19 +529,19 @@ class TestQuery(TestingBase):
         if not self.anno_repr.endswith('_coord'):
             self.skipTest('annotation does not support coordinates')
 
-        query_command = f'{METAGRAPH} query --query-coords --verbose-output \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords --verbose-output \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 0.05 {TEST_DATA_DIR}/transcripts_100.fa'
+                            --min-kmers-fraction-label 0.05 {TEST_DATA_DIR}/transcripts_100.fa' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 1619883)
 
-        query_command = f'{METAGRAPH} query --query-coords --verbose-output \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords --verbose-output \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 0.95 {TEST_DATA_DIR}/transcripts_100.fa'
+                            --min-kmers-fraction-label 0.95 {TEST_DATA_DIR}/transcripts_100.fa' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
@@ -604,10 +612,10 @@ class TestQueryTinyLinear(TestingBase):
         if not self.anno_repr.endswith('_coord'):
             self.skipTest('annotation does not support coordinates')
 
-        query_command = f'{METAGRAPH} query --query-coords  --verbose-output \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords  --verbose-output \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 0.05 {self.fasta_graph}'
+                            --min-kmers-fraction-label 0.05 {self.fasta_graph}' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
@@ -658,7 +666,7 @@ class TestQuery1Column(TestingBase):
         if cls.with_bloom:
             convert_command = f'{METAGRAPH} transform -o {cls.tempdir.name}/graph \
                                 --initialize-bloom --bloom-fpp 0.1 \
-                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}'
+                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}' + MMAP_FLAG
             res = subprocess.run([convert_command], shell=True)
             assert(res.returncode == 0)
 
@@ -697,20 +705,20 @@ class TestQuery1Column(TestingBase):
         assert('representation: ' + cls.anno_repr == out[3])
 
     def test_query(self):
-        query_command = f'{METAGRAPH} query \
+        query_command = f'{METAGRAPH} query --batch-size 0 \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 1.0 \
-                            {TEST_DATA_DIR}/transcripts_1000.fa'
+                            --min-kmers-fraction-label 1.0 \
+                            {TEST_DATA_DIR}/transcripts_1000.fa' + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(hashlib.sha224(res.stdout).hexdigest(), '254d173abb255a81a4ab8a685201a73de8dbad4546c378e0a645d454')
 
-        query_command = f'{METAGRAPH} query --count-labels \
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode matches \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction 1.0 \
-                            {TEST_DATA_DIR}/transcripts_1000.fa'
+                            --min-kmers-fraction-label 1.0 \
+                            {TEST_DATA_DIR}/transcripts_1000.fa' + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(hashlib.sha224(res.stdout).hexdigest(), '1bd6c24373812064c3e17e73533de7b1e30baa3cca3a64b460e83cb4')
@@ -719,7 +727,7 @@ class TestQuery1Column(TestingBase):
 @parameterized_class(('graph_repr', 'anno_repr'),
     input_values=product(
         [repr for repr in GRAPH_TYPES if not (repr == 'bitmap' and PROTEIN_MODE)],
-        [anno_type for anno_type in ANNO_TYPES if anno_type.endswith('int_brwt') or anno_type.endswith('_coord')]
+        [anno_type for anno_type in ANNO_TYPES if '_int_' in anno_type or anno_type.endswith('_coord')]
     ),
     class_name_func=get_test_class_name
 )
@@ -791,7 +799,7 @@ class TestQueryCounts(TestingBase):
         if cls.with_bloom:
             convert_command = f'{METAGRAPH} transform -o {cls.tempdir.name}/graph \
                                 --initialize-bloom --bloom-fpp 0.1 \
-                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}'
+                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}' + MMAP_FLAG
             res = subprocess.run([convert_command], shell=True)
             assert(res.returncode == 0)
 
@@ -864,10 +872,10 @@ class TestQueryCounts(TestingBase):
 
                     expected_output += '\n'
 
-            query_command = f'{METAGRAPH} query --fast --count-kmers \
+            query_command = f'{METAGRAPH} query --batch-size 100000000 --query-mode counts-sum \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction {discovery_rate} {query_file}'
+                            --min-kmers-fraction-label {discovery_rate} {query_file}' + MMAP_FLAG
 
             res = subprocess.run(query_command.split(), stdout=PIPE)
             self.assertEqual(res.returncode, 0)
@@ -903,19 +911,19 @@ class TestQueryCounts(TestingBase):
 
                     expected_output += '\n'
 
-            query_command = f'{METAGRAPH} query --fast --query-counts --verbose-output \
+            query_command = f'{METAGRAPH} query --batch-size 100000000 --query-mode counts --verbose-output \
                             -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                             -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                            --discovery-fraction {discovery_rate} {query_file}'
+                            --min-kmers-fraction-label {discovery_rate} {query_file}' + MMAP_FLAG
 
             res = subprocess.run(query_command.split(), stdout=PIPE)
             self.assertEqual(res.returncode, 0)
             self._compare_unsorted_results(res.stdout.decode(), expected_output)
 
-        query_command = f'{METAGRAPH} query --fast --query-counts \
+        query_command = f'{METAGRAPH} query --batch-size 100000000 --query-mode counts \
                         -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
                         -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                        --discovery-fraction {discovery_rate} {query_file}'
+                        --min-kmers-fraction-label {discovery_rate} {query_file}' + MMAP_FLAG
 
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
@@ -932,49 +940,6 @@ class TestQueryCounts(TestingBase):
             f"9\ts9\t<{self.fasta_file_1}>:0=1:1=2:2=3:3=4:4=5:5=6:6=7:7=8:8=9:9=10:10=11:11=12:12=1\n"
             f"10\ts10\t<{self.fasta_file_1}>:0=10:1=11:2=12:3=1:4=2:5=3:6=4:7=5:8=6:9=7\n"
             "11\ts11\n")
-
-    def test_count_quantiles(self):
-        query_file = self.tempdir.name + '/query.fa'
-        quantiles = np.linspace(0, 1, 100)
-        expected_output = ''
-        with open(query_file, 'w') as f:
-            for i, s in enumerate(self.queries):
-                f.write(f'>s{i}\n{s}\n')
-                expected_output += f'{i}\ts{i}\t<{self.fasta_file_1}>'
-                def get_count(d, kmer):
-                    try:
-                        return d[kmer]
-                    except:
-                        return 0
-                for p in quantiles:
-                    counts = [get_count(self.kmer_counts_1, s[i:i + self.k]) for i in range(len(s) - self.k + 1)]
-                    expected_output += f':{np.quantile(counts, p, interpolation="lower")}'
-                expected_output += f'\t<{self.fasta_file_2}>'
-                for p in quantiles:
-                    counts = [get_count(self.kmer_counts_2, s[i:i + self.k]) for i in range(len(s) - self.k + 1)]
-                    expected_output += f':{np.quantile(counts, p, interpolation="lower")}'
-                expected_output += '\n'
-
-        query_command = f'{METAGRAPH} query --fast --count-quantiles <SET_BELOW> \
-                        -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
-                        -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                        --discovery-fraction 0.0 {query_file}'
-
-        query_command = query_command.split()
-        query_command[4] = ' '.join([str(p) for p in quantiles])
-        res = subprocess.run(query_command, stdout=PIPE)
-        self.assertEqual(res.returncode, 0)
-        self._compare_unsorted_results(res.stdout.decode(), expected_output)
-
-        query_command = f'{METAGRAPH} query --fast --count-quantiles <SET_BELOW> \
-                        -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
-                        -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
-                        --discovery-fraction 1.0 {query_file}'
-
-        query_command = query_command.split()
-        query_command[4] = ' '.join([str(p) for p in quantiles])
-        res = subprocess.run(query_command, stdout=PIPE)
-        self.assertEqual(res.returncode, 0)
 
 
 @parameterized_class(('graph_repr', 'anno_repr'),
@@ -1014,7 +979,7 @@ class TestQueryCanonical(TestingBase):
         if cls.with_bloom:
             convert_command = f'{METAGRAPH} transform -o {cls.tempdir.name}/graph \
                                 --initialize-bloom --bloom-fpp 0.1 \
-                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}'
+                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}' + MMAP_FLAG
             res = subprocess.run([convert_command], shell=True)
             assert(res.returncode == 0)
 
@@ -1039,106 +1004,106 @@ class TestQueryCanonical(TestingBase):
         assert('representation: ' + cls.anno_repr == out[3])
 
     def test_query(self):
-        query_command = '{exe} query -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)
 
     def test_query_with_align(self):
-        query_command = '{exe} query --align -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12840)
 
-        query_command = '{exe} query --align --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12970)
 
     def test_batch_query(self):
-        query_command = '{exe} query --fast -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)
 
     def test_batch_query_with_align(self):
-        query_command = '{exe} query --align --fast -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12840)
 
-        query_command = '{exe} query --align --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12970)
 
     def test_batch_query_with_tiny_batch(self):
-        query_command = '{exe} query --fast --batch-size 100 -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --fast --batch-size 100 --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)
@@ -1181,7 +1146,7 @@ class TestQueryPrimary(TestingBase):
         if cls.with_bloom:
             convert_command = f'{METAGRAPH} transform -o {cls.tempdir.name}/graph \
                                 --initialize-bloom --bloom-fpp 0.1 \
-                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}'
+                                {cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}' + MMAP_FLAG
             res = subprocess.run([convert_command], shell=True)
             assert(res.returncode == 0)
 
@@ -1206,106 +1171,106 @@ class TestQueryPrimary(TestingBase):
         assert('representation: ' + cls.anno_repr == out[3])
 
     def test_query(self):
-        query_command = '{exe} query -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)
 
     def test_query_with_align(self):
-        query_command = '{exe} query --align -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12840)
 
-        query_command = '{exe} query --align --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 0 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12970)
 
     def test_batch_query(self):
-        query_command = '{exe} query --fast -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)
 
     def test_batch_query_with_align(self):
-        query_command = '{exe} query --align --fast -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12840)
 
-        query_command = '{exe} query --align --fast --count-labels -i {graph} -a {annotation} --discovery-fraction 0.0 --align-min-exact-match 0.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --align --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 0.0 --align-min-exact-match 0.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_100_tail10_snp.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 12970)
 
     def test_batch_query_with_tiny_batch(self):
-        query_command = '{exe} query --fast --batch-size 100 -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137269)
 
-        query_command = '{exe} query --fast --batch-size 100 --count-labels -i {graph} -a {annotation} --discovery-fraction 1.0 {input}'.format(
+        query_command = '{exe} query --batch-size 100000000 --batch-size 100 --query-mode matches -i {graph} -a {annotation} --min-kmers-fraction-label 1.0 {input}'.format(
             exe=METAGRAPH,
             graph=self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
             annotation=self.tempdir.name + '/annotation' + anno_file_extension[self.anno_repr],
             input=TEST_DATA_DIR + '/transcripts_1000.fa'
-        )
+        ) + MMAP_FLAG
         res = subprocess.run(query_command.split(), stdout=PIPE)
         self.assertEqual(res.returncode, 0)
         self.assertEqual(len(res.stdout), 137093)

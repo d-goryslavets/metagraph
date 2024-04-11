@@ -8,12 +8,11 @@
 #include <ips4o.hpp>
 
 #include "common/serialization.hpp"
+#include "common/utils/file_utils.hpp"
 #include "common/utils/string_utils.hpp"
 #include "common/logger.hpp"
 #include "common/unix_tools.hpp"
 #include "common/vectors/bitmap_builder.hpp"
-#include "common/vectors/bitmap_mergers.hpp"
-#include "common/vectors/bit_vector_adaptive.hpp"
 #include "common/threads/threading.hpp"
 
 
@@ -83,24 +82,6 @@ ColumnCompressed<Label>::~ColumnCompressed() {
     // Note: this is needed to make sure that everything is flushed to bitmatrix_
     //       BEFORE bitmatrix_ is destroyed
     cached_columns_.Clear();
-}
-
-template <typename Label>
-void ColumnCompressed<Label>::set(Index i, const VLabels &labels) {
-    assert(i < num_rows_);
-    // add new labels
-    for (const auto &label : labels) {
-        label_encoder_.insert_and_encode(label);
-    }
-    // labels as a row
-    std::vector<bool> row(label_encoder_.size(), 0);
-    for (const auto &label : labels) {
-        row[label_encoder_.encode(label)] = 1;
-    }
-    // set bits
-    for (size_t j = 0; j < row.size(); ++j) {
-        set(i, j, row[j]);
-    }
 }
 
 template <typename Label>
@@ -195,28 +176,10 @@ void ColumnCompressed<Label>::add_label_coords(const std::vector<std::pair<Index
 }
 
 template <typename Label>
-bool ColumnCompressed<Label>::has_label(Index i, const Label &label) const {
-    try {
-        return get_column(label)[i];
-    } catch (...) {
-        return false;
-    }
-}
-
-template <typename Label>
-bool ColumnCompressed<Label>::has_labels(Index i, const VLabels &labels) const {
-    for (const auto &label : labels) {
-        if (!has_label(i, label))
-            return false;
-    }
-    return true;
-}
-
-template <typename Label>
 void ColumnCompressed<Label>::serialize(const std::string &filename) const {
     flush();
 
-    std::ofstream out(make_suffix(filename, kExtension), std::ios::binary);
+    std::ofstream out = utils::open_new_ofstream(make_suffix(filename, kExtension));
     if (!out) {
         logger->error("Could not open file for writing: {}",
                       make_suffix(filename, kExtension));
@@ -244,7 +207,7 @@ void ColumnCompressed<Label>::serialize(const std::string &filename) const {
 template <typename Label>
 void ColumnCompressed<Label>::serialize_counts(const std::string &filename) const {
     auto counts_fname = remove_suffix(filename, kExtension) + kCountExtension;
-    std::ofstream out(counts_fname, std::ios::binary);
+    std::ofstream out = utils::open_new_ofstream(counts_fname);
     if (!out) {
         logger->error("Could not open file for writing: {}", counts_fname);
         throw std::ofstream::failure("Bad stream");
@@ -309,7 +272,7 @@ void ColumnCompressed<Label>::serialize_counts(const std::string &filename) cons
 template <typename Label>
 void ColumnCompressed<Label>::serialize_coordinates(const std::string &filename) const {
     auto coords_fname = remove_suffix(filename, kExtension) + kCoordExtension;
-    std::ofstream out(coords_fname, std::ios::binary);
+    std::ofstream out = utils::open_new_ofstream(coords_fname);
     if (!out) {
         logger->error("Could not open file for writing: {}", coords_fname);
         throw std::ofstream::failure("Bad stream");
@@ -449,18 +412,15 @@ void ColumnCompressed<Label>::serialize_coordinates(const std::string &filename)
 
             {
                 sdsl::bit_vector delim_bv;
-                std::ifstream in(tmp_path/"delim", std::ios::binary);
-                delim_bv.load(in);
+                std::unique_ptr<std::ifstream> in = utils::open_ifstream(tmp_path/"delim");
+                delim_bv.load(*in);
                 bit_vector_smart(std::move(delim_bv)).serialize(out);
             }
 
             out.close();
 
-            std::string concat_command = fmt::format("cat {} >> {}", tmp_path/"coords", coords_fname);
-            if (std::system(concat_command.c_str())) {
-                logger->error("Error while cat-ing files: {}", concat_command);
-                std::exit(EXIT_FAILURE);
-            }
+            utils::append_file(tmp_path/"coords", coords_fname);
+            fs::remove(tmp_path/"coords");
 
             out = std::ofstream(coords_fname, std::ios::binary | std::ios::app);
         }
@@ -484,7 +444,8 @@ bool ColumnCompressed<Label>::load(const std::string &filename) {
     logger->trace("Loading annotations from file {}", f);
 
     try {
-        std::ifstream in(f, std::ios::binary);
+        std::unique_ptr<std::ifstream> in_ptr = utils::open_ifstream(f);
+        auto &in = *in_ptr;
         if (!in.good())
             throw std::ifstream::failure("can't open file");
 
@@ -577,12 +538,12 @@ bool ColumnCompressed<Label>::merge_load(const std::vector<std::string> &filenam
 
 template <typename Label>
 size_t ColumnCompressed<Label>::read_num_labels(const std::string &filename) {
-    return load_label_encoder(filename).size();
+    return read_label_encoder(filename).size();
 }
 
 template <typename Label>
 LabelEncoder<Label>
-ColumnCompressed<Label>::load_label_encoder(const std::string &filename) {
+ColumnCompressed<Label>::read_label_encoder(const std::string &filename) {
     auto fname = make_suffix(filename, kExtension);
     std::ifstream in(filename, std::ios::binary);
     std::ignore = load_number(in); // read num_rows
@@ -624,7 +585,8 @@ bool ColumnCompressed<Label>::merge_load(const std::vector<std::string> &filenam
         const auto &filename = make_suffix(filenames[i], kExtension);
         logger->trace("Loading annotations from file {}", filename);
         try {
-            std::ifstream in(filename, std::ios::binary);
+            std::unique_ptr<std::ifstream> in_ptr = utils::open_ifstream(filename);
+            auto &in = *in_ptr;
             if (!in.good())
                 throw std::ifstream::failure("can't open file");
 
@@ -696,7 +658,7 @@ void ColumnCompressed<Label>
         const auto &filename = make_suffix(filenames[i], kExtension);
         logger->trace("Loading labels from {}", filename);
         try {
-            LabelEncoder<Label> label_encoder_load = load_label_encoder(filename);
+            LabelEncoder<Label> label_encoder_load = read_label_encoder(filename);
 
             if (!label_encoder_load.size()) {
                 logger->warn("No columns in {}", filename);
@@ -706,7 +668,8 @@ void ColumnCompressed<Label>
             const auto &values_fname
                 = remove_suffix(filename, kExtension) + kCountExtension;
 
-            std::ifstream values_in(values_fname, std::ios::binary);
+            std::unique_ptr<std::ifstream> in_ptr = utils::open_ifstream(values_fname);
+            auto &values_in = *in_ptr;
             if (!values_in)
                 throw std::ifstream::failure("can't open file " + values_fname);
 
@@ -770,7 +733,8 @@ void ColumnCompressed<Label>
         const auto &filename = make_suffix(filenames[i], kExtension);
         logger->trace("Loading columns from {}", filename);
         try {
-            std::ifstream in(filename, std::ios::binary);
+            std::unique_ptr<std::ifstream> in_ptr = utils::open_ifstream(filename);
+            auto &in = *in_ptr;
             if (!in)
                 throw std::ifstream::failure("can't open file");
 
@@ -789,7 +753,8 @@ void ColumnCompressed<Label>
                 = utils::remove_suffix(filename, ColumnCompressed<>::kExtension)
                                                 + ColumnCompressed<>::kCountExtension;
 
-            std::ifstream values_in(values_fname, std::ios::binary);
+            std::unique_ptr<std::ifstream> values_in_ptr = utils::open_ifstream(values_fname);
+            auto &values_in = *values_in_ptr;
             if (!values_in)
                 throw std::ifstream::failure("can't open file " + values_fname);
 
@@ -813,6 +778,108 @@ void ColumnCompressed<Label>
                 callback(offsets[i] + c,
                          label_encoder_load.decode(c),
                          std::move(column), std::move(column_values));
+            }
+
+        } catch (const std::exception &e) {
+            logger->error("Caught exception when loading values for {}: {}", filename, e.what());
+            error_occurred = true;
+        } catch (...) {
+            logger->error("Unknown exception when loading values for {}", filename);
+            error_occurred = true;
+        }
+    }
+
+    if (error_occurred)
+        exit(1);
+}
+
+template <typename Label>
+void ColumnCompressed<Label>::load_columns_delims_and_values(
+        const std::vector<std::string> &filenames,
+        const ColumnsDelimsValuesCallback &callback,
+        size_t num_threads) {
+
+    std::atomic<bool> error_occurred = false;
+
+    std::vector<uint64_t> offsets(filenames.size(), 0);
+
+    // load labels
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+    for (size_t i = 1; i < filenames.size(); ++i) {
+        auto fname = make_suffix(filenames[i - 1], kExtension);
+        try {
+            offsets[i] = read_num_labels(fname);
+        } catch (...) {
+            logger->error("Can't load label encoder from {}", fname);
+            error_occurred = true;
+        }
+    }
+
+    if (error_occurred)
+        exit(1);
+
+    // compute global offsets (partial sums)
+    std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+
+    // load annotations
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+    for (size_t i = 0; i < filenames.size(); ++i) {
+        const auto &filename = make_suffix(filenames[i], kExtension);
+        logger->trace("Loading columns from {}", filename);
+        try {
+            std::unique_ptr<std::ifstream> in_ptr = utils::open_ifstream(filename);
+            auto &in = *in_ptr;
+            if (!in)
+                throw std::ifstream::failure("can't open file");
+
+            std::ignore = load_number(in);
+
+            LabelEncoder<Label> label_encoder_load;
+            if (!label_encoder_load.load(in))
+                throw std::ifstream::failure("can't load label encoder");
+
+            if (!label_encoder_load.size()) {
+                logger->warn("No columns in {}", filename);
+                continue;
+            }
+
+            const auto &coords_fname
+                    = utils::remove_suffix(filename, ColumnCompressed<>::kExtension)
+                    + ColumnCompressed<>::kCoordExtension;
+
+            std::unique_ptr<std::ifstream> coords_in_ptr = utils::open_ifstream(coords_fname);
+            auto &coord_in = *coords_in_ptr;
+            if (!coord_in)
+                throw std::ifstream::failure("can't open file " + coords_fname);
+
+            for (size_t c = 0; c < label_encoder_load.size(); ++c) {
+                auto column = std::make_unique<bit_vector_smart>();
+
+                if (!column->load(in))
+                    throw std::ifstream::failure("can't load next column");
+
+                bit_vector_smart delims;
+                sdsl::int_vector<> column_values;
+
+                try {
+                    if(!delims.load(coord_in))
+                        throw std::runtime_error("can't load delims");
+                } catch(...) {
+                    logger->error("Can't load delimeters from {} for column {}",
+                                  coords_fname, c);
+                    throw;
+                }
+                try {
+                    column_values.load(coord_in);
+                } catch(...) {
+                    logger->error("Can't load column values from {} for column {}",
+                                  coords_fname, c);
+                    throw;
+                }
+
+                callback(offsets[i] + c,
+                         label_encoder_load.decode(c),
+                         std::move(column), std::move(delims), std::move(column_values));
             }
 
         } catch (const std::exception &e) {
@@ -1073,16 +1140,16 @@ const bitmap& ColumnCompressed<Label>::get_column(const Label &label) const {
 }
 
 template <typename Label>
-const binmat::ColumnMajor& ColumnCompressed<Label>::get_matrix() const {
+const matrix::ColumnMajor& ColumnCompressed<Label>::get_matrix() const {
     flush();
     return matrix_;
 }
 
 template <typename Label>
-std::unique_ptr<binmat::ColumnMajor> ColumnCompressed<Label>::release_matrix() {
+std::unique_ptr<matrix::ColumnMajor> ColumnCompressed<Label>::release_matrix() {
     flush();
     label_encoder_.clear();
-    return std::make_unique<binmat::ColumnMajor>(std::move(matrix_));
+    return std::make_unique<matrix::ColumnMajor>(std::move(matrix_));
 }
 
 template <typename Label>

@@ -11,7 +11,7 @@
 
 namespace mtg {
 namespace annot {
-namespace binmat {
+namespace matrix {
 
 using mtg::common::logger;
 
@@ -244,8 +244,8 @@ BRWT BRWTBottomUpBuilder::build(
         get_node = [tmp_dir](uint64_t id) {
             BRWT node;
             auto filename = tmp_dir/std::to_string(id);
-            std::ifstream in(filename, std::ios::binary);
-            if (!node.load(in)) {
+            std::unique_ptr<std::ifstream> in = utils::open_ifstream(filename);
+            if (!node.load(*in)) {
                 logger->error("Can't load temp BRWT node {}", filename);
                 exit(1);
             }
@@ -310,8 +310,11 @@ BRWT BRWTBottomUpBuilder::build(
     num_nodes_parallel = std::min(num_nodes_parallel, done.size());
     // initialize buffers for merging columns
     // these may be huge, so we keep only a few of them
+    size_t num_buffers = std::max(num_nodes_parallel, size_t(1));
+    logger->trace("Initializing {} column buffers, in total {:.2} GB", num_buffers,
+                  num_buffers * ((num_rows + 63) / 64 * 8) / 1e9);
     std::vector<sdsl::bit_vector> buffers;
-    for (size_t i = 0; i < std::max(num_nodes_parallel, size_t(1)); ++i) {
+    for (size_t i = 0; i < num_buffers; ++i) {
         buffers.emplace_back(num_rows);
     }
 
@@ -672,6 +675,6 @@ double BRWTOptimizer::pruning_delta(const BRWT &node) {
     return delta;
 }
 
-} // namespace binmat
+} // namespace matrix
 } // namespace annot
 } // namespace mtg

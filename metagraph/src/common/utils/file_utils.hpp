@@ -22,6 +22,17 @@ void remove_temp_dir(std::filesystem::path dir_name);
 
 bool check_if_writable(const std::string &filename);
 
+// Call with_mmap() to check and with_mmap(true) to set. Off by default.
+bool with_mmap(bool set_bit = false);
+
+std::unique_ptr<std::ifstream>
+open_ifstream(const std::string &filename, bool mmap_stream = with_mmap());
+
+// Always create a new physical file to avoid overwriting the existing one if
+// such exists, so that all readers (including mmap) can keep reading from it.
+std::ofstream open_new_ofstream(const std::string &filename);
+
+void append_file(const std::string &source_fname, const std::string &target_fname);
 
 class TempFile {
   public:

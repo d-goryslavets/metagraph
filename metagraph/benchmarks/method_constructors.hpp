@@ -6,14 +6,14 @@
 #include "annotation/binary_matrix/multi_brwt/clustering.hpp"
 #include "annotation/binary_matrix/column_sparse/column_major.hpp"
 #include "annotation/binary_matrix/row_vector/vector_row_binmat.hpp"
-#include "common/vectors/bitmap_mergers.hpp"
+#include "common/vectors/transpose.hpp"
 #include "common/data_generation.hpp"
 
 
 namespace mtg {
 namespace experiments {
 
-using namespace mtg::annot::binmat;
+using namespace mtg::annot::matrix;
 
 
 template <typename T>
@@ -25,7 +25,6 @@ enum class MatrixType {
     COLUMN,
     BRWT,
     BRWT_EXTRA,
-    BIN_REL_WT_SDSL,
     BIN_REL_WT,
     ROW_FLAT,
     RAINBOWFISH
@@ -43,9 +42,6 @@ MatrixType string_to_matrix_type(const std::string &string) {
 
     } else if (string == "brwt_extra") {
         return MatrixType::BRWT_EXTRA;
-
-    } else if (string == "bin_rel_wt_sdsl") {
-        return MatrixType::BIN_REL_WT_SDSL;
 
     } else if (string == "bin_rel_wt") {
         return MatrixType::BIN_REL_WT;
@@ -73,12 +69,10 @@ matrix_type_to_data(const std::string &file, MatrixType type) {
         matrix_ptr.reset(new BRWT());
     } else if (type == MatrixType::BRWT_EXTRA) {
         matrix_ptr.reset(new BRWT());
-    } else if (type == MatrixType::BIN_REL_WT_SDSL) {
-        matrix_ptr.reset(new BinRelWT_sdsl());
     } else if (type == MatrixType::BIN_REL_WT) {
         matrix_ptr.reset(new BinRelWT());
     } else if (type == MatrixType::ROW_FLAT) {
-        matrix_ptr.reset(new RowConcatenated<>());
+        matrix_ptr.reset(new RowFlat<>());
     } else if (type == MatrixType::RAINBOWFISH) {
         matrix_ptr.reset(new Rainbowfish());
     } else {
@@ -180,7 +174,7 @@ generate_from_rows(std::vector<std::unique_ptr<bit_vector>>&& columns,
             ));
             break;
         }
-        case MatrixType::BIN_REL_WT_SDSL: {
+        case MatrixType::BIN_REL_WT: {
             uint64_t num_set_bits = 0;
             uint64_t num_columns = columns.size();
 
@@ -188,17 +182,11 @@ generate_from_rows(std::vector<std::unique_ptr<bit_vector>>&& columns,
                 num_set_bits += vector_ptr->num_set_bits();
             }
 
-            binary_matrix.reset(new BinRelWT_sdsl(
-                [&](const auto &callback) {
-                    utils::RowsFromColumnsTransformer(columns).call_rows(callback);
-                },
+            binary_matrix.reset(new BinRelWT(
+                [&](const auto &callback) { utils::call_rows(columns, callback); },
                 num_set_bits, num_columns
             ));
 
-            break;
-        }
-        case MatrixType::BIN_REL_WT: {
-            binary_matrix.reset(new BinRelWT(std::move(columns)));
             break;
         }
         case MatrixType::ROW_FLAT: {
@@ -210,14 +198,9 @@ generate_from_rows(std::vector<std::unique_ptr<bit_vector>>&& columns,
                 num_set_bits += vector_ptr->num_set_bits();
             }
 
-            binary_matrix.reset(new RowConcatenated<>(
-                [&](const auto &callback) {
-                    utils::RowsFromColumnsTransformer(columns).call_rows(callback);
-                },
-                num_columns,
-                num_rows,
-                num_set_bits,
-                std::forward<Args>(args)...
+            binary_matrix.reset(new RowFlat<>(
+                [&](const auto &callback) { utils::call_rows(columns, callback); },
+                num_columns, num_rows, num_set_bits, std::forward<Args>(args)...
             ));
 
             break;
@@ -226,11 +209,8 @@ generate_from_rows(std::vector<std::unique_ptr<bit_vector>>&& columns,
             const auto num_columns = columns.size();
 
             binary_matrix.reset(new Rainbowfish(
-                [&](const auto &callback) {
-                    utils::RowsFromColumnsTransformer(columns).call_rows(callback);
-                },
-                num_columns,
-                std::forward<Args>(args)...
+                [&](const auto &callback) { utils::call_rows(columns, callback); },
+                num_columns, std::forward<Args>(args)...
             ));
             break;
         }
