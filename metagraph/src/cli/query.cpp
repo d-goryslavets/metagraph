@@ -339,15 +339,13 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
     } else if (const auto *v = std::get_if<LabelOverlappingReads>(&result_)) {
         // output += fmt::format("\n");
         uint64_t counter = 0;
-        for (const auto & overlapping_reads : *v) {
-            for (const auto & [read_seq, read_lab, pos_in_input, pos_in_ref] : overlapping_reads) {
-                if (!counter)
-                    output += fmt::format("\t{}\t{}\t{}\t{}", read_seq, read_lab, pos_in_input, pos_in_ref);
-                else
-                    output += fmt::format("\n{}\t{}\t{}\t{}\t{}\t{}", sequence_.id, sequence_.name, read_seq, read_lab, pos_in_input, pos_in_ref);
-                ++counter;
-            }
-            // output += fmt::format("\n");
+        for (const auto & [read_seq, read_lab, pos_in_input, pos_in_ref] : *v) {
+            if (!counter)
+                output += fmt::format("\t{}\t{}\t{}\t{}", read_seq, read_lab, pos_in_input, pos_in_ref);
+            else
+                output += fmt::format("\n{}\t{}\t{}\t{}\t{}\t{}", sequence_.id, sequence_.name, read_seq, read_lab, pos_in_input, pos_in_ref);
+            ++counter;
+        // output += fmt::format("\n");
         }
 
     } else {
@@ -429,7 +427,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             break;
         }
         case READS: {
-            result = anno_graph.get_overlapping_reads(sequence.sequence, std::unordered_set<std::string> {},  false); // plug !config_.label_based
+            result = anno_graph.get_overlapping_reads(sequence.sequence, std::unordered_set<std::string> {},  true); // plug !config_.label_based
         }
     }
 
@@ -1293,12 +1291,15 @@ size_t QueryExecutor::query_fasta(const string &file,
     }
 
     if (config_.query_batch_size) {
-        if (config_.query_mode != COORDS) {
+        if (config_.query_mode != COORDS && config_.query_mode != READS) {
             // Construct a query graph and query against it
             return batched_query_fasta(fasta_parser, callback);
         } else {
             // TODO: Implement batch mode for query_coords queries
-            logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
+            if (config_.query_mode == COORDS)
+                logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
+            else
+                logger->warn("Querying reads in batch mode is currently not supported. Querying sequentially...");
         }
     }
 

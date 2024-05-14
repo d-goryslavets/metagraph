@@ -100,7 +100,7 @@ class SeqSearchResult {
     typedef std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>> LabelCountCoordsVec;
 
     // should it be like that?
-    typedef std::vector<std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>> LabelOverlappingReads;
+    typedef std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> LabelOverlappingReads;
 
     // add here LabelOverlappingReads
     typedef std::variant<LabelVec,

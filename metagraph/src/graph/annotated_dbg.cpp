@@ -544,7 +544,7 @@ AnnotatedDBG::get_kmer_coordinates(const std::vector<node_index> &nodes,
     return result;
 }
 
-std::vector<std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>>
+std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
 AnnotatedDBG::get_overlapping_reads(std::string_view sequence, std::unordered_set<std::string> manifest_labels, bool auto_labels) const {
     
     if (sequence.size() < dbg_.get_k())
@@ -554,7 +554,7 @@ AnnotatedDBG::get_overlapping_reads(std::string_view sequence, std::unordered_se
     return get_overlapping_reads(nodes, manifest_labels, auto_labels);
 }
 
-std::vector<std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>>
+std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
 AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::unordered_set<std::string> manifest_labels, bool auto_labels) const {
     
     if (!nodes.size())
@@ -583,35 +583,38 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
         exit(1);
     }
 
-    std::vector<std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>> result;
-    result.reserve(rows.size());
+    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
 
     if (auto_labels) {
-        /* to be improved*/
+        // work in progress
 
         if (manifest_labels.empty()) {
 
             logger->trace("Extracting reads...");
-            auto traces = tuple_row_diff->get_traces_with_row_auto_labels(rows);
+            auto traces = tuple_row_diff->get_traces_with_row_reborn(rows);
             logger->trace("Spelling paths...");
 
             for (size_t i = 0; i < traces.size(); ++i) {
-                std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> row_result;
-                for (auto & [row_trace, j, input_start_pos_in_ref] : traces[i]) {
-                    Label label = annotator_->get_label_encoder().decode(j);
 
-                    std::vector<node_index> trace_to_graph_index;
-                    trace_to_graph_index.reserve(row_trace.size());
-                    for (row_index & row_in_trace : row_trace) {
-                        trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
-                    }
 
-                    std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
-                    row_result.push_back(std::make_tuple(path_spelling, label, rows_to_nodes[i], input_start_pos_in_ref));
-                }
+                const auto & [row_trace, j, input_start_pos_in_ref] = traces[i];
+                Label label = annotator_->get_label_encoder().decode(j);
+                std::vector<node_index> trace_to_graph_index;
+                trace_to_graph_index.reserve(row_trace.size());
+                for (const row_index & row_in_trace : row_trace)
+                    trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
+
+                std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
+                std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
+
                 result.push_back(row_result);
             }
         } else {
+
+            // band-aid fix to process huge graphs
+            return result;
+
+            /*
             std::vector<std::unordered_set<uint64_t>> initial_labels = tuple_row_diff->get_labels_of_rows(rows);
             std::vector<std::unordered_set<uint64_t>> acceptable_initial_labels;
 
@@ -655,8 +658,14 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
                 }
                 result.push_back(row_result);
             }
+            */
         }
     } else {
+        
+        // obsolete implementation
+        return result;
+
+        /*
         auto [reads_paths, traces] = tuple_row_diff->get_traces_with_row(rows);
         std::unordered_map<Label, std::string> paths_spellings;
 
@@ -682,6 +691,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::u
 
             result.push_back(row_result);
         }
+        */
     }
 
     return result;
