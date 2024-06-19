@@ -98,8 +98,6 @@ class SeqSearchResult {
     typedef std::vector<std::pair<Label, sdsl::bit_vector>> LabelSigVec;
     typedef std::vector<std::tuple<Label, size_t, std::vector<size_t>>> LabelCountAbundancesVec;
     typedef std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>> LabelCountCoordsVec;
-
-    // should it be like that?
     typedef std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> LabelOverlappingReads;
 
     // add here LabelOverlappingReads

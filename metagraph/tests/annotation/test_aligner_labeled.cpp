@@ -97,16 +97,17 @@ TYPED_TEST(LabeledAlignerTest, GetTracesWithRow) {
 
 
     // CAATGCTGCTAATGCTT
-    std::string_view start_seq = "CAAT";
+    std::string_view start_seq = "AATG";
 
-    std::unordered_set<std::string> manifest_labels = { "A", "B" };
+    // std::unordered_set<std::string> manifest_labels = { "A", "B" };
 
-    auto obs = anno_graph->get_overlapping_reads(start_seq, manifest_labels);
+
+    auto obs = anno_graph->get_overlapping_reads(start_seq);
  
-    std::tuple ref_tuple1 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTGCTAATGCTT", "A", 0, 0);
-    std::tuple ref_tuple2 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTT", "B", 0, 0);
+    std::tuple ref_tuple1 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTGCTAATGCTT", "A", 0, 1);
+    std::tuple ref_tuple2 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTT", "B", 0, 1);
 
-    std::vector<std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>>> ref = { {ref_tuple2, ref_tuple1} };
+    std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>> ref = {ref_tuple2, ref_tuple1};
 
     // std::vector<std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>>> ref = { {ref_tuple2, ref_tuple1}, {ref_tuple1, ref_tuple2}, 
     // {ref_tuple1, ref_tuple2}, {ref_tuple1, ref_tuple2}, {ref_tuple1}, {ref_tuple1}, {ref_tuple1, ref_tuple2}, {ref_tuple1}, {ref_tuple1}, {ref_tuple1}, 

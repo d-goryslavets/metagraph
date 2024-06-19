@@ -427,7 +427,9 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             break;
         }
         case READS: {
-            result = anno_graph.get_overlapping_reads(sequence.sequence, std::unordered_set<std::string> {},  true); // plug !config_.label_based
+            // TODO: add config_.label_based option use for --anno-header graphs
+            // TODO: change config_.label_based -> config_.header_based
+            result = anno_graph.get_overlapping_reads(sequence.sequence);
         }
     }
 
@@ -1124,51 +1126,6 @@ int query_graph(Config *config) {
     for (const auto &file : files) {
         Timer curr_timer;
 
-        // if (config->query_mode == READS) {
-        //     executor.query_reads(file,
-        //                          [config, &anno_graph = std::as_const(*anno_graph)]
-        //                          (const std::string &read, const SeqSearchResult &result) {
-        //         // TODO: implement this
-        //         std::ignore = read;
-        //         // std::ignore = result;
-
-        //         if (config->output_json) {
-        //             logger->error("Json output for querying reads is currently not supported");
-        //         } else {
-        //             // std::cout << "Query sequence: " << read << "\n";
-        //             // std::cout << "Overlapping reads:\n";
-        //             std::cout << result.to_string(config->anno_labels_delimiter,
-        //                                           config->suppress_unlabeled,
-        //                                           config->verbose_output
-        //                                             || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-        //                                           anno_graph) + "\n";
-        //         }
-        //     });
-        //     logger->trace("Extracted reads from file '{}' in {} sec", file, curr_timer.elapsed());
-        // } else {
-        //     // Callback, which captures the config pointer and a const reference to the anno_graph
-        //     // instance pointed to by our unique_ptr...
-        //     auto query_callback = [config, &anno_graph=std::as_const(*anno_graph)](const SeqSearchResult &result) {
-        //         if (config->output_json) {
-        //             std::ostringstream ss;
-        //             ss << result.to_json(config->verbose_output
-        //                                     || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-        //                                 anno_graph) << "\n";
-        //             std::cout << ss.str();
-        //         } else {
-        //             std::cout << result.to_string(config->anno_labels_delimiter,
-        //                                         config->suppress_unlabeled,
-        //                                         config->verbose_output
-        //                                             || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-        //                                         anno_graph) + "\n";
-        //         }
-        //     };
-        //     size_t num_bp = executor.query_fasta(file, query_callback);
-        //     auto time = curr_timer.elapsed();
-        //     logger->trace("File '{}' with {} base pairs was processed in {} sec, throughput: {:.1f} bp/s",
-        //                 file, num_bp, time, (double)num_bp / time);
-        // }
-
         // Callback, which captures the config pointer and a const reference to the anno_graph
         // instance pointed to by our unique_ptr...
         auto query_callback = [config, &anno_graph=std::as_const(*anno_graph)](const SeqSearchResult &result) {
@@ -1321,90 +1278,6 @@ size_t QueryExecutor::query_fasta(const string &file,
 
     return num_bp;
 }
-
-// void QueryExecutor::query_reads(const std::string &file,
-//                                 const std::function<void(const std::string &, const SeqSearchResult &)> &callback) {
-//     logger->trace("Parsing sequences from file '{}'", file);
-
-//     seq_io::FastaParser fasta_parser(file, config_.forward_and_reverse);
-
-//     // Only query_reads if using coord/count aware index.
-//     if (!(dynamic_cast<const annot::matrix::MultiIntMatrix *>(
-//             &this->anno_graph_.get_annotator().get_matrix()))) {
-//         logger->error("Annotation does not support read queries. "
-//                       "First transform this annotation to include coordinate data "
-//                       "(e.g., {}, {}, {}, {}).",
-//                       Config::annotype_to_string(Config::ColumnCoord),
-//                       Config::annotype_to_string(Config::BRWTCoord),
-//                       Config::annotype_to_string(Config::RowDiffCoord),
-//                       Config::annotype_to_string(Config::RowDiffBRWTCoord));
-//         exit(1);
-//     }
-
-//     if (config_.query_batch_size) {
-//         // TODO: Implement batch mode for query_reads queries
-//         logger->warn("Querying reads in batch mode is currently not supported. Querying sequentially...");
-//     }
-
-//     // Query sequences independently
-//     size_t seq_count = 0;
-
-//     for (const seq_io::kseq_t &kseq : fasta_parser) {
-//         thread_pool_.enqueue([&](QuerySequence &sequence) {
-//             // Callback with the SeqSearchResult
-//             // TODO: implement
-//             // std::ignore = sequence;
-//             // std::ignore = callback;
-//             // use AnnotatedDBG::get_overlapping_reads
-
-//             std::unordered_set<std::string> labels_of_reads_to_extract;
-
-//             if (!config_.manifest_file.empty()) {
-
-//                 logger->trace("Reading sample labels from the manifest file '{}'", config_.manifest_file);
-
-//                 std::ifstream instream(config_.manifest_file);
-//                 if (!instream.is_open()) {
-//                     logger->error("Cannot open manifest file '{}'", config_.manifest_file);
-//                     exit(1);
-//                 }
-
-//                 std::string manifest_line;
-//                 while (std::getline(instream, manifest_line)) {
-//                     labels_of_reads_to_extract.insert(manifest_line);
-//                 }
-//                 instream.close();
-
-//                 // logger->trace("Extracting overlapping reads...");
-
-//                 auto result = anno_graph_.get_overlapping_reads(sequence.sequence, labels_of_reads_to_extract, !config_.label_based);
-//                 std::string query_seq_copy = sequence.sequence;
-//                 SeqSearchResult search_result(std::move(sequence), std::move(result));
-
-//                 callback(query_seq_copy, search_result);
-//             } else {
-
-//                 // logger->trace("Extracting overlapping reads...");
-
-//                 auto result = anno_graph_.get_overlapping_reads(sequence.sequence, labels_of_reads_to_extract, !config_.label_based);
-//                 std::string query_seq_copy = sequence.sequence;
-//                 SeqSearchResult search_result(std::move(sequence), std::move(result));
-
-//                 callback(query_seq_copy, search_result);
-//             }
-
-//             // auto result = anno_graph_.get_overlapping_reads(sequence.sequence, !config_.label_based);
-//             // std::string query_seq_copy = sequence.sequence;
-//             // SeqSearchResult search_result(std::move(sequence), std::move(result));
-            
-//             // callback(query_seq_copy, search_result);
-
-//         }, QuerySequence { seq_count++, std::string(kseq.name.s), std::string(kseq.seq.s) });
-//     }
-
-//     // wait while all threads finish processing the current file
-//     thread_pool_.join();
-// }
 
 size_t
 QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
