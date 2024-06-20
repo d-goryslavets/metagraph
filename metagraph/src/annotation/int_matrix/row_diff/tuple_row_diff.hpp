@@ -53,11 +53,6 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     RowTuples get_row_tuples(Row i) const;
     std::vector<RowTuples> get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
 
-    RowTuples get_row_tuples(Row i, std::vector<Row> &rd_ids,
-    VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows,
-    std::unordered_map<Row, RowTuples> &rows_annotations,
-    const graph::boss::BOSS &boss, const bit_vector &rd_succ) const;
-
     /** Returns all labeled traces that pass through a given row.
      * 
      * @param i Index of the row.
@@ -72,8 +67,13 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     // auto_labels means that the labels will be derived based on coordinates
     // this is needed for the graphs where reads are not marked with different labels
 
-    // new approach attempt
-    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_reborn(std::vector<Row> i) const;
+    // returns reads for a set of columns (samples)
+    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_labelled(std::vector<Row> i, 
+    std::unordered_set<Column> samples_with_query) const;
+
+    // iteratively processes batches of columns
+    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_reborn(std::vector<Row> i,
+    uint64_t columns_batch_size = 50) const; // TODO: DEBUG and if ok add this parameter to cli
 
     // pre-traverse graph to find samples with reads containing full query sequence
     std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const;
@@ -238,48 +238,6 @@ TupleRowDiff<BaseMatrix>::get_row_tuples_labeled(const std::vector<Row> &row_ids
     return rows;
 }
 
-template <class BaseMatrix>
-MultiIntMatrix::RowTuples TupleRowDiff<BaseMatrix>::get_row_tuples(Row i, std::vector<Row> &rd_ids,
-VectorMap<Row, size_t> &node_to_rd, std::vector<RowTuples> &rd_rows,
-std::unordered_map<Row, RowTuples> &rows_annotations,
-const graph::boss::BOSS &boss, const bit_vector &rd_succ) const {
-    assert(graph_ && "graph must be loaded");
-    assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
-    assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
-
-    // get row-diff paths
-    auto [rd_ids_current, rd_path_trunc] = get_rd_ids(i, rd_ids, node_to_rd, boss, rd_succ);
-
-    std::vector<RowTuples> rd_rows_current = diffs_.get_row_tuples(rd_ids_current);
-    for (auto &row : rd_rows_current) {
-        decode_diffs(&row);
-    }
-
-    rd_rows.insert(rd_rows.end(), rd_rows_current.begin(), rd_rows_current.end());
-
-    RowTuples result;     
-    auto it = rd_path_trunc.rbegin();
-    std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
-
-    result = rd_rows[*it];
-    rows_annotations[rd_ids[*it]] = result;
-
-    // propagate back and reconstruct full annotations for predecessors
-    for (++it ; it != rd_path_trunc.rend(); ++it) {
-        std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
-        add_diff(rd_rows[*it], &result);
-        // replace diff row with full reconstructed annotation
-        rd_rows[*it] = result;
-
-        // keep the decompressed annotations for the Rows
-        // along that row-diff path
-        rows_annotations[rd_ids[*it]] = result;
-    }
-    assert(std::all_of(result.begin(), result.end(),
-                        [](auto &p) { return p.second.size(); }));
-
-    return result;
-}
 
 template <class BaseMatrix>
 bool TupleRowDiff<BaseMatrix>::load(std::istream &in) {
@@ -472,9 +430,49 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
     return labels_matching_query_result;
 }
 
+
 template <class BaseMatrix>
 std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
-::get_traces_with_row_reborn(std::vector<Row> i) const {
+::get_traces_with_row_reborn(std::vector<Row> i, uint64_t columns_batch_size) const {
+    assert(graph_ && "graph must be loaded");
+    assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
+    assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
+
+    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
+
+    auto samples_with_query = get_samples_containing_query(i);
+
+
+    
+    std::vector<Column> samples_with_query_vec;
+    samples_with_query_vec.reserve(samples_with_query.size());
+    samples_with_query_vec.insert(samples_with_query_vec.end(), 
+    samples_with_query.begin(), samples_with_query.end());
+
+    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += columns_batch_size) {
+        size_t cur_end = std::min(curColumn + columns_batch_size, samples_with_query_vec.size());
+
+        std::vector<Column> samples_with_query_batch;
+        samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,
+        samples_with_query_vec.begin() + cur_end);
+
+        std::unordered_set<Column> columns_batch(samples_with_query_batch.begin(), samples_with_query_batch.end());
+
+        auto retrieved_reads = get_traces_with_row_labelled(i, columns_batch);
+
+        // extend result with newly retrieved reads
+        result.reserve(result.size() + distance(retrieved_reads.begin(), retrieved_reads.end()));
+        result.insert(result.end(), retrieved_reads.begin(), retrieved_reads.end());
+
+    }
+
+    return result;
+}
+
+
+template <class BaseMatrix>
+std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
+::get_traces_with_row_labelled(std::vector<Row> i, std::unordered_set<Column> samples_with_query) const {
     assert(graph_ && "graph must be loaded");
     assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
@@ -482,12 +480,13 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     // vector of reads <vector<Row>, Column, coord_of_query_1st_kmer>
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
 
-    auto samples_with_query = get_samples_containing_query(i);
+    // auto samples_with_query = get_samples_containing_query(i);
 
-    mtg::common::logger->trace("samples matching query: ");
-    for (const auto & sample_col_id : samples_with_query) {
-        mtg::common::logger->trace("{}", sample_col_id);        
-    }
+    // DEBUG
+    // mtg::common::logger->trace("samples matching query cur: ");
+    // for (const auto & sample_col_id : samples_with_query) {
+    //     mtg::common::logger->trace("{}", sample_col_id);        
+    // }
 
     std::vector<RowTuples> initial_row_tuples = get_row_tuples_labeled(i, samples_with_query);
 
@@ -509,7 +508,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     std::unordered_map<Column, std::set<uint64_t>> ends_of_reads_final;
     std::unordered_map<Column, std::set<uint64_t>> starts_of_reads_final;
 
-    mtg::common::logger->trace("Getting initial starts and ends of the reads");
+    // mtg::common::logger->trace("Getting initial starts and ends of the reads");
     for (auto & [j, coords] : reconstructed_paths) {
         auto node_1 = graph::AnnotatedSequenceGraph::anno_to_graph_index(coords.begin()->second);
         auto coord_1 = coords.begin()->first;
@@ -609,15 +608,15 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         batches_count++;
 
-        mtg::common::logger->trace("traversed batch {}", batches_count);
+        // mtg::common::logger->trace("traversed batch {}", batches_count);
 
 
-        mtg::common::logger->trace("decompress the annotations for the current batch of rows");
+        // mtg::common::logger->trace("decompress the annotations for the current batch of rows");
         // decompress the annotations for the current batch of rows
         std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query);
 
 
-        mtg::common::logger->trace("collect all new discovered coordinates");
+        // mtg::common::logger->trace("collect all new discovered coordinates");
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
             for (auto & [j_next, tuple_next] : batch_annotations[batch_i]) {
@@ -638,7 +637,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         batch_annotations = std::vector<RowTuples>();
         batch_of_rows = std::vector<Row>();
 
-        mtg::common::logger->trace("update reads ends");
+        // mtg::common::logger->trace("update reads ends");
         // update reads ends
         std::unordered_map<Column, std::vector<std::pair<uint64_t, uint64_t>>> ends_to_update;
         for (auto & [j_end, coords_ends] : ends_of_reads) {
@@ -682,7 +681,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         }
 
 
-        mtg::common::logger->trace("check if graph has to be traversed more");
+        // mtg::common::logger->trace("check if graph has to be traversed more");
         // check if graph has to be traversed more 
         // by checking if there are continuations of the reads after the known ends
 

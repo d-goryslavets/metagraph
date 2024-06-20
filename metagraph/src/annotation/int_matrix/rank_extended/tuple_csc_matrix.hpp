@@ -136,7 +136,7 @@ TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labeled(const std::ve
         for (auto [j, r] : column_ranks[i]) {
             assert(r >= 1 && "matches can't have zero-rank");
             if (!labels_of_interest.count(j)) {
-                row_tuples[i].emplace_back(j, Tuple());
+                // row_tuples[i].emplace_back(j, Tuple()); // DEBUG
                 continue;
             }
             size_t begin = delimiters_[j].select1(r) + 1 - r;
