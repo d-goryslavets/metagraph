@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <fstream> // for batched read extaction DEBUG
 
 #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
 #include "annotation/int_matrix/base/int_matrix.hpp"
@@ -551,11 +552,11 @@ AnnotatedDBG::get_overlapping_reads(std::string_view sequence) const {
         return {};
 
     std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes);
+    return get_overlapping_reads(nodes, sequence);
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes) const {
+AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence) const {
     
     if (!nodes.size())
         return {};    
@@ -583,27 +584,89 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes) const 
         exit(1);
     }
 
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
+    // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
 
     logger->trace("Extracting reads...");
-    auto traces = tuple_row_diff->get_traces_with_row_reborn(rows);
-    logger->trace("Spelling paths...");
+    
 
-    for (size_t i = 0; i < traces.size(); ++i) {
-        const auto & [row_trace, j, input_start_pos_in_ref] = traces[i];
-        Label label = annotator_->get_label_encoder().decode(j);
-        std::vector<node_index> trace_to_graph_index;
-        trace_to_graph_index.reserve(row_trace.size());
-        for (const row_index & row_in_trace : row_trace)
-            trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
+    // TODO: make this as parameter, not hardcoded
+    uint64_t columnBatchsize = 10;
 
-        std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
-        std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
+    logger->trace("Getting samples with query...");
+    std::unordered_set<Column> samples_with_query = tuple_row_diff->get_samples_containing_query(rows);
 
-        result.push_back(row_result);
+    logger->trace(fmt::format("Num of samples matching query: {}", samples_with_query.size()));
+
+    std::vector<Column> samples_with_query_vec;
+    samples_with_query_vec.reserve(samples_with_query.size());
+    samples_with_query_vec.insert(samples_with_query_vec.end(), 
+    samples_with_query.begin(), samples_with_query.end());
+
+    logger->trace("Processing columns in batches...");
+    std::ofstream outfile;
+    
+    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += columnBatchsize) {
+        // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result; // result for current batch of columns
+
+        size_t cur_end = std::min(curColumn + columnBatchsize, samples_with_query_vec.size());
+
+        std::vector<Column> samples_with_query_batch;
+        samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,
+        samples_with_query_vec.begin() + cur_end);
+
+        std::unordered_set<Column> columns_batch(samples_with_query_batch.begin(), samples_with_query_batch.end());
+
+
+        logger->trace("Column batch getting traces...");
+        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(rows, columns_batch);
+
+
+        // Spell paths for curr batch of columns
+        logger->trace("Column batch spelling paths...");
+        for (size_t i = 0; i < retrieved_traces.size(); ++i) {
+            const auto & [row_trace, j, input_start_pos_in_ref] = retrieved_traces[i];
+            Label label = annotator_->get_label_encoder().decode(j);
+            std::vector<node_index> trace_to_graph_index;
+            trace_to_graph_index.reserve(row_trace.size());
+            for (const row_index & row_in_trace : row_trace)
+                trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
+
+            std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
+            // std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
+            // result.push_back(row_result);
+
+            // save column batch result to a file
+            std::string dummy_query_idx = "query_idx"; // DEBUG
+            std::string dummy_query_name = "query_name"; // DEBUG
+            std::string_view read_result = dummy_query_idx + "\t" + dummy_query_name + "\t" + path_spelling + "\t" + label + "\t" + \
+            std::to_string(rows_to_nodes[0]) + "\t" + std::to_string(input_start_pos_in_ref);
+
+            outfile.open(fmt::format("extracted_reads_{}.txt", sequence), std::ios_base::app); // TODO make as parameter in config
+            outfile << read_result << "\n";
+            outfile.close();
+        }
     }
 
-    return result;
+
+
+    // auto traces = tuple_row_diff->get_traces_with_row_reborn(rows);
+    // logger->trace("Spelling paths...");
+
+    // for (size_t i = 0; i < traces.size(); ++i) {
+    //     const auto & [row_trace, j, input_start_pos_in_ref] = traces[i];
+    //     Label label = annotator_->get_label_encoder().decode(j);
+    //     std::vector<node_index> trace_to_graph_index;
+    //     trace_to_graph_index.reserve(row_trace.size());
+    //     for (const row_index & row_in_trace : row_trace)
+    //         trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
+
+    //     std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
+    //     std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
+
+    //     result.push_back(row_result);
+    // }
+
+    return {};
 }
 
 std::vector<std::pair<Label, sdsl::bit_vector>>

@@ -1136,11 +1136,12 @@ int query_graph(Config *config) {
                                     anno_graph) << "\n";
                 std::cout << ss.str();
             } else {
-                std::cout << result.to_string(config->anno_labels_delimiter,
-                                            config->suppress_unlabeled,
-                                            config->verbose_output
-                                                || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-                                            anno_graph) + "\n";
+                // std::cout << result.to_string(config->anno_labels_delimiter,
+                //                             config->suppress_unlabeled,
+                //                             config->verbose_output
+                //                                 || !(config->query_mode == COUNTS || config->query_mode == COORDS),
+                //                             anno_graph) + "\n";
+                std::cout << "Extracted reads are written in file." << "\n";
             }
         };
         size_t num_bp = executor.query_fasta(file, query_callback);

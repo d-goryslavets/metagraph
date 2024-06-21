@@ -34,7 +34,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     // check graph traversal in batches
-    static const uint64_t TRAVERSAL_BATCH_SIZE = 20'000;
+    static const uint64_t TRAVERSAL_BATCH_SIZE = 50'000;
 
     // TupleRowDiff() {}
 
