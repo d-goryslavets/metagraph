@@ -34,7 +34,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     // check graph traversal in batches
-    static const uint64_t TRAVERSAL_BATCH_SIZE = 50'000;
+    static const uint64_t TRAVERSAL_BATCH_SIZE = 500; //  50'000
 
     // TupleRowDiff() {}
 
@@ -396,6 +396,7 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
     }
 
     // find samples containing the full query 
+    // TODO: try making it in batches
     std::vector<RowTuples> query_annot = get_row_tuples(i);
     std::unordered_map<Column, std::unordered_set<uint64_t>> labels_matching_query;
     std::unordered_set<Column> labels_matching_query_result;
@@ -480,6 +481,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     // vector of reads <vector<Row>, Column, coord_of_query_1st_kmer>
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
 
+    // DEBUG ADAPTIVE DECOMPRESSION TEST
+    // std::unordered_set<Column> samples_with_query_adaptive = samples_with_query;
     // auto samples_with_query = get_samples_containing_query(i);
 
     // DEBUG
@@ -505,8 +508,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     std::unordered_map<Column, std::set<uint64_t>> ends_of_reads;
     std::unordered_map<Column, std::set<uint64_t>> starts_of_reads;
 
-    std::unordered_map<Column, std::set<uint64_t>> ends_of_reads_final;
-    std::unordered_map<Column, std::set<uint64_t>> starts_of_reads_final;
+    // std::unordered_map<Column, std::set<uint64_t>> ends_of_reads_final;
+    // std::unordered_map<Column, std::set<uint64_t>> starts_of_reads_final;
 
     // mtg::common::logger->trace("Getting initial starts and ends of the reads");
     for (auto & [j, coords] : reconstructed_paths) {
@@ -608,18 +611,19 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         batches_count++;
 
-        // mtg::common::logger->trace("traversed batch {}", batches_count);
+        mtg::common::logger->trace("traversed batch {}", batches_count);
 
 
-        // mtg::common::logger->trace("decompress the annotations for the current batch of rows");
+        mtg::common::logger->trace("decompress the annotations for the current batch of rows");
         // decompress the annotations for the current batch of rows
-        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query);
+        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query); // DEBUG ADAPTIVE DECOMPRESSION TEST
 
 
         // mtg::common::logger->trace("collect all new discovered coordinates");
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
             for (auto & [j_next, tuple_next] : batch_annotations[batch_i]) {
+                // DEBUG ADAPTIVE DECOMPRESSION TEST
                 if (!samples_with_query.count(j_next)) {
                     tuple_next = Tuple();
                     continue;
@@ -687,8 +691,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         to_visit = std::deque<Row>(); // collect in the queue only the known ends of the reads
 
-        std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
         for (auto & [j_end, coords_ends] : ends_of_reads) {
+            // bool more_read_to_reconstruct = false; // DEBUG ADAPTIVE DECOMPRESSION TEST
             for (auto & c_end : coords_ends) {
                 auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
 
@@ -698,66 +702,94 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
                         return;
                     
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
-                    batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
+                    if (!visited_nodes_forward.count(adj_outg_to_anno)) {
+                        to_visit.push_front(adj_outg_to_anno);
+                        // more_read_to_reconstruct = true; // DEBUG ADAPTIVE DECOMPRESSION TEST
+                    }
                 });
             }
+
+            // // DEBUG ADAPTIVE DECOMPRESSION TEST
+            // if (!more_read_to_reconstruct)
+            //     samples_with_query_adaptive.erase(j_end);
         }
 
-        std::vector<Row> batch_of_rows_to_check_if_traverse_more;
-        batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
-        batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
-        batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
-        batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
 
-        std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
-        std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
-        size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
+        /*
 
-        for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
-            size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+        // std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
+        // for (auto & [j_end, coords_ends] : ends_of_reads) {
+        //     for (auto & c_end : coords_ends) {
+        //         auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
 
-            std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
-            batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
+        //         graph_->call_outgoing_kmers(end_node_old, [&](auto adj_outg_node, char c) {
+        //             // std::ignore = c;
+        //             if (c == graph::boss::BOSS::kSentinel)
+        //                 return;
+                    
+        //             Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
+        //             batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
+        //         });
+        //     }
+        // }
 
-            std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, samples_with_query);
-            // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+        // std::vector<Row> batch_of_rows_to_check_if_traverse_more;
+        // batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
+        // batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
+        // batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
+        // batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
 
-            for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
-                for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
-                    if (!samples_with_query.count(j_to_check)) {
-                        tuple_to_check = Tuple();
-                        continue;
-                    }
+        // std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
+        // std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
+        // size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
 
-                    for (auto & c_to_check : tuple_to_check) {
-                        coordinates_of_the_successors[j_to_check].insert(c_to_check);
-                        successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
-                    }
-                    tuple_to_check = Tuple();
-                }
-            }
-            batch_part_annotations = std::vector<RowTuples>();
-        }
+        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
+        //     size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
 
-        for (auto & [j_end, coords_ends] : ends_of_reads) {
-            for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
-                if (coordinates_of_the_successors[j_end].count(*it_end_coords + SHIFT)) {
-                    to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
-                    visited_nodes_forward.erase(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
-                    ++it_end_coords;
-                } else {
-                    ends_of_reads_final[j_end].insert(*it_end_coords);
-                    it_end_coords = coords_ends.erase(it_end_coords);
-                }
-            }
-        }
+        //     std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
+        //     batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
+
+        //     std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, samples_with_query);
+        //     // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+
+        //     for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
+        //         for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
+        //             if (!samples_with_query.count(j_to_check)) {
+        //                 tuple_to_check = Tuple();
+        //                 continue;
+        //             }
+
+        //             for (auto & c_to_check : tuple_to_check) {
+        //                 coordinates_of_the_successors[j_to_check].insert(c_to_check);
+        //                 successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
+        //             }
+        //             tuple_to_check = Tuple();
+        //         }
+        //     }
+        //     batch_part_annotations = std::vector<RowTuples>();
+        // }
+
+        // for (auto & [j_end, coords_ends] : ends_of_reads) {
+        //     for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
+        //         if (coordinates_of_the_successors[j_end].count(*it_end_coords + SHIFT)) {
+        //             to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
+        //             visited_nodes_forward.erase(successors_rows_and_coords[j_end][*it_end_coords + SHIFT]);
+        //             ++it_end_coords;
+        //         } else {
+        //             ends_of_reads_final[j_end].insert(*it_end_coords);
+        //             it_end_coords = coords_ends.erase(it_end_coords);
+        //         }
+        //     }
+        // }
+
+        */
 
         if (to_visit.empty())
             break;
     }
 
-    ends_of_reads = ends_of_reads_final;
-    ends_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
+    // ends_of_reads = ends_of_reads_final;
+    // ends_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
 
     mtg::common::logger->trace("Traversed batches forwards count {}", batches_count);
 
@@ -879,7 +911,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         // by checking if there are continuations of the reads after the known ends
 
         to_visit = std::deque<Row>();
-        std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
+
 
         for (auto & [j_end, coords_ends] : starts_of_reads) {
             for (auto & c_end : coords_ends) {
@@ -891,69 +923,88 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
                         return;
                     
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
-                    batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
+                    if (!visited_nodes_backward.count(adj_outg_to_anno)) {
+                        to_visit.push_front(adj_outg_to_anno);
+                    }
                 });
             }
         }
 
-        std::vector<Row> batch_of_rows_to_check_if_traverse_more;
-        batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
-        batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
-        batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
-        batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
+        // std::unordered_set<Row> batch_of_rows_to_check_if_traverse_more_set;
 
-        std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
-        std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
-        size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
+        // for (auto & [j_end, coords_ends] : starts_of_reads) {
+        //     for (auto & c_end : coords_ends) {
+        //         auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
 
-        for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
-            size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+        //         graph_->call_incoming_kmers(end_node_old, [&](auto adj_outg_node, char c) {
+        //             // std::ignore = c;
+        //             if (c == graph::boss::BOSS::kSentinel)
+        //                 return;
+                    
+        //             Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
+        //             batch_of_rows_to_check_if_traverse_more_set.insert(adj_outg_to_anno);
+        //         });
+        //     }
+        // }
 
-            std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
-            batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
+        // std::vector<Row> batch_of_rows_to_check_if_traverse_more;
+        // batch_of_rows_to_check_if_traverse_more.reserve(batch_of_rows_to_check_if_traverse_more_set.size());
+        // batch_of_rows_to_check_if_traverse_more.insert(batch_of_rows_to_check_if_traverse_more.end(),
+        // batch_of_rows_to_check_if_traverse_more_set.begin(), batch_of_rows_to_check_if_traverse_more_set.end());
+        // batch_of_rows_to_check_if_traverse_more_set = std::unordered_set<Row>();
 
-            std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, samples_with_query);
-            // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+        // std::unordered_map<Column, std::unordered_set<uint64_t>> coordinates_of_the_successors;
+        // std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
+        // size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
 
-            for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
-                for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
-                    if (!samples_with_query.count(j_to_check)) {
-                        tuple_to_check = Tuple();
-                        continue;
-                    }
+        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
+        //     size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
 
-                    for (auto & c_to_check : tuple_to_check) {
-                        coordinates_of_the_successors[j_to_check].insert(c_to_check);
-                        successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
-                    }
-                    tuple_to_check = Tuple();
-                }
-            }
-            batch_part_annotations = std::vector<RowTuples>();
-        }
+        //     std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
+        //     batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
 
-        for (auto & [j_end, coords_ends] : starts_of_reads) {
-            for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
-                if (*it_end_coords == 0) {
-                    starts_of_reads_final[j_end].insert(*it_end_coords);
-                    it_end_coords = coords_ends.erase(it_end_coords);
-                } else if (coordinates_of_the_successors[j_end].count(*it_end_coords - SHIFT)) {
-                    to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
-                    visited_nodes_backward.erase(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
-                    ++it_end_coords;
-                } else {
-                    starts_of_reads_final[j_end].insert(*it_end_coords);
-                    it_end_coords = coords_ends.erase(it_end_coords);
-                }
-            }
-        }
+        //     std::vector<RowTuples> batch_part_annotations = get_row_tuples_labeled(batch_part, samples_with_query);
+        //     // std::vector<RowTuples> batch_part_annotations = get_row_tuples(batch_part);
+
+        //     for (size_t rowt_to_check = 0; rowt_to_check < batch_part.size(); ++rowt_to_check) {
+        //         for (auto & [j_to_check, tuple_to_check] : batch_part_annotations[rowt_to_check]) {
+        //             if (!samples_with_query.count(j_to_check)) {
+        //                 tuple_to_check = Tuple();
+        //                 continue;
+        //             }
+
+        //             for (auto & c_to_check : tuple_to_check) {
+        //                 coordinates_of_the_successors[j_to_check].insert(c_to_check);
+        //                 successors_rows_and_coords[j_to_check][c_to_check] = batch_part[rowt_to_check];
+        //             }
+        //             tuple_to_check = Tuple();
+        //         }
+        //     }
+        //     batch_part_annotations = std::vector<RowTuples>();
+        // }
+
+        // for (auto & [j_end, coords_ends] : starts_of_reads) {
+        //     for (auto it_end_coords = coords_ends.begin(); it_end_coords != coords_ends.end(); ) {
+        //         if (*it_end_coords == 0) {
+        //             starts_of_reads_final[j_end].insert(*it_end_coords);
+        //             it_end_coords = coords_ends.erase(it_end_coords);
+        //         } else if (coordinates_of_the_successors[j_end].count(*it_end_coords - SHIFT)) {
+        //             to_visit.push_front(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
+        //             visited_nodes_backward.erase(successors_rows_and_coords[j_end][*it_end_coords - SHIFT]);
+        //             ++it_end_coords;
+        //         } else {
+        //             starts_of_reads_final[j_end].insert(*it_end_coords);
+        //             it_end_coords = coords_ends.erase(it_end_coords);
+        //         }
+        //     }
+        // }
 
         if (to_visit.empty())
             break;
     }
 
-    starts_of_reads = starts_of_reads_final;
-    starts_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
+    // starts_of_reads = starts_of_reads_final;
+    // starts_of_reads_final = std::unordered_map<Column, std::set<uint64_t>>();
 
     // reconstruct the paths
     mtg::common::logger->trace("Traversed batches backwards count {}", batches_count_backwards);

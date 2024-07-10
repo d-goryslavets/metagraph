@@ -577,8 +577,8 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
         assert(anno_to_graph_index(rows[i]) == nodes[rows_to_nodes[i]]);
     }
 
-    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
-    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
+    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
+    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
     if (!tuple_row_diff) {
         logger->error("k-mer coordinates are not indexed in this annotator");
         exit(1);
@@ -638,7 +638,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
             // save column batch result to a file
             std::string dummy_query_idx = "query_idx"; // DEBUG
             std::string dummy_query_name = "query_name"; // DEBUG
-            std::string_view read_result = dummy_query_idx + "\t" + dummy_query_name + "\t" + path_spelling + "\t" + label + "\t" + \
+            std::string read_result = dummy_query_idx + "\t" + dummy_query_name + "\t" + path_spelling + "\t" + label + "\t" + \
             std::to_string(rows_to_nodes[0]) + "\t" + std::to_string(input_start_pos_in_ref);
 
             outfile.open(fmt::format("extracted_reads_{}.txt", sequence), std::ios_base::app); // TODO make as parameter in config
