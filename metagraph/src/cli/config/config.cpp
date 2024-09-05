@@ -302,6 +302,8 @@ Config::Config(int argc, char *argv[]) {
             separately = true;
         } else if (!strcmp(argv[i], "--num-top-labels")) {
             num_top_labels = atoi(get_value(i++));
+        } else if (!strcmp(argv[i], "--traversal-batch-size")) {
+            traversal_batch_size = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--port")) {
             port = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--address")) {

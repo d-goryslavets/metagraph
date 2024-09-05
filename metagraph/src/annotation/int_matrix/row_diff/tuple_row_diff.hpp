@@ -69,7 +69,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
 
     // returns reads for a set of columns (samples)
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_labelled(std::vector<Row> i, 
-    std::unordered_set<Column> samples_with_query) const;
+    std::unordered_set<Column> samples_with_query, uint64_t traversal_batch_size) const;
 
     // iteratively processes batches of columns
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_reborn(std::vector<Row> i,
@@ -459,7 +459,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         std::unordered_set<Column> columns_batch(samples_with_query_batch.begin(), samples_with_query_batch.end());
 
-        auto retrieved_reads = get_traces_with_row_labelled(i, columns_batch);
+        auto retrieved_reads = get_traces_with_row_labelled(i, columns_batch, 500); // TODO DEBUG obsolete function
 
         // extend result with newly retrieved reads
         result.reserve(result.size() + distance(retrieved_reads.begin(), retrieved_reads.end()));
@@ -473,7 +473,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
 template <class BaseMatrix>
 std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
-::get_traces_with_row_labelled(std::vector<Row> i, std::unordered_set<Column> samples_with_query) const {
+::get_traces_with_row_labelled(std::vector<Row> i, std::unordered_set<Column> samples_with_query, uint64_t traversal_batch_size) const {
     assert(graph_ && "graph must be loaded");
     assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
@@ -482,7 +482,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
 
     // DEBUG ADAPTIVE DECOMPRESSION TEST
-    // std::unordered_set<Column> samples_with_query_adaptive = samples_with_query;
+    std::unordered_set<Column> samples_with_query_adaptive = samples_with_query;
+
     // auto samples_with_query = get_samples_containing_query(i);
 
     // DEBUG
@@ -491,7 +492,9 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     //     mtg::common::logger->trace("{}", sample_col_id);        
     // }
 
-    std::vector<RowTuples> initial_row_tuples = get_row_tuples_labeled(i, samples_with_query);
+    mtg::common::logger->trace("Getting row tuples for the query");
+    std::vector<RowTuples> initial_row_tuples = get_row_tuples_labeled(i, samples_with_query); // DEBUG ADAPTIVE
+    mtg::common::logger->trace("Done Getting row tuples for the query");
 
     // keep visited rows, and their coords for each label separately
     std::unordered_map<Column, std::map<uint64_t, Row>> reconstructed_paths;
@@ -571,7 +574,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
     std::unordered_set<Row> visited_nodes_forward;
     uint64_t batches_count = 0;
-    std::unordered_map<Column, std::set<uint64_t>> all_discovered_coordinates;
+    // std::unordered_map<Column, std::set<uint64_t>> all_discovered_coordinates;
     mtg::common::logger->trace("Traversing the graph forwards");
 
     while (true) {
@@ -604,7 +607,7 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
             visited_nodes_forward.insert(current_parent);
 
             // if we reached the batch size then stop the current batch traversal
-            if (traversed_nodes_count >= TRAVERSAL_BATCH_SIZE) {
+            if (traversed_nodes_count >= traversal_batch_size) {
                 break;
             }
         }
@@ -616,23 +619,32 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         mtg::common::logger->trace("decompress the annotations for the current batch of rows");
         // decompress the annotations for the current batch of rows
-        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query); // DEBUG ADAPTIVE DECOMPRESSION TEST
+        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query_adaptive); // DEBUG ADAPTIVE DECOMPRESSION TEST
+        mtg::common::logger->trace("Done decompress batch annotations");
 
 
-        // mtg::common::logger->trace("collect all new discovered coordinates");
+        // DEBUG the most time consuming step so far
+        mtg::common::logger->trace("collect all new discovered coordinates");
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
+            Row batch_row = batch_of_rows[batch_i];
             for (auto & [j_next, tuple_next] : batch_annotations[batch_i]) {
                 // DEBUG ADAPTIVE DECOMPRESSION TEST
-                if (!samples_with_query.count(j_next)) {
+                if (!samples_with_query_adaptive.count(j_next)) {
                     tuple_next = Tuple();
                     continue;
                 }
 
+
                 for (uint64_t &c_next : tuple_next) {
-                    all_discovered_coordinates[j_next].insert(c_next);
-                    reconstructed_paths[j_next][c_next] = batch_of_rows[batch_i];
+                    reconstructed_paths[j_next][c_next] = batch_row;
                 }
+
+
+                // for (uint64_t &c_next : tuple_next) {
+                //     all_discovered_coordinates[j_next].insert(c_next);
+                //     reconstructed_paths[j_next][c_next] = batch_of_rows[batch_i];
+                // }
 
                 tuple_next = Tuple();
             }
@@ -641,17 +653,24 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         batch_annotations = std::vector<RowTuples>();
         batch_of_rows = std::vector<Row>();
 
-        // mtg::common::logger->trace("update reads ends");
+        mtg::common::logger->trace("update reads ends");
         // update reads ends
         std::unordered_map<Column, std::vector<std::pair<uint64_t, uint64_t>>> ends_to_update;
         for (auto & [j_end, coords_ends] : ends_of_reads) {
+            // DEBUG ADAPTIVE
+            if (samples_with_query_adaptive.find(j_end) == samples_with_query_adaptive.end())
+                continue;
+    
+            // TODO since it is sorted we can make use of it
+            auto &reconstructed_paths_for_j = reconstructed_paths[j_end];
             for (auto & c_end : coords_ends) {
                 auto c_end_cur = c_end;
                 bool replace_read_end = false;
 
-                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end_cur]);
-                while (all_discovered_coordinates[j_end].count(c_end_cur + SHIFT)) {
-                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end_cur + SHIFT]);
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths_for_j[c_end_cur]);
+
+                while (reconstructed_paths_for_j.find(c_end_cur + SHIFT) != reconstructed_paths_for_j.end()) {
+                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths_for_j[c_end_cur + SHIFT]);
 
                     bool edge_exists = false;
                     graph_->adjacent_outgoing_nodes(end_node_old, [&](auto adj_outg_node) {
@@ -685,17 +704,27 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         }
 
 
-        // mtg::common::logger->trace("check if graph has to be traversed more");
+        mtg::common::logger->trace("check if graph has to be traversed more");
         // check if graph has to be traversed more 
         // by checking if there are continuations of the reads after the known ends
 
         to_visit = std::deque<Row>(); // collect in the queue only the known ends of the reads
 
+        std::unordered_map<Row, std::vector<Row>> processed_ends; // TODO DEBUG and unvisited successors
         for (auto & [j_end, coords_ends] : ends_of_reads) {
-            // bool more_read_to_reconstruct = false; // DEBUG ADAPTIVE DECOMPRESSION TEST
+            // DEBUG ADAPTIVE
+            if (samples_with_query_adaptive.find(j_end) == samples_with_query_adaptive.end())
+                continue;
+            bool more_read_to_reconstruct = false; // DEBUG ADAPTIVE DECOMPRESSION TEST
             for (auto & c_end : coords_ends) {
                 auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
-
+                if (processed_ends.count(end_node_old)) {
+                    for (auto & unvisited_successor_row : processed_ends[end_node_old])
+                        to_visit.push_front(unvisited_successor_row);
+                    continue;
+                }
+                    
+                std::vector<Row> unvisited_successors;
                 graph_->call_outgoing_kmers(end_node_old, [&](auto adj_outg_node, char c) {
                     // std::ignore = c;
                     if (c == graph::boss::BOSS::kSentinel)
@@ -704,14 +733,20 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
                     if (!visited_nodes_forward.count(adj_outg_to_anno)) {
                         to_visit.push_front(adj_outg_to_anno);
-                        // more_read_to_reconstruct = true; // DEBUG ADAPTIVE DECOMPRESSION TEST
+                        unvisited_successors.push_back(adj_outg_to_anno); // TODO DEBUG slight optimization attempt
+                        more_read_to_reconstruct = true; // DEBUG ADAPTIVE DECOMPRESSION TEST
                     }
                 });
+
+                processed_ends.try_emplace(end_node_old, unvisited_successors);
             }
 
-            // // DEBUG ADAPTIVE DECOMPRESSION TEST
-            // if (!more_read_to_reconstruct)
-            //     samples_with_query_adaptive.erase(j_end);
+            // DEBUG ADAPTIVE DECOMPRESSION TEST
+            if (!more_read_to_reconstruct) {
+                mtg::common::logger->trace("Finished processing sample {}", j_end);
+                samples_with_query_adaptive.erase(j_end);
+            }
+
         }
 
 
@@ -743,8 +778,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         // std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
         // size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
 
-        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
-        //     size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += traversal_batch_size) {
+        //     size_t cur_end = std::min(cur_part + traversal_batch_size, batch_vec_size);
 
         //     std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
         //     batch_of_rows_to_check_if_traverse_more.begin() + cur_end);
@@ -802,6 +837,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     uint64_t batches_count_backwards = 0;
 
     mtg::common::logger->trace("Traversing the graph backwards");
+
+    samples_with_query_adaptive = samples_with_query;
     while (true) {
         uint64_t traversed_nodes_count = 0;
 
@@ -833,26 +870,28 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
             visited_nodes_backward.insert(current_child);
 
-            if (traversed_nodes_count >= TRAVERSAL_BATCH_SIZE) {
+            if (traversed_nodes_count >= traversal_batch_size) {
                 break;
             }
         }
         
         batches_count_backwards++;
 
-        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query);
+        // DEBUG ADAPTIVE
+        std::vector<RowTuples> batch_annotations = get_row_tuples_labeled(batch_of_rows, samples_with_query_adaptive);
         // std::vector<RowTuples> batch_annotations = get_row_tuples(batch_of_rows);
 
         // collect all new discovered coordinates
         for (size_t batch_i = 0; batch_i < batch_of_rows.size(); ++batch_i) {
             for (auto & [j_prev, tuple_prev] : batch_annotations[batch_i]) {
-                if (!samples_with_query.count(j_prev)) {
+                // DEBUG ADAPTIVE
+                if (!samples_with_query_adaptive.count(j_prev)) {
                     tuple_prev = Tuple();
                     continue;
                 }
 
                 for (uint64_t &c_prev : tuple_prev) {
-                    all_discovered_coordinates[j_prev].insert(c_prev);
+                    // all_discovered_coordinates[j_prev].insert(c_prev);
                     reconstructed_paths[j_prev][c_prev] = batch_of_rows[batch_i];
                 }
 
@@ -866,15 +905,23 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         // update reads starts
         std::unordered_map<Column, std::vector<std::pair<uint64_t, uint64_t>>> starts_to_update;
         for (auto & [j_start, coords_starts] : starts_of_reads) {
+            // DEBUG ADAPTIVE, if this sample is fully processed, no need to do these operations
+            if (samples_with_query_adaptive.find(j_start) == samples_with_query_adaptive.end())
+                continue;
+
+            // TODO since it is sorted (std::map) we can make use of it
+            auto &reconstructed_paths_for_j = reconstructed_paths[j_start];
             for (auto & c_start : coords_starts) {
                 if (c_start == 0)
                     continue;
                 auto c_end_cur = c_start;
                 bool replace_read_end = false;
 
-                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_start][c_end_cur]);
-                while (all_discovered_coordinates[j_start].count(c_end_cur - SHIFT)) {
-                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_start][c_end_cur - SHIFT]);
+                auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths_for_j[c_end_cur]);
+
+                // TODO here instead of using find() every time, we can find the match and then iterate
+                while (reconstructed_paths_for_j.find(c_end_cur - SHIFT) != reconstructed_paths_for_j.end()) {
+                    auto end_node_new = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths_for_j[c_end_cur - SHIFT]);
 
                     bool edge_exists = false;
                     graph_->adjacent_incoming_nodes(end_node_old, [&](auto adj_inc_node) {
@@ -912,11 +959,21 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
         to_visit = std::deque<Row>();
 
-
+        std::unordered_map<Row, std::vector<Row>> processed_starts; // TODO DEBUG and unvisited predecessors
         for (auto & [j_end, coords_ends] : starts_of_reads) {
+            // DEBUG ADAPTIVE
+            if (samples_with_query_adaptive.find(j_end) == samples_with_query_adaptive.end())
+                continue;
+            bool more_read_to_reconstruct = false; // DEBUG ADAPTIVE DECOMPRESSION TEST
             for (auto & c_end : coords_ends) {
                 auto end_node_old = graph::AnnotatedSequenceGraph::anno_to_graph_index(reconstructed_paths[j_end][c_end]);
-
+                if (processed_starts.count(end_node_old)) {
+                    for (auto & unvisited_predecessor_row : processed_starts[end_node_old])
+                        to_visit.push_front(unvisited_predecessor_row);
+                    continue;
+                }
+                    
+                std::vector<Row> unvisited_predecessors;
                 graph_->call_incoming_kmers(end_node_old, [&](auto adj_outg_node, char c) {
                     // std::ignore = c;
                     if (c == graph::boss::BOSS::kSentinel)
@@ -925,8 +982,18 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
                     Row adj_outg_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(adj_outg_node);
                     if (!visited_nodes_backward.count(adj_outg_to_anno)) {
                         to_visit.push_front(adj_outg_to_anno);
+                        unvisited_predecessors.push_back(adj_outg_to_anno);
+                        more_read_to_reconstruct = true;
                     }
                 });
+
+                processed_starts.try_emplace(end_node_old, unvisited_predecessors);
+            }
+
+            // DEBUG ADAPTIVE DECOMPRESSION TEST
+            if (!more_read_to_reconstruct) {
+                mtg::common::logger->trace("Finished backwards processing sample {}", j_end);
+                samples_with_query_adaptive.erase(j_end);
             }
         }
 
@@ -957,8 +1024,8 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
         // std::unordered_map<Column, std::unordered_map<uint64_t, Row>> successors_rows_and_coords;
         // size_t batch_vec_size = batch_of_rows_to_check_if_traverse_more.size();
 
-        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += TRAVERSAL_BATCH_SIZE) {
-        //     size_t cur_end = std::min(cur_part + TRAVERSAL_BATCH_SIZE, batch_vec_size);
+        // for (size_t cur_part = 0; cur_part < batch_vec_size; cur_part += traversal_batch_size) {
+        //     size_t cur_end = std::min(cur_part + traversal_batch_size, batch_vec_size);
 
         //     std::vector<Row> batch_part(batch_of_rows_to_check_if_traverse_more.begin() + cur_part,
         //     batch_of_rows_to_check_if_traverse_more.begin() + cur_end);

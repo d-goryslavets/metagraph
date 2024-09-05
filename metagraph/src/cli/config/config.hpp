@@ -108,6 +108,9 @@ class Config {
 
     uint8_t count_width = 8;
 
+    // Read extraction options
+    uint64_t traversal_batch_size = 500;
+
     // Alignment options
     bool alignment_edit_distance = false;
     bool alignment_chain = false;

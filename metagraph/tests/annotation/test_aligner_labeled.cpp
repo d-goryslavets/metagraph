@@ -102,7 +102,7 @@ TYPED_TEST(LabeledAlignerTest, GetTracesWithRow) {
     // std::unordered_set<std::string> manifest_labels = { "A", "B" };
 
 
-    auto obs = anno_graph->get_overlapping_reads(start_seq);
+    auto obs = anno_graph->get_overlapping_reads(start_seq, 50); // TODO DEBUG explicit traversal batchsize
  
     std::tuple ref_tuple1 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTGCTAATGCTT", "A", 0, 1);
     std::tuple ref_tuple2 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTT", "B", 0, 1);

@@ -546,17 +546,17 @@ AnnotatedDBG::get_kmer_coordinates(const std::vector<node_index> &nodes,
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(std::string_view sequence) const {
+AnnotatedDBG::get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size) const {
     
     if (sequence.size() < dbg_.get_k())
         return {};
 
     std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes, sequence);
+    return get_overlapping_reads(nodes, sequence, traversal_batch_size);
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence) const {
+AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size) const {
     
     if (!nodes.size())
         return {};    
@@ -590,7 +590,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
     
 
     // TODO: make this as parameter, not hardcoded
-    uint64_t columnBatchsize = 10;
+    uint64_t column_batch_size = 100;
 
     logger->trace("Getting samples with query...");
     std::unordered_set<Column> samples_with_query = tuple_row_diff->get_samples_containing_query(rows);
@@ -605,10 +605,10 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
     logger->trace("Processing columns in batches...");
     std::ofstream outfile;
     
-    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += columnBatchsize) {
+    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += column_batch_size) {
         // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result; // result for current batch of columns
 
-        size_t cur_end = std::min(curColumn + columnBatchsize, samples_with_query_vec.size());
+        size_t cur_end = std::min(curColumn + column_batch_size, samples_with_query_vec.size());
 
         std::vector<Column> samples_with_query_batch;
         samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,
@@ -618,7 +618,7 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
 
 
         logger->trace("Column batch getting traces...");
-        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(rows, columns_batch);
+        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(rows, columns_batch, traversal_batch_size);
 
 
         // Spell paths for curr batch of columns

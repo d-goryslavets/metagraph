@@ -159,7 +159,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
      * (path_spelling, label, position_in_input_sequence, position_in_ref_sequence) is returned.
      */
     std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(std::string_view sequence) const;
+    get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size) const;
 
     /** Returns all labeled reads that match the corresponding sequence of k-mers. 
      * TODO: UPDATE
@@ -172,7 +172,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
      * Also iterativelt saves extracted reads for groups of columns (samples) in a .txt file
      */
     std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence) const;
+    get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size) const;
 
     std::vector<std::pair<Label, sdsl::bit_vector>>
     get_top_label_signatures(std::string_view sequence,
