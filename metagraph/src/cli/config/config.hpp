@@ -61,6 +61,8 @@ class Config {
     bool output_json = false;
     bool aggregate_columns = false;
     bool coordinates = false;
+    bool index_header_coords = false;
+    bool no_coord_mapping = false;
     bool advanced = false;
 
     unsigned int k = 3;
@@ -147,6 +149,7 @@ class Config {
     double alignment_min_exact_match = 0.7;
     double min_fraction = 0.0;
     double max_fraction = 1.0;
+    double cleaning_threshold_percentile = 0.001;
     std::vector<double> count_slice_quantiles;
     std::vector<double> count_quantiles;
 
@@ -244,7 +247,7 @@ class Config {
     static std::string graphmode_to_string(graph::DeBruijnGraph::Mode mode);
     static graph::DeBruijnGraph::Mode string_to_graphmode(const std::string &string);
 
-    QueryMode query_mode = LABELS;
+    QueryMode query_mode = MATCHES;
     static std::string querymode_to_string(QueryMode mode);
     static QueryMode string_to_querymode(const std::string &string);
 

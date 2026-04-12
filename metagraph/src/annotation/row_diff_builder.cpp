@@ -11,6 +11,7 @@
 #include "common/elias_fano/elias_fano_merger.hpp"
 #include "common/utils/file_utils.hpp"
 #include "common/vectors/bit_vector_sdsl.hpp"
+#include "common/vectors/bit_vector_dyn.hpp"
 #include "graph/annotated_dbg.hpp"
 
 const uint64_t BLOCK_SIZE = 1 << 25;
@@ -26,6 +27,7 @@ namespace annot {
 using namespace mtg::annot::matrix;
 using mtg::common::logger;
 using mtg::graph::boss::BOSS;
+using node_index = graph::DeBruijnGraph::node_index;
 namespace fs = std::filesystem;
 
 using anchor_bv_type = RowDiff<ColumnMajor>::anchor_bv_type;
@@ -33,11 +35,6 @@ using rd_succ_bv_type = RowDiff<ColumnMajor>::fork_succ_bv_type;
 template <typename T>
 using Encoder = mtg::elias_fano::EliasFanoEncoderBuffered<T>;
 
-#if _OpenMP_5
-#define _OMP_NONRCTGLR_LOOP collapse(2)
-#else
-#define _OMP_NONRCTGLR_LOOP schedule(dynamic)
-#endif
 
 std::vector<annot::ColumnCompressed<>>
 load_columns(const std::vector<std::string> &source_files, uint64_t *num_rows) {
@@ -104,6 +101,17 @@ void load_coordinates(const std::vector<std::string> &source_files,
     }
 }
 
+std::vector<std::pair<size_t, size_t>>
+get_all_column_indexes(const std::vector<annot::ColumnCompressed<>> &sources) {
+    std::vector<std::pair<size_t, size_t>> col_indexes;
+    for (size_t l_idx = 0; l_idx < sources.size(); ++l_idx) {
+        for (size_t j = 0; j < sources[l_idx].num_labels(); ++j) {
+            col_indexes.emplace_back(l_idx, j);
+        }
+    }
+    return col_indexes;
+}
+
 void count_labels_per_row(const std::vector<std::string> &source_files,
                           const std::string &row_count_fname,
                           bool with_coordinates) {
@@ -153,6 +161,9 @@ void count_labels_per_row(const std::vector<std::string> &source_files,
     ProgressBar progress_bar(num_rows, "Count row labels", std::cerr, !common::get_verbose());
     uint64_t next_block_size = std::min(BLOCK_SIZE, num_rows);
 
+    // get a full array of all columns for the omp parallelization below
+    const auto col_indexes = get_all_column_indexes(sources);
+
     for (uint64_t block_begin = 0; block_begin < num_rows; block_begin += BLOCK_SIZE) {
         uint64_t block_size = next_block_size;
         next_block_size = std::min(BLOCK_SIZE, num_rows - (block_begin + block_size));
@@ -160,24 +171,23 @@ void count_labels_per_row(const std::vector<std::string> &source_files,
         row_count_block.assign(block_size, 0);
 
         // process the current block
-        #pragma omp parallel for num_threads(get_num_threads()) _OMP_NONRCTGLR_LOOP
-        for (size_t l_idx = 0; l_idx < sources.size(); ++l_idx) {
-            for (size_t j = 0; j < sources[l_idx].num_labels(); ++j) {
-                const bit_vector &source_col
-                        = *sources[l_idx].get_matrix().data()[j];
-                source_col.call_ones_in_range(block_begin, block_begin + block_size,
-                    [&](uint64_t i) {
-                        if (with_coordinates) {
-                            uint64_t rk = source_col.rank1(i);
-                            uint32_t num_coords = delims[l_idx][j].select1(rk + 1)
-                                                    - delims[l_idx][j].select1(rk);
-                            __atomic_add_fetch(&row_count_block[i - block_begin], num_coords, __ATOMIC_RELAXED);
-                        } else {
-                            __atomic_add_fetch(&row_count_block[i - block_begin], 1, __ATOMIC_RELAXED);
-                        }
+        #pragma omp parallel for num_threads(get_num_threads())
+        for (size_t c = 0; c < col_indexes.size(); ++c) {
+            auto [l_idx, j] = col_indexes[c];
+            const bit_vector &source_col
+                    = *sources[l_idx].get_matrix().data()[j];
+            source_col.call_ones_in_range(block_begin, block_begin + block_size,
+                [&,l_idx=l_idx,j=j](uint64_t i) {
+                    if (with_coordinates) {
+                        uint64_t rk = source_col.rank1(i);
+                        uint32_t num_coords = delims[l_idx][j].select1(rk + 1)
+                                                - delims[l_idx][j].select1(rk);
+                        __atomic_add_fetch(&row_count_block[i - block_begin], num_coords, __ATOMIC_RELAXED);
+                    } else {
+                        __atomic_add_fetch(&row_count_block[i - block_begin], 1, __ATOMIC_RELAXED);
                     }
-                );
-            }
+                }
+            );
         }
 
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -264,13 +274,35 @@ void sum_and_call_counts(const fs::path &dir,
     }
 }
 
-rd_succ_bv_type route_at_forks(const graph::DBGSuccinct &graph,
-                               const std::string &rd_succ_filename,
-                               const std::string &count_vectors_dir,
-                               const std::string &row_count_extension) {
+std::shared_ptr<const bit_vector> get_last(const graph::DeBruijnGraph &graph) {
+    if (auto* dbg_succ = dynamic_cast<graph::DBGSuccinct const*>(&graph)) {
+        return std::shared_ptr<const bit_vector>(
+            std::shared_ptr<const bit_vector>{}, &dbg_succ->get_boss().get_last());
+    } else {
+        sdsl::bit_vector last_bv(graph.max_index() + 1);
+
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        graph.call_nodes([&](node_index v) {
+            std::pair<char, node_index> last = { '\0', graph::DeBruijnGraph::npos };
+            graph.call_outgoing_kmers(v, [&](node_index u, char c) {
+                last = std::max(last, std::pair{ c, u });
+            });
+
+            if (last.second != graph::DeBruijnGraph::npos)
+                set_bit(last_bv.data(), last.second, true, __ATOMIC_RELAXED);
+        }, []() { return false; }, get_num_threads());
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return std::make_shared<bit_vector_stat>(std::move(last_bv));
+    }
+}
+
+std::shared_ptr<const bit_vector> route_at_forks(const graph::DeBruijnGraph &graph,
+                                                 const std::string &rd_succ_filename,
+                                                 const std::string &count_vectors_dir,
+                                                 const std::string &row_count_extension) {
     logger->trace("Assigning row-diff successors at forks...");
 
-    rd_succ_bv_type rd_succ;
+    std::shared_ptr<const bit_vector> rd_succ;
 
     bool optimize_forks = false;
     for (const auto &p : fs::directory_iterator(count_vectors_dir)) {
@@ -278,55 +310,153 @@ rd_succ_bv_type route_at_forks(const graph::DBGSuccinct &graph,
             optimize_forks = true;
     }
 
+    std::ofstream f(rd_succ_filename, ios::binary);
     if (optimize_forks) {
         logger->trace("RowDiff successors will be set to the adjacent nodes with"
                       " the largest number of labels");
 
-        const bit_vector &last = graph.get_boss().get_last();
+        sdsl::bit_vector rd_succ_bv(graph.max_index() + 1, false);
+
         graph::DeBruijnGraph::node_index graph_idx = to_node(0);
-
-        std::vector<uint32_t> outgoing_counts;
-
-        sdsl::bit_vector rd_succ_bv(last.size(), false);
-
-        sum_and_call_counts(count_vectors_dir, row_count_extension, "row counts",
-            [&](int32_t count) {
-                // TODO: skip single outgoing
-                outgoing_counts.push_back(count);
-                if (last[graph.kmer_to_boss_index(graph_idx)]) {
-                    // pick the node with the largest count
-                    size_t max_pos = std::max_element(outgoing_counts.rbegin(),
-                                                      outgoing_counts.rend())
-                                     - outgoing_counts.rbegin();
-                    rd_succ_bv[graph.kmer_to_boss_index(graph_idx - max_pos)] = true;
-                    outgoing_counts.resize(0);
+        if (const auto *succinct = dynamic_cast<graph::DBGSuccinct const*>(&graph)) {
+            const auto &boss = succinct->get_boss();
+            std::vector<uint32_t> outgoing_counts;
+            sum_and_call_counts(count_vectors_dir, row_count_extension, "row counts",
+                [&](int32_t count) {
+                    // TODO: skip single outgoing
+                    outgoing_counts.push_back((count + 1) * graph.in_graph(graph_idx));
+                    if (boss.get_last(graph_idx)) {
+                        // pick the node with the largest count
+                        size_t max_pos = std::max_element(outgoing_counts.rbegin(),
+                                                        outgoing_counts.rend())
+                                        - outgoing_counts.rbegin();
+                        if (outgoing_counts[max_pos]) { // Don't mark fake vertices as succ
+                            rd_succ_bv[graph_idx - max_pos] = true;
+                        }
+                        outgoing_counts.resize(0);
+                    }
+                    graph_idx++;
                 }
-                graph_idx++;
-            }
-        );
+            );
+        } else {
+            auto get_first_parent = [&](node_index v) {
+                std::pair<char, node_index> first_in_edge { 127, graph::DeBruijnGraph::npos };
+                size_t indegree = 0;
+                graph.call_incoming_kmers(v, [&](node_index prev, char c) {
+                    first_in_edge = std::min(first_in_edge, std::make_pair(c, prev));
+                    ++indegree;
+                });
 
-        if (graph_idx != graph.num_nodes() + 1) {
-            logger->error("Size the count vectors is incompatible with the"
-                          " graph: {} != {}", graph_idx - 1, graph.num_nodes());
+                auto [c, p] = first_in_edge;
+
+                assert((indegree > 0) == (p != graph::DeBruijnGraph::npos));
+                size_t outdegree = !indegree ? 0 : graph.outdegree(p);
+                return std::make_pair(p, outdegree);
+            };
+
+            tsl::hopscotch_map<node_index, std::vector<std::pair<uint32_t, node_index>>> outgoing_counts_cache;
+            sum_and_call_counts(count_vectors_dir, row_count_extension, "row counts",
+                [&](int32_t count) {
+                    if (graph.in_graph(graph_idx)) {
+                        auto [parent, outdegree] = get_first_parent(graph_idx);
+                        if (outdegree > 1) {
+                            assert(parent != graph::DeBruijnGraph::npos);
+                            auto &bucket = outgoing_counts_cache[parent];
+                            bucket.emplace_back(count, graph_idx);
+                            if (bucket.size() == outdegree) {
+                                // all siblings visited, mark the max, then clear cache
+                                auto max_it = std::max_element(bucket.begin(), bucket.end());
+                                rd_succ_bv[max_it->second] = true;
+                                outgoing_counts_cache.erase(parent);
+                            }
+                        } else {
+                            rd_succ_bv[graph_idx] = true;
+                        }
+                    }
+                    graph_idx++;
+                }
+            );
+
+            if (outgoing_counts_cache.size()) {
+                logger->error("{} parent nodes unaccounted for", outgoing_counts_cache.size());
+                exit(1);
+            }
+        }
+
+        if (graph_idx != graph.max_index() + 1) {
+            logger->error("Size of the count vectors is incompatible with the"
+                        " graph: {} != {}", graph_idx - 1, graph.max_index());
             exit(1);
         }
 
-        rd_succ = rd_succ_bv_type(std::move(rd_succ_bv));
+        rd_succ = std::make_shared<rd_succ_bv_type>(std::move(rd_succ_bv));
+        rd_succ->serialize(f);
 
     } else {
         logger->warn("No count vectors could be found in {}. The last outgoing"
                      " edges will be selected for assigning RowDiff successors",
                      count_vectors_dir);
+        rd_succ = get_last(graph);
+        if (dynamic_cast<graph::DBGSuccinct const*>(&graph)) {
+            rd_succ_bv_type().serialize(f);
+        } else {
+            assert(std::dynamic_pointer_cast<const bit_vector_stat>(rd_succ));
+            rd_succ_bv_type(std::move(
+                *std::static_pointer_cast<const bit_vector_stat>(rd_succ)
+            )).serialize(f);
+        }
     }
 
-    std::ofstream f(rd_succ_filename, ios::binary);
-    rd_succ.serialize(f);
     logger->trace("RowDiff successors are assigned for forks and written to {}",
                   rd_succ_filename);
     return rd_succ;
 }
 
-void build_pred_succ(const std::string &graph_fname,
+void row_diff_traverse(const graph::DeBruijnGraph &graph,
+                       size_t num_threads,
+                       size_t max_length,
+                       const bit_vector &rd_succ,
+                       sdsl::bit_vector *terminal) {
+    if (auto* dbg_succ = dynamic_cast<graph::DBGSuccinct const*>(&graph)) {
+        return dbg_succ->get_boss().row_diff_traverse(
+            num_threads, max_length, rd_succ, terminal);
+    } else {
+        std::atomic_thread_fence(std::memory_order_release);
+        sdsl::bit_vector visited(graph.max_index() + 1);
+        auto finalised = visited;
+        assert(terminal->size() == visited.size());
+        assert(rd_succ.size() == visited.size());
+
+        ProgressBar progress_bar(graph.num_nodes(), "Checking nodes", std::cerr,
+                                 !common::get_verbose());
+        graph.call_nodes([&](node_index start) {
+            ++progress_bar;
+            node_index v = start;
+            std::vector<node_index> path;
+            while (path.size() < max_length
+                    && !fetch_and_set_bit(visited.data(), v, true, std::memory_order_acq_rel)) {
+                path.push_back(v);
+                if (!graph.has_no_outgoing(v))
+                    v = row_diff_successor(graph, v, rd_succ);
+            }
+
+            if (path.empty())
+                return;
+
+            // Either a sink, or a cyclic dependency
+            if (!fetch_and_set_bit(finalised.data(), v, true, std::memory_order_acq_rel))
+                set_bit(terminal->data(), v, true, std::memory_order_relaxed);
+
+            for (node_index v : path) {
+                set_bit(finalised.data(), v, true, std::memory_order_release);
+            }
+        }, []() { return false; }, num_threads);
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+}
+
+void build_pred_succ(const graph::DeBruijnGraph &graph,
                      const std::string &outfbase,
                      const std::string &count_vectors_dir,
                      const std::string &row_count_extension,
@@ -342,70 +472,70 @@ void build_pred_succ(const std::string &graph_fname,
     logger->trace("Building and writing successor and predecessor files to {}.*",
                   outfbase);
 
-    graph::DBGSuccinct graph(2);
-    logger->trace("Loading graph...");
-    if (!graph.load(graph_fname)) {
-        logger->error("Cannot load graph from {}", graph_fname);
-        std::exit(1);
-    }
 
     // assign row-diff successors at forks
-    rd_succ_bv_type rd_succ = route_at_forks(graph, outfbase + kRowDiffForkSuccExt,
-                                             count_vectors_dir, row_count_extension);
-
-    const BOSS &boss = graph.get_boss();
-
-    sdsl::bit_vector dummy = boss.mark_all_dummy_edges(num_threads);
+    auto rd_succ_ptr = route_at_forks(graph, outfbase + kRowDiffForkSuccExt,
+                                      count_vectors_dir, row_count_extension);
+    auto& rd_succ = *rd_succ_ptr;
 
     // create the succ/pred files, indexed using annotation indices
-    uint32_t width = sdsl::bits::hi(graph.num_nodes()) + 1;
+    uint32_t width = sdsl::bits::hi(graph.max_index()) + 1;
     sdsl::int_vector_buffer<> succ(outfbase + ".succ", std::ios::out, BUFFER_SIZE, width);
     sdsl::int_vector_buffer<1> succ_boundary(outfbase + ".succ_boundary", std::ios::out, BUFFER_SIZE);
     sdsl::int_vector_buffer<> pred(outfbase + ".pred", std::ios::out, BUFFER_SIZE, width);
     sdsl::int_vector_buffer<1> pred_boundary(outfbase + ".pred_boundary", std::ios::out, BUFFER_SIZE);
 
-    ProgressBar progress_bar(graph.num_nodes(), "Compute succ/pred", std::cerr,
+    std::optional<sdsl::bit_vector> dummy;
+    auto* succinct = dynamic_cast<graph::DBGSuccinct const*>(&graph);
+    if (succinct) {
+        dummy = succinct->get_boss().mark_all_dummy_edges(num_threads);
+    }
+
+    ProgressBar progress_bar(graph.max_index(), "Compute succ/pred", std::cerr,
                              !common::get_verbose());
 
     const uint64_t BS = 1'000'000;
-    // traverse BOSS table in parallel processing blocks of size |BS|
+    // traverse graph in parallel processing blocks of size |BS|
     // use static scheduling to make threads process ordered contiguous blocks
     #pragma omp parallel for ordered num_threads(num_threads) schedule(dynamic)
-    for (uint64_t start = 1; start <= graph.num_nodes(); start += BS) {
-        std::vector<uint64_t> succ_buf;
+    for (node_index start = 1; start <= graph.max_index(); start += BS) {
+        std::vector<node_index> succ_buf;
         std::vector<bool> succ_boundary_buf;
-        std::vector<uint64_t> pred_buf;
+        std::vector<node_index> pred_buf;
         std::vector<bool> pred_boundary_buf;
 
-        for (uint64_t i = start; i < std::min(start + BS, graph.num_nodes() + 1); ++i) {
-            BOSS::edge_index boss_idx = graph.kmer_to_boss_index(i);
-            if (!dummy[boss_idx]) {
-                BOSS::edge_index next = boss.fwd(boss_idx);
-                assert(next);
-                if (!dummy[next]) {
-                    while (rd_succ.size() && !rd_succ[next]) {
-                        next--;
-                        assert(!boss.get_last(next));
-                    }
-                    succ_buf.push_back(to_row(graph.boss_to_kmer_index(next)));
-                    succ_boundary_buf.push_back(0);
-                }
-                // compute predecessors only for row-diff successors
-                if (rd_succ.size() ? rd_succ[boss_idx] : boss.get_last(boss_idx)) {
-                    BOSS::TAlphabet d = boss.get_node_last_value(boss_idx);
-                    BOSS::edge_index back_idx = boss.bwd(boss_idx);
-                    boss.call_incoming_to_target(back_idx, d,
-                        [&](BOSS::edge_index pred) {
-                            // dummy predecessors are ignored
-                            if (!dummy[pred]) {
-                                uint64_t node_index = graph.boss_to_kmer_index(pred);
-                                pred_buf.push_back(to_row(node_index));
-                                pred_boundary_buf.push_back(0);
-                            }
-                        }
-                    );
+        for (node_index i = start; i < std::min(start + BS, graph.max_index() + 1); ++i) {
+            bool skip_succ = false;
+            bool skip_all = !graph.in_graph(i);
+
+            if (!skip_all && succinct) { // Legacy code for DBGSuccinct
+                BOSS::edge_index boss_idx = i;
+                if((*dummy)[boss_idx]) {
+                    skip_all = true;
+                } else {
+                    skip_succ = (*dummy)[succinct->get_boss().fwd(boss_idx)];
                 }
             }
+
+            if (!skip_all) {
+                skip_succ |= graph.has_no_outgoing(i);
+                if (!skip_succ) {
+                    auto j = row_diff_successor(graph, i, rd_succ);
+                    succ_buf.push_back(to_row(j));
+                    succ_boundary_buf.push_back(0);
+                }
+
+                if (rd_succ[i]) {
+                    graph.adjacent_incoming_nodes(i, [&](auto pred) {
+                        if (dummy && (*dummy)[pred]) {
+                            return;
+                        }
+                        pred_buf.push_back(to_row(pred));
+                        pred_boundary_buf.push_back(0);
+                    });
+                }
+            }
+
             succ_boundary_buf.push_back(1);
             pred_boundary_buf.push_back(1);
             ++progress_bar;
@@ -424,7 +554,7 @@ void build_pred_succ(const std::string &graph_fname,
     logger->trace("Pred/succ nodes written to {}.pred/succ", outfbase);
 }
 
-void assign_anchors(const std::string &graph_fname,
+void assign_anchors(const graph::DeBruijnGraph &graph,
                     const std::string &outfbase,
                     const std::filesystem::path &count_vectors_dir,
                     uint32_t max_length,
@@ -436,14 +566,7 @@ void assign_anchors(const std::string &graph_fname,
         return;
     }
 
-    graph::DBGSuccinct graph(2);
-    logger->trace("Loading graph...");
-    if (!graph.load(graph_fname)) {
-        logger->error("Cannot load graph from {}", graph_fname);
-        std::exit(1);
-    }
-    const BOSS &boss = graph.get_boss();
-    const uint64_t num_rows = graph.num_nodes();
+    const uint64_t num_rows = graph.max_index();
 
     bool optimize_anchors = false;
     for (const auto &p : fs::directory_iterator(count_vectors_dir)) {
@@ -451,7 +574,7 @@ void assign_anchors(const std::string &graph_fname,
             optimize_anchors = true;
     }
 
-    sdsl::bit_vector anchors_bv(boss.get_last().size(), false);
+    sdsl::bit_vector anchors_bv(graph.max_index() + 1, false);
 
     if (optimize_anchors) {
         logger->trace("Making every row with negative reduction an anchor...");
@@ -460,8 +583,9 @@ void assign_anchors(const std::string &graph_fname,
         sum_and_call_counts(count_vectors_dir, row_reduction_extension, "row reduction",
             [&](int32_t count) {
                 // check if the reduction is negative
-                if (count < 0)
-                    anchors_bv[graph.kmer_to_boss_index(to_node(i))] = true;
+                if (count < 0) {
+                    anchors_bv[to_node(i)] = true;
+                }
                 i++;
             }
         );
@@ -492,11 +616,12 @@ void assign_anchors(const std::string &graph_fname,
 
         if (rd_succ.size()) {
             logger->trace("Assigning anchors for RowDiff successors {}...", rd_succ_fname);
-            boss.row_diff_traverse(num_threads, max_length, rd_succ, &anchors_bv);
+            row_diff_traverse(graph, num_threads, max_length, rd_succ, &anchors_bv);
         } else {
             logger->warn("Assigning anchors without chosen RowDiff successors."
                          " The last outgoing edges will be used for routing.");
-            boss.row_diff_traverse(num_threads, max_length, boss.get_last(), &anchors_bv);
+            auto last = get_last(graph);
+            row_diff_traverse(graph, num_threads, max_length, *last, &anchors_bv);
         }
     }
 
@@ -505,7 +630,7 @@ void assign_anchors(const std::string &graph_fname,
         sdsl::bit_vector anchors(num_rows, false);
         for (BOSS::edge_index i = 1; i < anchors_bv.size(); ++i) {
             if (anchors_bv[i]) {
-                uint64_t graph_idx = graph.boss_to_kmer_index(i);
+                uint64_t graph_idx = i;
                 assert(to_row(graph_idx) < num_rows);
                 anchors[to_row(graph_idx)] = 1;
             }
@@ -567,23 +692,6 @@ void read_next_block(sdsl::int_vector_buffer<>::iterator &it,
     }
 }
 
-void read_next_blocks(sdsl::int_vector_buffer<>::iterator *succ_it_p,
-                      sdsl::int_vector_buffer<1>::iterator *succ_boundary_it_p,
-                      sdsl::int_vector_buffer<>::iterator *pred_it_p,
-                      sdsl::int_vector_buffer<1>::iterator *pred_boundary_it_p,
-                      uint64_t block_size,
-                      std::array<std::vector<uint64_t>, 4> *out) {
-    #pragma omp parallel sections num_threads(2)
-    {
-        #pragma omp section
-        read_next_block(*succ_it_p, *succ_boundary_it_p, block_size,
-                        out->at(0), out->at(1));
-        #pragma omp section
-        read_next_block(*pred_it_p, *pred_boundary_it_p, block_size,
-                        out->at(2), out->at(3));
-    }
-}
-
 /**
  * Traverses a group of column compressed annotations (loaded in memory) in chunks of
  * BLOCK_SIZE rows at a time and invokes #call_ones for each set bit.
@@ -618,22 +726,28 @@ void traverse_anno_chunked(
     auto pred_it = pred.begin();
     auto pred_boundary_it = pred_boundary.begin();
 
-    ThreadPool async_reader(1, 1);
+    ThreadPool async_reader(2);
     // start reading the first block
     uint64_t next_block_size = std::min(BLOCK_SIZE, num_rows);
     std::array<std::vector<uint64_t>, 4> context;
     std::array<std::vector<uint64_t>, 4> context_other;
-    async_reader.enqueue(read_next_blocks,
-                         &succ_it, &succ_boundary_it,
-                         &pred_it, &pred_boundary_it,
-                         next_block_size, &context_other);
+
+    async_reader.enqueue([&]() {
+        read_next_block(succ_it, succ_boundary_it, next_block_size,
+                        context_other[0], context_other[1]);
+    });
+    async_reader.enqueue([&]() {
+        read_next_block(pred_it, pred_boundary_it, next_block_size,
+                        context_other[2], context_other[3]);
+    });
+
+    // get a full array of all columns for the omp parallelization below
+    const auto col_indexes = get_all_column_indexes(col_annotations);
 
     ProgressBar progress_bar(num_rows, "Compute diffs", std::cerr, !common::get_verbose());
 
     for (uint64_t chunk = 0; chunk < num_rows; chunk += BLOCK_SIZE) {
         uint64_t block_size = next_block_size;
-        next_block_size = std::min(BLOCK_SIZE, num_rows - (chunk + block_size));
-
         before_chunk(block_size);
 
         // finish reading this block
@@ -645,33 +759,37 @@ void traverse_anno_chunked(
         std::vector<uint64_t> &pred_chunk_idx = context[3];
 
         // start reading next block
-        async_reader.enqueue(read_next_blocks,
-                             &succ_it, &succ_boundary_it,
-                             &pred_it, &pred_boundary_it,
-                             next_block_size, &context_other);
+        next_block_size = std::min(BLOCK_SIZE, num_rows - (chunk + block_size));
+        async_reader.enqueue([&]() {
+            read_next_block(succ_it, succ_boundary_it, next_block_size,
+                            context_other[0], context_other[1]);
+        });
+        async_reader.enqueue([&]() {
+            read_next_block(pred_it, pred_boundary_it, next_block_size,
+                            context_other[2], context_other[3]);
+        });
 
         assert(succ_chunk.size() == succ_chunk_idx.back());
         assert(pred_chunk.size() == pred_chunk_idx.back());
         // process the current block
-        #pragma omp parallel for num_threads(num_threads) _OMP_NONRCTGLR_LOOP
-        for (size_t l_idx = 0; l_idx < col_annotations.size(); ++l_idx) {
-            for (size_t j = 0; j < col_annotations[l_idx].num_labels(); ++j) {
-                const bit_vector &source_col
-                        = *col_annotations[l_idx].get_matrix().data()[j];
-                source_col.call_ones_in_range(chunk, chunk + block_size,
-                    [&](uint64_t i) {
-                        assert(succ_chunk_idx[i - chunk + 1] >= succ_chunk_idx[i - chunk]);
-                        assert(succ_chunk_idx[i - chunk + 1] <= succ_chunk_idx[i - chunk] + 1);
-                        const uint64_t *succ = succ_chunk_idx[i - chunk + 1]
-                                                > succ_chunk_idx[i - chunk]
-                                                ? succ_chunk.data() + succ_chunk_idx[i - chunk]
-                                                : NULL;
-                        call_ones(source_col, i, i - chunk, l_idx, j, succ,
-                                  pred_chunk.data() + pred_chunk_idx[i - chunk],
-                                  pred_chunk.data() + pred_chunk_idx[i - chunk + 1]);
-                    }
-                );
-            }
+        #pragma omp parallel for num_threads(num_threads)
+        for (size_t c = 0; c < col_indexes.size(); ++c) {
+            auto [l_idx, j] = col_indexes[c];
+            const bit_vector &source_col
+                    = *col_annotations[l_idx].get_matrix().data()[j];
+            source_col.call_ones_in_range(chunk, chunk + block_size,
+                [&,l_idx=l_idx,j=j](uint64_t i) {
+                    assert(succ_chunk_idx[i - chunk + 1] >= succ_chunk_idx[i - chunk]);
+                    assert(succ_chunk_idx[i - chunk + 1] <= succ_chunk_idx[i - chunk] + 1);
+                    const uint64_t *succ = succ_chunk_idx[i - chunk + 1]
+                                            > succ_chunk_idx[i - chunk]
+                                            ? succ_chunk.data() + succ_chunk_idx[i - chunk]
+                                            : NULL;
+                    call_ones(source_col, i, i - chunk, l_idx, j, succ,
+                              pred_chunk.data() + pred_chunk_idx[i - chunk],
+                              pred_chunk.data() + pred_chunk_idx[i - chunk + 1]);
+                }
+            );
         }
 
         after_chunk(chunk);
@@ -929,7 +1047,7 @@ void convert_batch_to_row_diff(const std::string &pred_succ_fprefix,
                         // reduction (zero diff)
                         __atomic_add_fetch(&row_nbits_block[chunk_idx], 1, __ATOMIC_RELAXED);
                     }
-                } else {
+                } else if (succ || anchor[row_idx]) {
                     bool is_anchor = anchor[row_idx];
                     // add current bit if this node is an anchor
                     // or if the successor has zero diff
@@ -977,17 +1095,19 @@ void convert_batch_to_row_diff(const std::string &pred_succ_fprefix,
                 });
             });
 
-    #pragma omp parallel for num_threads(num_threads) _OMP_NONRCTGLR_LOOP
-    for (size_t s = 0; s < sources.size(); ++s) {
-        for (size_t j = 0; j < sources[s].num_labels(); ++j) {
-            // flush and release the buffer
-            set_rows[s][j].flush(true);
-            logger->trace("Number of relations for column {} reduced from {}"
-                          " to {}, of them stored in anchors: {}",
-                          sources[s].get_label_encoder().decode(j),
-                          sources[s].get_matrix().data()[j]->num_set_bits(),
-                          set_rows[s][j].size(), num_relations_anchored[s][j]);
-        }
+    // get a full array of all columns for the omp parallelization below
+    const auto col_indexes = get_all_column_indexes(sources);
+
+    #pragma omp parallel for num_threads(num_threads)
+    for (size_t c = 0; c < col_indexes.size(); ++c) {
+        auto [s, j] = col_indexes[c];
+        // flush and release the buffer
+        set_rows[s][j].flush(true);
+        logger->trace("Number of relations for column {} reduced from {}"
+                      " to {}, of them stored in anchors: {}",
+                      sources[s].get_label_encoder().decode(j),
+                      sources[s].get_matrix().data()[j]->num_set_bits(),
+                      set_rows[s][j].size(), num_relations_anchored[s][j]);
     }
 
     async_writer.join();
@@ -1078,15 +1198,14 @@ void convert_batch_to_row_diff(const std::string &pred_succ_fprefix,
     for (uint64_t chunk = 0; chunk < row_reduction.size(); chunk += BLOCK_SIZE) {
         row_nbits_block.assign(std::min(BLOCK_SIZE, row_reduction.size() - chunk), 0);
 
-        #pragma omp parallel for num_threads(num_threads) _OMP_NONRCTGLR_LOOP
-        for (size_t l_idx = 0; l_idx < diff_columns.size(); ++l_idx) {
-            for (const auto &col_ptr : diff_columns[l_idx]) {
-                col_ptr->call_ones_in_range(chunk, chunk + row_nbits_block.size(),
-                    [&](uint64_t i) {
-                        __atomic_add_fetch(&row_nbits_block[i - chunk], 1, __ATOMIC_RELAXED);
-                    }
-                );
-            }
+        #pragma omp parallel for num_threads(num_threads)
+        for (size_t c = 0; c < col_indexes.size(); ++c) {
+            auto [l_idx, j] = col_indexes[c];
+            diff_columns[l_idx][j]->call_ones_in_range(chunk, chunk + row_nbits_block.size(),
+                [&](uint64_t i) {
+                    __atomic_add_fetch(&row_nbits_block[i - chunk], 1, __ATOMIC_RELAXED);
+                }
+            );
         }
 
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -1374,16 +1493,18 @@ void convert_batch_to_row_diff_coord(const std::string &pred_succ_fprefix,
             [&](uint64_t) {}
     );
 
-    #pragma omp parallel for num_threads(num_threads) _OMP_NONRCTGLR_LOOP
-    for (size_t s = 0; s < sources.size(); ++s) {
-        for (size_t j = 0; j < sources[s].num_labels(); ++j) {
-            // flush and release the buffer
-            set_rows[s][j].flush(true);
-            logger->trace("Number of coordinates for column {} reduced from {}"
-                          " to {}, number of coordinates stored in anchors: {}",
-                          sources[s].get_label_encoder().decode(j), coords[s][j].size(),
-                          row_diff_coords[s][j], num_coords_anchored[s][j]);
-        }
+    // get a full array of all columns for the omp parallelization below
+    const auto col_indexes = get_all_column_indexes(sources);
+
+    #pragma omp parallel for num_threads(num_threads)
+    for (size_t c = 0; c < col_indexes.size(); ++c) {
+        auto [s, j] = col_indexes[c];
+        // flush and release the buffer
+        set_rows[s][j].flush(true);
+        logger->trace("Number of coordinates for column {} reduced from {}"
+                      " to {}, number of coordinates stored in anchors: {}",
+                      sources[s].get_label_encoder().decode(j), coords[s][j].size(),
+                      row_diff_coords[s][j], num_coords_anchored[s][j]);
     }
 
     anchor = anchor_bv_type();

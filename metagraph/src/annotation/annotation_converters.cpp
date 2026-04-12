@@ -10,6 +10,7 @@
 #include <tsl/hopscotch_map.h>
 
 #include "row_diff_builder.hpp"
+#include "cli/load/load_graph.hpp"
 #include "common/logger.hpp"
 #include "common/algorithms.hpp"
 #include "common/hashers/hash.hpp"
@@ -213,7 +214,7 @@ convert_row_diff_to_BRWT(RowDiffColumnAnnotator &&annotator,
                          BRWTBottomUpBuilder::Partitioner partitioning,
                          size_t num_parallel_nodes,
                          size_t num_threads) {
-    const graph::DBGSuccinct* graph = annotator.get_matrix().graph();
+    const graph::DeBruijnGraph* graph = annotator.get_matrix().graph();
 
     auto matrix = std::make_unique<BRWT>(
             BRWTBottomUpBuilder::build(std::move(annotator.release_matrix()->diffs().data()),
@@ -380,6 +381,31 @@ void convert_to_row_diff<RowDiffRowFlatAnnotator>(
     logger->trace("Annotation converted");
 }
 
+
+template <>
+void convert_to_row_diff<RowDiffRowFlatAnnotator>(const RowDiffBRWTAnnotator &anno,
+                                                  const std::string &outfbase) {
+    const auto &fname = utils::make_suffix(outfbase, RowDiffRowFlatAnnotator::kExtension);
+    std::ofstream out = utils::open_new_ofstream(fname);
+    if (!out.good())
+        throw std::ofstream::failure("Can't write to " + fname);
+
+    anno.get_label_encoder().serialize(out);
+
+    // serialize RowDiff<RowFlat<>>
+    out.write("v2.0", 4);
+    anno.get_matrix().anchor().serialize(out);
+    anno.get_matrix().fork_succ().serialize(out);
+    out.close();
+
+    RowFlat<>::serialize([&](auto callback) { anno.get_matrix().diffs().call_rows(callback); },
+                         anno.get_matrix().diffs().num_columns(),
+                         anno.get_matrix().diffs().num_rows(),
+                         anno.get_matrix().diffs().num_relations(),
+                         fname, true);
+    logger->trace("Annotation converted");
+}
+
 template <>
 void convert_to_row_diff<RowDiffRowSparseAnnotator>(
             const std::vector<std::string> &files,
@@ -419,7 +445,7 @@ void convert_to_row_diff<RowDiffRowSparseAnnotator>(
 
 std::unique_ptr<MultiBRWTAnnotator>
 convert_to_BRWT(
-        const std::vector<std::vector<uint64_t>> &linkage,
+        const std::vector<std::vector<BRWT::Column>> &linkage,
         size_t num_parallel_nodes,
         size_t num_threads,
         const fs::path &tmp_path,
@@ -455,7 +481,7 @@ convert_to_BRWT(
 template <>
 std::unique_ptr<MultiBRWTAnnotator> convert_to_BRWT<MultiBRWTAnnotator>(
         const std::vector<std::string> &annotation_files,
-        const std::vector<std::vector<uint64_t>> &linkage,
+        const std::vector<std::vector<BRWT::Column>> &linkage,
         size_t num_parallel_nodes,
         size_t num_threads,
         const fs::path &tmp_path) {
@@ -486,7 +512,7 @@ std::unique_ptr<MultiBRWTAnnotator> convert_to_BRWT<MultiBRWTAnnotator>(
 template<>
 std::unique_ptr<RowDiffBRWTAnnotator>
 convert_to_BRWT<RowDiffBRWTAnnotator>(const std::vector<std::string> &annotation_files,
-                         const std::vector<std::vector<uint64_t>> &linkage,
+                         const std::vector<std::vector<BRWT::Column>> &linkage,
                          size_t num_parallel_nodes,
                          size_t num_threads,
                          const fs::path &tmp_path) {
@@ -525,10 +551,10 @@ void relax_BRWT(BRWT *annotation, size_t relax_max_arity, size_t num_threads) {
         BRWTOptimizer::relax(annotation, relax_max_arity, num_threads);
 }
 
-using CallColumn = std::function<void(std::unique_ptr<bit_vector>&&)>;
+using CallColumn = BRWTBottomUpBuilder::CallColumn;
 
 std::vector<uint64_t>
-get_row_classes(const std::function<void(const CallColumn &)> &call_columns,
+get_row_classes(const std::function<void(const CallColumn &, size_t)> &call_columns,
                 size_t num_columns) {
     std::vector<uint64_t> row_classes;
     uint64_t max_class = 0;
@@ -538,7 +564,7 @@ get_row_classes(const std::function<void(const CallColumn &)> &call_columns,
 
     tsl::hopscotch_map<uint64_t, uint64_t> new_class;
 
-    call_columns([&](const auto &col_ptr) {
+    call_columns([&](uint64_t, const auto &col_ptr) {
         new_class.clear();
 
         if (row_classes.empty())
@@ -577,20 +603,20 @@ get_row_classes(const std::function<void(const CallColumn &)> &call_columns,
         }
 
         ++progress_bar;
-    });
+    }, 0);
 
     return row_classes;
 }
 
 std::unique_ptr<Rainbow<BRWT>>
-convert_to_RainbowBRWT(const std::function<void(const CallColumn &)> &call_columns,
+convert_to_RainbowBRWT(const std::function<void(const CallColumn &, size_t)> &call_columns,
                        size_t max_brwt_arity = 1) {
     uint64_t num_columns = 0;
     uint64_t num_ones = 0;
-    call_columns([&](const auto &col_ptr) {
+    call_columns([&](uint64_t, const auto &col_ptr) {
         num_columns++;
         num_ones += col_ptr->num_set_bits();
-    });
+    }, 0);
 
     if (!num_columns)
         return std::make_unique<Rainbow<BRWT>>();
@@ -661,19 +687,14 @@ convert_to_RainbowBRWT(const std::function<void(const CallColumn &)> &call_colum
                              std::cerr, !common::get_verbose());
 
     std::vector<std::unique_ptr<bit_vector>> columns(num_columns);
-    size_t j = 0;
-    ThreadPool thread_pool(get_num_threads());
-    call_columns([&](auto &&col_ptr) {
-        thread_pool.enqueue([&](size_t j, const auto &col_ptr) {
-            sdsl::bit_vector reduced_column(row_pointers.size(), false);
-            for (size_t r = 0; r < row_pointers.size(); ++r) {
-                reduced_column[r] = (*col_ptr)[row_pointers[r]];
-            }
-            columns[j] = std::make_unique<bit_vector_smart>(std::move(reduced_column));
-            ++progress_bar;
-        }, j++, std::move(col_ptr));
-    });
-    thread_pool.join();
+    call_columns([&](uint64_t j, auto &&col_ptr) {
+        sdsl::bit_vector reduced_column(row_pointers.size(), false);
+        for (size_t r = 0; r < row_pointers.size(); ++r) {
+            reduced_column[r] = (*col_ptr)[row_pointers[r]];
+        }
+        columns[j] = std::make_unique<bit_vector_smart>(std::move(reduced_column));
+        ++progress_bar;
+    }, get_num_threads());
 
     logger->trace("Start compressing the assignment vector");
 
@@ -726,18 +747,18 @@ convert_to_RbBRWT<RbBRWTAnnotator>(const std::vector<std::string> &annotation_fi
                                    size_t max_brwt_arity) {
     LEncoder label_encoder;
 
-    auto call_columns = [&](const CallColumn &call_column) {
+    auto call_columns = [&](const CallColumn &call_column, size_t num_threads) {
         label_encoder.clear();
 
         bool success = ColumnCompressed<>::merge_load(
             annotation_files,
-            [&](uint64_t /*j*/,
+            [&](uint64_t j,
                     const std::string &label,
                     std::unique_ptr<bit_vector>&& column) {
-                call_column(std::move(column));
+                call_column(j, std::move(column));
                 label_encoder.insert_and_encode(label);
             },
-            0
+            num_threads
         );
         if (!success) {
             logger->error("Can't load annotation columns");
@@ -1332,9 +1353,10 @@ convert<RbBRWTAnnotator, std::string>(ColumnCompressed<std::string>&& annotator)
         annotator.get_matrix().data()
     );
     auto matrix = convert_to_RainbowBRWT(
-        [&](const auto &callback) {
-            for (auto &column : columns) {
-                callback(std::move(column));
+        [&](const auto &callback, size_t num_threads) {
+            #pragma omp parallel for if(num_threads > 0) num_threads(num_threads) schedule(dynamic)
+            for (size_t j = 0; j < columns.size(); ++j) {
+                callback(j, std::move(columns[j]));
             }
         }
     );
@@ -1539,12 +1561,13 @@ void convert_to_row_diff(const std::vector<std::string> &files,
     if (out_dir.empty())
         out_dir = "./";
 
+    auto graph = cli::load_critical_dbg(graph_fname);
     if (construction_stage != RowDiffStage::COUNT_LABELS)
-        build_pred_succ(graph_fname, graph_fname, out_dir,
+        build_pred_succ(*graph, graph_fname, out_dir,
                         ".row_count", get_num_threads());
 
     if (construction_stage == RowDiffStage::CONVERT) {
-        assign_anchors(graph_fname, graph_fname, out_dir, max_path_length,
+        assign_anchors(*graph, graph_fname, out_dir, max_path_length,
                        ".row_reduction", get_num_threads());
 
         const std::string anchors_fname = graph_fname + kRowDiffAnchorExt;

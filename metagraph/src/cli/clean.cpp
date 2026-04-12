@@ -64,7 +64,7 @@ int clean_graph(Config *config) {
     }
 
     if (config->min_count > 1
-            || config->max_count < std::numeric_limits<unsigned int>::max()
+            || config->max_count < std::numeric_limits<decltype(config->max_count)>::max()
             || config->min_unitig_median_kmer_abundance != 1
             || config->count_slice_quantiles[0] != 0
             || config->count_slice_quantiles[1] != 1) {
@@ -82,7 +82,8 @@ int clean_graph(Config *config) {
 
             uint64_t cutoff
                 = estimate_min_kmer_abundance(*_graph, *node_weights,
-                                              config->num_singleton_kmers);
+                                              config->num_singleton_kmers,
+                                              config->cleaning_threshold_percentile);
 
             if (cutoff != static_cast<uint64_t>(-1)) {
                 config->min_unitig_median_kmer_abundance = cutoff;
@@ -99,7 +100,7 @@ int clean_graph(Config *config) {
         }
 
         if (config->min_count > 1
-                || config->max_count < std::numeric_limits<unsigned int>::max()) {
+                || config->max_count < std::numeric_limits<decltype(config->max_count)>::max()) {
             const auto &weights = *graph->get_extension<graph::NodeWeights>();
 
             graph = std::make_shared<graph::MaskedDeBruijnGraph>(graph,

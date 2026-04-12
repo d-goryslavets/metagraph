@@ -171,7 +171,7 @@ mask_nodes_by_label(const AnnotatedDBG &anno_graph,
 
         logger->trace("Checking shared and other labels");
         masked_graph->call_sequences([&](const std::string &contig, const std::vector<node_index> &path) {
-            for (const auto &[label, sig] : anno_graph.get_top_label_signatures(contig, num_labels)) {
+            for (const auto &[label, count, sig] : anno_graph.get_top_label_signatures(contig, num_labels)) {
                 bool found_in = labels_in.count(label);
                 bool found_out = labels_out.count(label);
                 bool found_in_round2 = labels_in_round2.count(label);
@@ -365,7 +365,7 @@ construct_diff_label_count_vector(const AnnotatedDBG &anno_graph,
         code_to_indicator[label_encoder.encode(label_out)] |= 2;
     }
 
-    std::vector<uint64_t> label_codes;
+    std::vector<annot::matrix::BinaryMatrix::Column> label_codes;
     label_codes.reserve(code_to_indicator.size());
     for (const auto &[code, indicator] : code_to_indicator) {
         label_codes.push_back(code);

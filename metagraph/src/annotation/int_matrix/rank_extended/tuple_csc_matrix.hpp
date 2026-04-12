@@ -36,12 +36,14 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
         column_values_(std::move(column_values)) {}
 
     // return tuple sizes (if not zero) at each entry
-    std::vector<RowValues> get_row_values(const std::vector<Row> &rows) const;
+    std::vector<RowValues> get_row_values(const std::vector<Row> &rows,
+                                          size_t num_threads = 1) const;
 
     uint64_t num_attributes() const;
 
     // return entries of the matrix -- where each entry is a set of integers
-    std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows) const;
+    std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows,
+                                          size_t num_threads = 1) const;
 
     std::vector<RowTuples>
     get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
@@ -78,10 +80,12 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
 
 template <class BaseMatrix, class Values, class Delims>
 inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowValues>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_values(const std::vector<Row> &rows) const {
-    const auto &column_ranks = binary_matrix_.get_column_ranks(rows);
+TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_values(const std::vector<Row> &rows,
+                                                           size_t num_threads) const {
+    const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
     std::vector<RowValues> row_values(rows.size());
     // TODO: reshape?
+    #pragma omp parallel for num_threads(num_threads)
     for (size_t i = 0; i < rows.size(); ++i) {
         row_values[i].reserve(column_ranks[i].size());
         for (auto [j, r] : column_ranks[i]) {
@@ -104,10 +108,12 @@ uint64_t TupleCSCMatrix<BaseMatrix, Values, Delims>::num_attributes() const {
 
 template <class BaseMatrix, class Values, class Delims>
 inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(const std::vector<Row> &rows) const {
-    const auto &column_ranks = binary_matrix_.get_column_ranks(rows);
+TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(const std::vector<Row> &rows,
+                                                           size_t num_threads) const {
+    const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
     std::vector<RowTuples> row_tuples(rows.size());
     // TODO: reshape?
+    #pragma omp parallel for num_threads(num_threads)
     for (size_t i = 0; i < rows.size(); ++i) {
         row_tuples[i].reserve(column_ranks[i].size());
         for (auto [j, r] : column_ranks[i]) {

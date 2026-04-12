@@ -96,6 +96,27 @@ BOSS::~BOSS() {
     delete last_;
 }
 
+sdsl::sd_vector<> BOSS::build_suffix_ranges_sd(std::vector<edge_index>&& ranges,
+                                               uint64_t num_edges) {
+    assert(ranges.size());
+    ranges[0] = std::max<uint64_t>(ranges[0], 1);
+    // align the values to be strictly increasing so that select queries
+    // can recover the originals via get_suffix_range(i) = select1(i+1) - i
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        ranges[i] = std::max(ranges[i], ranges[i - 1] - (i - 1)) + i;
+    }
+    assert(std::is_sorted(ranges.begin(), ranges.end()));
+    sdsl::sd_vector_builder builder(num_edges + ranges.size(), ranges.size());
+    for (auto pos : ranges) {
+        builder.set(pos);
+    }
+    sdsl::sd_vector<> sd(builder);
+    logger->trace("Compressed node ranges to approx. {:.2f} MB",
+                  footprint_sd_vector(sd.size(), ranges.size()) / 8e6);
+    ranges = {};
+    return sd;
+}
+
 template <uint8_t t_width>
 sdsl::int_vector<t_width> to_vector(sdsl::int_vector_buffer<t_width> &buf) {
     buf.flush();
@@ -122,6 +143,14 @@ void BOSS::initialize(Chunk *chunk) {
     // alph_size = chunk->alph_size_;
 
     state = State::STAT;
+
+    if (chunk->indexed_suffix_length_) {
+        indexed_suffix_length_ = chunk->indexed_suffix_length_;
+        indexed_suffix_ranges_ = std::move(chunk->indexed_suffix_ranges_);
+        indexed_suffix_ranges_rk1_ = decltype(indexed_suffix_ranges_rk1_)(&indexed_suffix_ranges_);
+        indexed_suffix_ranges_slct1_ = decltype(indexed_suffix_ranges_slct1_)(&indexed_suffix_ranges_);
+        indexed_suffix_ranges_slct0_ = decltype(indexed_suffix_ranges_slct0_)(&indexed_suffix_ranges_);
+    }
 }
 
 /**
@@ -247,7 +276,8 @@ void BOSS::serialize(std::ofstream &outstream) const {
     outstream.flush();
 }
 
-void BOSS::serialize(Chunk&& chunk, std::ofstream &out, State state) {
+void BOSS::serialize(Chunk&& chunk, std::ofstream &out, State state, int mode,
+                     bool serialize_suffix_ranges) {
     if (!out.good())
         throw std::ofstream::failure("Error: Can't write to file");
 
@@ -290,6 +320,16 @@ void BOSS::serialize(Chunk&& chunk, std::ofstream &out, State state) {
             SERIALIZE_W(wavelet_tree_small);
             SERIALIZE_LAST(bit_vector_small);
             break;
+    }
+
+    // serialize mode if provided (for DBGSuccinct)
+    if (mode >= 0)
+        serialize_number(out, mode);
+
+    if (serialize_suffix_ranges) {
+        assert(mode >= 0 && "suffix ranges require mode to be serialized");
+        serialize_number(out, chunk.indexed_suffix_length_);
+        chunk.indexed_suffix_ranges_.serialize(out);
     }
 
     out.flush();
@@ -1088,13 +1128,15 @@ std::string BOSS::decode(const std::vector<TAlphabet> &seq_encoded) const {
 
 template <class WaveletTree, class BitVector>
 void convert(wavelet_tree **W_, bit_vector **last_) {
-    wavelet_tree *W_new = new WaveletTree((*W_)->convert_to<WaveletTree>());
-    delete *W_;
-    *W_ = W_new;
-
+    common::logger->trace("Converting last");
     bit_vector *last_new = new BitVector((*last_)->convert_to<BitVector>());
     delete *last_;
     *last_ = last_new;
+
+    common::logger->trace("Converting W");
+    wavelet_tree *W_new = new WaveletTree((*W_)->convert_to<WaveletTree>());
+    delete *W_;
+    *W_ = W_new;
 }
 
 void BOSS::switch_state(State new_state) {
@@ -1179,6 +1221,12 @@ void BOSS::add_sequence(std::string_view seq,
 
     if (get_state() != State::DYN)
         throw std::runtime_error("representation must be dynamic");
+
+    if (indexed_suffix_length_) {
+        // the index of suffix ranges is invalid after dynamic updates
+        indexed_suffix_length_ = 0;
+        indexed_suffix_ranges_ = decltype(indexed_suffix_ranges_)();
+    }
 
     // prepend k buffer characters, in case we need to start with dummy node
     std::vector<TAlphabet> sequence(seq.size() + k_);
@@ -2079,6 +2127,7 @@ void BOSS::call_paths(Call<std::vector<edge_index> &&, std::vector<TAlphabet> &&
                       size_t num_threads,
                       bool split_to_unitigs,
                       bool kmers_in_single_form,
+                      bool verbose,
                       const bitmap *subgraph_mask,
                       bool trim_sentinels) const {
     assert(!subgraph_mask || subgraph_mask->size() == W_->size());
@@ -2104,7 +2153,7 @@ void BOSS::call_paths(Call<std::vector<edge_index> &&, std::vector<TAlphabet> &&
 
     ProgressBar progress_bar(visited.size() - sdsl::util::cnt_one_bits(visited),
                              "Traverse BOSS",
-                             std::cerr, !common::get_verbose());
+                             std::cerr, !verbose);
 
     ThreadPool thread_pool(num_threads ? num_threads : 1, TASK_POOL_SIZE);
     bool async = true;
@@ -2691,6 +2740,7 @@ call_path(const BOSS &boss,
 void BOSS::call_sequences(Call<std::string&&, std::vector<edge_index>&&> callback,
                           size_t num_threads,
                           bool kmers_in_single_form,
+                          bool verbose,
                           const bitmap *subgraph_mask) const {
     call_paths([&](std::vector<edge_index>&& edges, std::vector<TAlphabet>&& path) {
         assert(path.size() >= k_ + 1);
@@ -2703,7 +2753,7 @@ void BOSS::call_sequences(Call<std::string&&, std::vector<edge_index>&&> callbac
 
         callback(std::move(sequence), std::move(edges));
 
-    }, num_threads, false, kmers_in_single_form, subgraph_mask, true);
+    }, num_threads, false, kmers_in_single_form, verbose, subgraph_mask, true);
 }
 
 // Reach all k-mers that merge into anchor |edge| by following their diff paths.
@@ -2782,6 +2832,7 @@ void BOSS::row_diff_traverse(size_t num_threads,
     traverse_dummy_edges(*this, NULL, NULL, num_threads,
         [&](edge_index edge, size_t depth) {
             assert(depth <= get_k());
+            unset_bit(terminal->data(), edge, async);
             set_bit(dummy.data(), edge, async);
             if (depth < get_k())
                 set_bit(visited.data(), edge, async);
@@ -3043,7 +3094,7 @@ void BOSS::call_unitigs(Call<std::string&&, std::vector<edge_index>&&> callback,
         // this is not a tip
         callback(std::move(sequence), std::move(edges));
 
-    }, num_threads, true, kmers_in_single_form, subgraph_mask, true);
+    }, num_threads, true, kmers_in_single_form, common::get_verbose(), subgraph_mask, true);
 }
 
 /**
@@ -3132,8 +3183,7 @@ void BOSS::index_suffix_ranges(size_t suffix_length, size_t num_threads) {
     if (indexed_suffix_length_ == 0u)
         return;
 
-    if (indexed_suffix_length_ * log2(alph_size - 1) >= 64)
-        throw std::runtime_error("ERROR: Trying to index too long suffixes");
+    check_num_suffix_ranges(indexed_suffix_length_);
 
     // first, take empty suffix and the entire range of nodes in the BOSS table
     // will store pairs: begin[0], end[0], begin[1], end[1], ...
@@ -3162,19 +3212,7 @@ void BOSS::index_suffix_ranges(size_t suffix_length, size_t num_threads) {
         suffix_ranges.swap(narrowed);
     }
 
-    suffix_ranges[0] = std::max(suffix_ranges[0], (uint64_t)1);
-    // align the upper bounds to enable the binary search on them
-    for (size_t i = 1; i < suffix_ranges.size(); ++i) {
-        suffix_ranges[i] = std::max(suffix_ranges[i], suffix_ranges[i - 1] - (i - 1)) + i;
-    }
-
-    assert(std::is_sorted(suffix_ranges.begin(), suffix_ranges.end()));
-
-    sdsl::sd_vector_builder builder(W_->size() + suffix_ranges.size(), suffix_ranges.size());
-    for (auto pos : suffix_ranges) {
-        builder.set(pos);
-    }
-    indexed_suffix_ranges_ = sdsl::sd_vector<>(builder);
+    indexed_suffix_ranges_ = build_suffix_ranges_sd(std::move(suffix_ranges), W_->size());
     indexed_suffix_ranges_rk1_ = decltype(indexed_suffix_ranges_rk1_)(&indexed_suffix_ranges_);
     indexed_suffix_ranges_slct1_ = decltype(indexed_suffix_ranges_slct1_)(&indexed_suffix_ranges_);
     indexed_suffix_ranges_slct0_ = decltype(indexed_suffix_ranges_slct0_)(&indexed_suffix_ranges_);

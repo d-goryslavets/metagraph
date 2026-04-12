@@ -7,18 +7,10 @@ from tempfile import TemporaryDirectory
 import glob
 import os
 import gzip
-from base import TestingBase, METAGRAPH, TEST_DATA_DIR
+from base import PROTEIN_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, graph_file_extension
 
 
 """Test graph construction"""
-
-PROTEIN_MODE = os.readlink(METAGRAPH).endswith("_Protein")
-
-graph_file_extension = {'succinct': '.dbg',
-                        'bitmap': '.bitmapdbg',
-                        'hash': '.orhashdbg',
-                        'hashfast': '.hashfastdbg',
-                        'hashstr': '.hashstrdbg'}
 
 build_params = {'succinct': ('succinct', '""'),
                 'succinct_disk': ('succinct', '/tmp/'),  # build with disk swap
@@ -26,6 +18,11 @@ build_params = {'succinct': ('succinct', '""'),
                 'hash': ('hash', '""'),
                 'hashfast': ('hashfast', '""'),
                 'hashstr': ('hashstr', '""')}
+
+# Also test with swap in shm but only if it exists (Linux but not MacOS)
+# (shm has a different filesystem, hence we're testing cross-device moves here)
+if os.path.isdir("/dev/shm"):
+    build_params['succinct_shm'] = ('succinct', '/dev/shm/')
 
 BUILDS = [name for name, _ in build_params.items()]
 
@@ -50,14 +47,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 20', out[0])
-        self.assertEqual('nodes (k): 591997', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 591997', out[3])
-        self.assertEqual('avg weight: 2.48587', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '20')
+        self.assertEqual(stats_graph['nodes (k)'], '591997')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '591997')
+        self.assertEqual(stats_graph['avg weight'], '2.48587')
 
     @parameterized.expand([repr for repr in BUILDS if not (repr == 'bitmap' and PROTEIN_MODE)])
     def test_simple_all_graphs_contigs(self, build):
@@ -88,14 +84,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 20', out[0])
-        self.assertEqual('nodes (k): 591997', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 591997', out[3])
-        self.assertEqual('avg weight: 2.48587', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '20')
+        self.assertEqual(stats_graph['nodes (k)'], '591997')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '591997')
+        self.assertEqual(stats_graph['avg weight'], '2.48587')
 
     # TODO: add 'hashstr' once the canonical mode is implemented for it
     @parameterized.expand([repr for repr in BUILDS if repr != 'hashstr'])
@@ -115,14 +110,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 20', out[0])
-        self.assertEqual('nodes (k): 1159851', out[1])
-        self.assertEqual('mode: canonical', out[2])
-        self.assertEqual('nnz weights: 1159851', out[3])
-        self.assertEqual('avg weight: 2.53761', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '20')
+        self.assertEqual(stats_graph['nodes (k)'], '1159851')
+        self.assertEqual(stats_graph['mode'], 'canonical')
+        self.assertEqual(stats_graph['nnz weights'], '1159851')
+        self.assertEqual(stats_graph['avg weight'], '2.53761')
 
     @parameterized.expand(BUILDS)
     def test_build_tiny_k(self, build):
@@ -138,14 +132,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 2', out[0])
-        self.assertEqual('nodes (k): 16', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 16', out[3])
-        self.assertEqual('avg weight: 255', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '2')
+        self.assertEqual(stats_graph['nodes (k)'], '16')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '16')
+        self.assertEqual(stats_graph['avg weight'], '255')
 
     # TODO: add 'hashstr' once the canonical mode is implemented for it
     @parameterized.expand([repr for repr in BUILDS if repr != 'hashstr'])
@@ -164,14 +157,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 2', out[0])
-        self.assertEqual('nodes (k): 16', out[1])
-        self.assertEqual('mode: canonical', out[2])
-        self.assertEqual('nnz weights: 16', out[3])
-        self.assertEqual('avg weight: 255', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '2')
+        self.assertEqual(stats_graph['nodes (k)'], '16')
+        self.assertEqual(stats_graph['mode'], 'canonical')
+        self.assertEqual(stats_graph['nnz weights'], '16')
+        self.assertEqual(stats_graph['avg weight'], '255')
 
     @parameterized.expand(BUILDS)
     def test_build_from_kmc(self, build):
@@ -189,14 +181,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 11', out[0])
-        self.assertEqual('nodes (k): 469983', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 469983', out[3])
-        self.assertEqual('avg weight: 3.15029', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '11')
+        self.assertEqual(stats_graph['nodes (k)'], '469983')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '469983')
+        self.assertEqual(stats_graph['avg weight'], '3.15029')
 
     @parameterized.expand(BUILDS)
     def test_build_from_kmc_both(self, build):
@@ -214,14 +205,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 11', out[0])
-        self.assertEqual('nodes (k): 802920', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 802920', out[3])
-        self.assertEqual('avg weight: 3.68754', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '11')
+        self.assertEqual(stats_graph['nodes (k)'], '802920')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '802920')
+        self.assertEqual(stats_graph['avg weight'], '3.68754')
 
     # TODO: add 'hashstr' once the canonical mode is implemented for it
     @parameterized.expand([repr for repr in BUILDS if repr != 'hashstr'])
@@ -241,14 +231,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 11', out[0])
-        self.assertEqual('nodes (k): 802920', out[1])
-        self.assertEqual('mode: canonical', out[2])
-        self.assertEqual('nnz weights: 802920', out[3])
-        self.assertEqual('avg weight: 3.68754', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '11')
+        self.assertEqual(stats_graph['nodes (k)'], '802920')
+        self.assertEqual(stats_graph['mode'], 'canonical')
+        self.assertEqual(stats_graph['nnz weights'], '802920')
+        self.assertEqual(stats_graph['avg weight'], '3.68754')
 
     # TODO: add 'hashstr' once the canonical mode is implemented for it
     @parameterized.expand([repr for repr in BUILDS if repr != 'hashstr'])
@@ -268,14 +257,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 11', out[0])
-        self.assertEqual('nodes (k): 802920', out[1])
-        self.assertEqual('mode: canonical', out[2])
-        self.assertEqual('nnz weights: 802920', out[3])
-        self.assertEqual('avg weight: 3.68754', out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '11')
+        self.assertEqual(stats_graph['nodes (k)'], '802920')
+        self.assertEqual(stats_graph['mode'], 'canonical')
+        self.assertEqual(stats_graph['nnz weights'], '802920')
+        self.assertEqual(stats_graph['avg weight'], '3.68754')
 
     @parameterized.expand(
         itertools.product(BUILDS,
@@ -306,14 +294,13 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: 4', out[0])
-        self.assertEqual('nodes (k): 256', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 256', out[3])
-        self.assertEqual('avg weight: {}'.format(avg_count_expected), out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '4')
+        self.assertEqual(stats_graph['nodes (k)'], '256')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '256')
+        self.assertEqual(stats_graph['avg weight'], str(avg_count_expected))
 
     @parameterized.expand(itertools.chain(
         itertools.product(BUILDS,
@@ -366,15 +353,32 @@ class TestBuildWeighted(TestingBase):
         res = subprocess.run([construct_command], shell=True)
         self.assertEqual(res.returncode, 0)
 
-        res = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
-        self.assertEqual(res.returncode, 0)
-        out = res.stdout.decode().split('\n')[2:]
-        self.assertEqual('k: {}'.format(k), out[0])
-        self.assertEqual('nodes (k): 2', out[1])
-        self.assertEqual('mode: basic', out[2])
-        self.assertEqual('nnz weights: 2', out[3])
-        self.assertEqual('avg weight: {}'.format(avg_count_expected), out[4])
+        stats_graph = self._get_stats(self.tempdir.name + '/graph' + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], str(k))
+        self.assertEqual(stats_graph['nodes (k)'], '2')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertEqual(stats_graph['nnz weights'], '2')
+        self.assertEqual(stats_graph['avg weight'], str(avg_count_expected))
 
+    @parameterized.expand([repr for repr in BUILDS if not (repr == 'bitmap' and PROTEIN_MODE)])
+    def test_header_abundance_counts(self, build):
+        """Test --count-kmers with k-mer abundances from FASTA headers (Logan format) for all graph types"""
+        representation, tmp_dir = build_params[build]
+        fasta_path = os.path.join(TEST_DATA_DIR, 'logan_30.fa')
+        outbase = os.path.join(self.tempdir.name, f'logan_graph_{representation}')
+        cmd = f'{METAGRAPH} build --graph {representation} --count-kmers -k 31 -o {outbase} {fasta_path}'
+        res = subprocess.run(cmd, shell=True)
+        self.assertEqual(res.returncode, 0)
+        weights_file = outbase + graph_file_extension[representation] + '.weights'
+        self.assertTrue(os.path.exists(weights_file))
+        stats_graph = self._get_stats(outbase + graph_file_extension[representation])
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual(stats_graph['k'], '31')
+        self.assertEqual(stats_graph['nnz weights'], '728')
+        self.assertEqual(stats_graph['avg weight'], '7.74863')
+        self.assertEqual(stats_graph['mode'], 'basic')
+        self.assertIn(stats_graph['nodes (k)'], ['728', '1079'])
 
 if __name__ == '__main__':
     unittest.main()

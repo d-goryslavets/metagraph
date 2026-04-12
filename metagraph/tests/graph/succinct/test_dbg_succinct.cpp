@@ -20,9 +20,9 @@ TEST(DBGSuccinct, get_degree_with_source_dummy) {
                                 + std::string(k, 'T'));
 
         // dummy source k-mer: '$$$$$'
-        EXPECT_EQ(std::string(k, '$'), graph->get_node_sequence(1));
-        EXPECT_EQ(1ull, graph->outdegree(1));
-        EXPECT_EQ(1ull, graph->indegree(1));
+        EXPECT_EQ(std::string(k, '$'), graph->get_node_sequence(graph->select_node(1)));
+        EXPECT_EQ(1ull, graph->outdegree(graph->select_node(1)));
+        EXPECT_EQ(1ull, graph->indegree(graph->select_node(1)));
 
         // 'AAAAA'
         auto node_A = graph->kmer_to_node(std::string(k, 'A'));
@@ -40,7 +40,7 @@ TEST(DBGSuccinct, get_degree_with_source_dummy) {
 
         graph->mask_dummy_kmers(1, false);
         // dummy source k-mer: '$$$$$'
-        EXPECT_NE(std::string(k, '$'), graph->get_node_sequence(1));
+        EXPECT_NE(std::string(k, '$'), graph->get_node_sequence(graph->select_node(1)));
 
         // 'AAAAA'
         node_A = graph->kmer_to_node(std::string(k, 'A'));
@@ -65,9 +65,9 @@ TEST(DBGSuccinct, get_degree_with_source_and_sink_dummy) {
                                 + std::string(k - 1, 'T'));
 
         // dummy source k-mer: '$$$$$'
-        EXPECT_EQ(std::string(k, '$'), graph->get_node_sequence(1));
-        EXPECT_EQ(1ull, graph->outdegree(1));
-        EXPECT_EQ(1ull, graph->indegree(1));
+        EXPECT_EQ(std::string(k, '$'), graph->get_node_sequence(graph->select_node(1)));
+        EXPECT_EQ(1ull, graph->outdegree(graph->select_node(1)));
+        EXPECT_EQ(1ull, graph->indegree(graph->select_node(1)));
 
         // 'AAAAA'
         auto node_A = graph->kmer_to_node(std::string(k, 'A'));
@@ -85,7 +85,7 @@ TEST(DBGSuccinct, get_degree_with_source_and_sink_dummy) {
 
         graph->mask_dummy_kmers(1, false);
         // dummy source k-mer: '$$$$$'
-        EXPECT_NE(std::string(k, '$'), graph->get_node_sequence(1));
+        EXPECT_NE(std::string(k, '$'), graph->get_node_sequence(graph->select_node(1)));
 
         // 'AAAAA'
         node_A = graph->kmer_to_node(std::string(k, 'A'));
@@ -109,7 +109,7 @@ TEST(DBGSuccinct, is_single_outgoing_simple) {
 
     uint64_t single_outgoing_counter = 0;
     for (DBGSuccinct::node_index i = 1; i <= graph->num_nodes(); ++i) {
-        if (graph->outdegree(i) == 1)
+        if (graph->outdegree(graph->select_node(i)) == 1)
             single_outgoing_counter++;
     }
 
@@ -126,7 +126,7 @@ TEST(DBGSuccinct, is_single_outgoing_for_multiple_valid_edges) {
 
     uint64_t single_outgoing_counter = 0;
     for (DBGSuccinct::node_index i = 1; i <= graph->num_nodes(); ++i) {
-        if (graph->outdegree(i) == 1)
+        if (graph->outdegree(graph->select_node(i)) == 1)
             single_outgoing_counter++;
     }
 
@@ -524,6 +524,35 @@ TEST(DBGSuccinct, CallNodesWithSuffixMultipleInOut) {
 
     EXPECT_EQ(ref_nodes, nodes) << *graph;
     EXPECT_EQ(ref_node_str, node_str) << *graph;
+}
+
+TEST(DBGSuccinct, CallNodesSmallGraphManyThreads) {
+    // Regression: call_nodes with max_index() < num_threads caused
+    // block_size = 0, triggering SIGFPE in the OpenMP trip count computation.
+    for (size_t k = 2; k < 5; ++k) {
+        auto graph = std::make_unique<DBGSuccinct>(k);
+        graph->add_sequence(std::string(k, 'A'));
+        graph->mask_dummy_kmers(1, false);
+
+        ASSERT_GT(graph->max_index(), 0u);
+
+        size_t num_nodes = 0;
+        graph->call_nodes([&](auto) { num_nodes++; },
+                          []() { return false; },
+                          graph->max_index() + 10);
+        EXPECT_EQ(num_nodes, graph->num_nodes());
+    }
+}
+
+TEST(DBGSuccinct, CallNodesEmptyGraphManyThreads) {
+    auto graph = std::make_unique<DBGSuccinct>(3);
+    graph->mask_dummy_kmers(1, false);
+
+    size_t num_nodes = 0;
+    graph->call_nodes([&](auto) { num_nodes++; },
+                      []() { return false; },
+                      8);
+    EXPECT_EQ(0u, num_nodes);
 }
 
 } // namespace

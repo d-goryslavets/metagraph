@@ -6,13 +6,11 @@ import os
 import gzip
 import itertools
 from helpers import get_test_class_name
-from base import TestingBase, graph_file_extension, METAGRAPH, TEST_DATA_DIR, NUM_THREADS
+from base import PROTEIN_MODE, TestingBase, graph_file_extension, METAGRAPH, TEST_DATA_DIR, NUM_THREADS
 from test_query import anno_file_extension, GRAPH_TYPES, ANNO_TYPES, product
 
 
 """Test graph assemble"""
-
-PROTEIN_MODE = os.readlink(METAGRAPH).endswith("_Protein")
 
 gfa_tests = {
     'compacted': {
@@ -222,6 +220,8 @@ class TestDiffAssembly(TestingBase):
         if cls.graph_repr == 'succinct_mask':
             cls.graph_repr = 'succinct'
             cls.mask_dummy = True
+
+        cls.graph_repr = cls.graph_repr.removesuffix('_swap')
 
         k = 31
         construct_command = '{exe} build {mask_dummy} -p {num_threads} \

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -16,8 +17,62 @@ using namespace testing;
 using ::testing::_;
 using mtg::annot::matrix::RowDiff;
 using mtg::annot::matrix::ColumnMajor;
+using mtg::annot::matrix::BinaryMatrix;
+
+static auto graph_to_anno_index(graph::DeBruijnGraph::node_index node) {
+    return graph::AnnotatedDBG::graph_to_anno_index(node);
+}
 
 typedef RowDiff<ColumnMajor>::anchor_bv_type anchor_bv_type;
+
+class UnsortedRowMatrix : public BinaryMatrix {
+  public:
+    UnsortedRowMatrix() = default;
+
+    UnsortedRowMatrix(std::vector<SetBitPositions> rows, uint64_t num_columns)
+          : rows_(std::move(rows)), num_columns_(num_columns) {}
+
+    uint64_t num_columns() const override { return num_columns_; }
+    uint64_t num_rows() const override { return rows_.size(); }
+
+    std::vector<SetBitPositions> get_rows(const std::vector<Row> &row_ids) const override {
+        std::vector<SetBitPositions> result;
+        result.reserve(row_ids.size());
+        for (Row row_id : row_ids) {
+            result.push_back(rows_.at(row_id));
+        }
+        return result;
+    }
+
+    std::vector<SetBitPositions> get_rows(const std::vector<Row> &row_ids,
+                                          size_t) const override {
+        return get_rows(row_ids);
+    }
+
+    std::vector<Row> get_column(Column column) const override {
+        std::vector<Row> result;
+        for (size_t row = 0; row < rows_.size(); ++row) {
+            if (std::find(rows_[row].begin(), rows_[row].end(), column) != rows_[row].end())
+                result.push_back(row);
+        }
+        return result;
+    }
+
+    bool load(std::istream&) override { return false; }
+    void serialize(std::ostream&) const override {}
+
+    uint64_t num_relations() const override {
+        size_t num_relations = 0;
+        for (const auto &row : rows_) {
+            num_relations += row.size();
+        }
+        return num_relations;
+    }
+
+  private:
+    std::vector<SetBitPositions> rows_;
+    uint64_t num_columns_ = 0;
+};
 
 TEST(RowDiff, Empty) {
     RowDiff<ColumnMajor> rowdiff;
@@ -95,29 +150,64 @@ TEST(RowDiff, GetRows) {
     annot.load_anchor(fterm_temp.name());
 
     auto rows = annot.get_rows({ 3, 3, 3, 3, 5, 5, 6, 7, 8, 9, 10, 11 });
-    EXPECT_EQ("CTAG", graph.get_node_sequence(4));
+    EXPECT_EQ("CTAG", graph.get_node_sequence(graph.select_node(4)));
     ASSERT_THAT(rows[3], ElementsAre(0, 1));
 
-    EXPECT_EQ("AGCT", graph.get_node_sequence(6));
+    EXPECT_EQ("AGCT", graph.get_node_sequence(graph.select_node(6)));
     ASSERT_THAT(rows[5], ElementsAre(1));
 
-    EXPECT_EQ("CTCT", graph.get_node_sequence(7));
+    EXPECT_EQ("CTCT", graph.get_node_sequence(graph.select_node(7)));
     ASSERT_THAT(rows[6], ElementsAre(0));
 
-    EXPECT_EQ("TAGC", graph.get_node_sequence(8));
+    EXPECT_EQ("TAGC", graph.get_node_sequence(graph.select_node(8)));
     ASSERT_THAT(rows[7], ElementsAre(1));
 
-    EXPECT_EQ("ACTA", graph.get_node_sequence(9));
+    EXPECT_EQ("ACTA", graph.get_node_sequence(graph.select_node(9)));
     ASSERT_THAT(rows[8], ElementsAre(1));
 
-    EXPECT_EQ("ACTC", graph.get_node_sequence(10));
+    EXPECT_EQ("ACTC", graph.get_node_sequence(graph.select_node(10)));
     ASSERT_THAT(rows[9], ElementsAre(0));
 
-    EXPECT_EQ("GCTA", graph.get_node_sequence(11));
+    EXPECT_EQ("GCTA", graph.get_node_sequence(graph.select_node(11)));
     ASSERT_THAT(rows[10], ElementsAre(1));
 
-    EXPECT_EQ("TCTA", graph.get_node_sequence(12));
+    EXPECT_EQ("TCTA", graph.get_node_sequence(graph.select_node(12)));
     ASSERT_THAT(rows[11], ElementsAre(0));
+}
+
+TEST(RowDiff, GetRowsFromUnsortedBackingRows) {
+    graph::DBGSuccinct graph(3);
+    graph.add_sequence("AAAT");
+    graph.mask_dummy_kmers(1, false);
+
+    auto first_node = graph.kmer_to_node("AAA");
+    auto second_node = graph.kmer_to_node("AAT");
+    ASSERT_NE(graph::DeBruijnGraph::npos, first_node);
+    ASSERT_NE(graph::DeBruijnGraph::npos, second_node);
+
+    auto first = graph_to_anno_index(first_node);
+    auto second = graph_to_anno_index(second_node);
+
+    sdsl::bit_vector anchors(graph.max_index(), false);
+    anchors[second] = true;
+    anchor_bv_type anchor(anchors);
+    utils::TempFile anchor_temp;
+    std::ofstream anchor_out(anchor_temp.name(), ios::binary);
+    anchor.serialize(anchor_out);
+    anchor_out.flush();
+
+    std::vector<BinaryMatrix::SetBitPositions> diff_rows(graph.max_index());
+    diff_rows[first] = { 3, 1 };
+    diff_rows[second] = { 2, 0 };
+
+    RowDiff<UnsortedRowMatrix> annot(&graph, UnsortedRowMatrix(std::move(diff_rows), 4));
+    annot.load_anchor(anchor_temp.name());
+
+    auto rows = annot.get_rows({ first, second, first });
+
+    ASSERT_THAT(rows[0], ElementsAre(0, 1, 2, 3));
+    ASSERT_THAT(rows[1], ElementsAre(0, 2));
+    ASSERT_THAT(rows[2], ElementsAre(0, 1, 2, 3));
 }
 
 /**
@@ -149,28 +239,28 @@ TEST(RowDiff, GetAnnotation) {
     RowDiff<ColumnMajor> annot(&graph, std::move(mat));
     annot.load_anchor(fterm_temp.name());
 
-    EXPECT_EQ("CTAG", graph.get_node_sequence(4));
+    EXPECT_EQ("CTAG", graph.get_node_sequence(graph.select_node(4)));
     ASSERT_THAT(annot.get_rows({3})[0], ElementsAre(0, 1));
 
-    EXPECT_EQ("AGCT", graph.get_node_sequence(6));
+    EXPECT_EQ("AGCT", graph.get_node_sequence(graph.select_node(6)));
     ASSERT_THAT(annot.get_rows({5})[0], ElementsAre(1));
 
-    EXPECT_EQ("CTCT", graph.get_node_sequence(7));
+    EXPECT_EQ("CTCT", graph.get_node_sequence(graph.select_node(7)));
     ASSERT_THAT(annot.get_rows({6})[0], ElementsAre(0));
 
-    EXPECT_EQ("TAGC", graph.get_node_sequence(8));
+    EXPECT_EQ("TAGC", graph.get_node_sequence(graph.select_node(8)));
     ASSERT_THAT(annot.get_rows({7})[0], ElementsAre(1));
 
-    EXPECT_EQ("ACTA", graph.get_node_sequence(9));
+    EXPECT_EQ("ACTA", graph.get_node_sequence(graph.select_node(9)));
     ASSERT_THAT(annot.get_rows({8})[0], ElementsAre(1));
 
-    EXPECT_EQ("ACTC", graph.get_node_sequence(10));
+    EXPECT_EQ("ACTC", graph.get_node_sequence(graph.select_node(10)));
     ASSERT_THAT(annot.get_rows({9})[0], ElementsAre(0));
 
-    EXPECT_EQ("GCTA", graph.get_node_sequence(11));
+    EXPECT_EQ("GCTA", graph.get_node_sequence(graph.select_node(11)));
     ASSERT_THAT(annot.get_rows({10})[0], ElementsAre(1));
 
-    EXPECT_EQ("TCTA", graph.get_node_sequence(12));
+    EXPECT_EQ("TCTA", graph.get_node_sequence(graph.select_node(12)));
     ASSERT_THAT(annot.get_rows({11})[0], ElementsAre(0));
 }
 
@@ -187,47 +277,66 @@ TEST(RowDiff, GetAnnotationMasked) {
     graph.mask_dummy_kmers(1, false);
 
     // build annotation
-    sdsl::bit_vector bterminal = { 0, 0, 0, 0, 1, 0, 1, 0 };
+    sdsl::bit_vector bterminal_masked = { 0, 0, 0, 0, 1, 0, 1, 0 };
+    sdsl::bit_vector bterminal(graph.max_index());
+    sdsl::bit_vector cols_masked[2] = {
+        { 1, 0, 0, 0, 0, 0, 0, 0 },
+        { 0, 0, 0, 0, 1, 0, 1, 1 }
+    };
+    sdsl::bit_vector cols_concrete[2];
+    cols_concrete[0].resize(bterminal.size());
+    cols_concrete[1].resize(bterminal.size());
+    graph.call_nodes([&](auto i) {
+        auto rank = graph_to_anno_index(graph.rank_node(i));
+        bterminal[graph_to_anno_index(i)] = bterminal_masked[rank];
+        cols_concrete[0][graph_to_anno_index(i)] = cols_masked[0][rank];
+        cols_concrete[1][graph_to_anno_index(i)] = cols_masked[1][rank];
+    });
     anchor_bv_type terminal(bterminal);
     utils::TempFile fterm_temp;
     std::ofstream fterm(fterm_temp.name(), ios::binary);
     terminal.serialize(fterm);
     fterm.flush();
-
+    
     std::vector<std::unique_ptr<bit_vector>> cols(2);
-    cols[0] = std::make_unique<bit_vector_sd>(
-            std::initializer_list<bool>({ 1, 0, 0, 0, 0, 0, 0, 0 }));
-    cols[1] = std::make_unique<bit_vector_sd>(
-            std::initializer_list<bool>({ 0, 0, 0, 0, 1, 0, 1, 1 }));
+    cols[0] = std::make_unique<bit_vector_sd>(std::move(cols_concrete[0]));
+    cols[1] = std::make_unique<bit_vector_sd>(std::move(cols_concrete[1]));
 
     ColumnMajor mat(std::move(cols));
 
     RowDiff<ColumnMajor> annot(&graph, std::move(mat));
     annot.load_anchor(fterm_temp.name());
+    EXPECT_EQ("CTAG", graph.get_node_sequence(graph.select_node(1)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(1))})[0],
+                ElementsAre(0, 1));
 
-    EXPECT_EQ("CTAG", graph.get_node_sequence(1));
-    ASSERT_THAT(annot.get_rows({0})[0], ElementsAre(0, 1));
+    EXPECT_EQ("AGCT", graph.get_node_sequence(graph.select_node(2)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(2))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("AGCT", graph.get_node_sequence(2));
-    ASSERT_THAT(annot.get_rows({1})[0], ElementsAre(1));
+    EXPECT_EQ("CTCT", graph.get_node_sequence(graph.select_node(3)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(3))})[0],
+                ElementsAre(0));
 
-    EXPECT_EQ("CTCT", graph.get_node_sequence(3));
-    ASSERT_THAT(annot.get_rows({2})[0], ElementsAre(0));
+    EXPECT_EQ("TAGC", graph.get_node_sequence(graph.select_node(4)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(4))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("TAGC", graph.get_node_sequence(4));
-    ASSERT_THAT(annot.get_rows({3})[0], ElementsAre(1));
+    EXPECT_EQ("ACTA", graph.get_node_sequence(graph.select_node(5)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(5))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("ACTA", graph.get_node_sequence(5));
-    ASSERT_THAT(annot.get_rows({4})[0], ElementsAre(1));
+    EXPECT_EQ("ACTC", graph.get_node_sequence(graph.select_node(6)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(6))})[0],
+                ElementsAre(0));
 
-    EXPECT_EQ("ACTC", graph.get_node_sequence(6));
-    ASSERT_THAT(annot.get_rows({5})[0], ElementsAre(0));
+    EXPECT_EQ("GCTA", graph.get_node_sequence(graph.select_node(7)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(7))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("GCTA", graph.get_node_sequence(7));
-    ASSERT_THAT(annot.get_rows({6})[0], ElementsAre(1));
-
-    EXPECT_EQ("TCTA", graph.get_node_sequence(8));
-    ASSERT_THAT(annot.get_rows({7})[0], ElementsAre(0));
+    EXPECT_EQ("TCTA", graph.get_node_sequence(graph.select_node(8)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(8))})[0],
+                ElementsAre(0));
 }
 
 /**
@@ -260,34 +369,34 @@ TEST(RowDiff, GetAnnotationBifurcation) {
     RowDiff<ColumnMajor> annot(&graph, std::move(mat));
     annot.load_anchor(fterm_temp.name());
 
-    EXPECT_EQ("CTAG", graph.get_node_sequence(4));
+    EXPECT_EQ("CTAG", graph.get_node_sequence(graph.select_node(4)));
     ASSERT_THAT(annot.get_rows({3})[0], ElementsAre(0, 1));
 
-    EXPECT_EQ("CTAT", graph.get_node_sequence(5));
+    EXPECT_EQ("CTAT", graph.get_node_sequence(graph.select_node(5)));
     ASSERT_THAT(annot.get_rows({4})[0], ElementsAre(1));
 
-    EXPECT_EQ("TACT", graph.get_node_sequence(6));
+    EXPECT_EQ("TACT", graph.get_node_sequence(graph.select_node(6)));
     ASSERT_THAT(annot.get_rows({5})[0], ElementsAre(0));
 
-    EXPECT_EQ("AGCT", graph.get_node_sequence(7));
+    EXPECT_EQ("AGCT", graph.get_node_sequence(graph.select_node(7)));
     ASSERT_THAT(annot.get_rows({6})[0], ElementsAre(0, 1));
 
-    EXPECT_EQ("CTCT", graph.get_node_sequence(8));
+    EXPECT_EQ("CTCT", graph.get_node_sequence(graph.select_node(8)));
     ASSERT_THAT(annot.get_rows({7})[0], ElementsAre(1));
 
-    EXPECT_EQ("TAGC", graph.get_node_sequence(9));
+    EXPECT_EQ("TAGC", graph.get_node_sequence(graph.select_node(9)));
     ASSERT_THAT(annot.get_rows({8})[0], ElementsAre(0, 1));
 
-    EXPECT_EQ("ACTA", graph.get_node_sequence(12));
+    EXPECT_EQ("ACTA", graph.get_node_sequence(graph.select_node(12)));
     ASSERT_THAT(annot.get_rows({11})[0], ElementsAre(0));
 
-    EXPECT_EQ("ACTC", graph.get_node_sequence(13));
+    EXPECT_EQ("ACTC", graph.get_node_sequence(graph.select_node(13)));
     ASSERT_THAT(annot.get_rows({12})[0], ElementsAre(1));
 
-    EXPECT_EQ("GCTA", graph.get_node_sequence(14));
+    EXPECT_EQ("GCTA", graph.get_node_sequence(graph.select_node(14)));
     ASSERT_THAT(annot.get_rows({13})[0], ElementsAre(0, 1));
 
-    EXPECT_EQ("TCTA", graph.get_node_sequence(15));
+    EXPECT_EQ("TCTA", graph.get_node_sequence(graph.select_node(15)));
     ASSERT_THAT(annot.get_rows({14})[0], ElementsAre(1));
 }
 
@@ -299,57 +408,77 @@ TEST(RowDiff, GetAnnotationBifurcationMasked) {
     graph.mask_dummy_kmers(1, false);
 
     // build annotation
-    sdsl::bit_vector bterminal = { 0, 1, 0, 0, 0, 0, 1, 0, 1, 0 };
+    sdsl::bit_vector bterminal_masked = { 0, 1, 0, 0, 0, 0, 1, 0, 1, 0 };
+    sdsl::bit_vector bterminal(graph.max_index());
+    sdsl::bit_vector cols_masked[2] = {
+        {0, 0, 1, 0, 0, 0, 1, 0, 1, 0 },
+        {0, 1, 1, 0, 0, 0, 0, 0, 1, 0 }
+    };
+    sdsl::bit_vector cols_concrete[2];
+    cols_concrete[0].resize(bterminal.size());
+    cols_concrete[1].resize(bterminal.size());
+    graph.call_nodes([&](auto i) {
+        auto rank = graph_to_anno_index(graph.rank_node(i));
+        bterminal[graph_to_anno_index(i)] = bterminal_masked[rank];
+        cols_concrete[0][graph_to_anno_index(i)] = cols_masked[0][rank];
+        cols_concrete[1][graph_to_anno_index(i)] = cols_masked[1][rank];
+    });
     anchor_bv_type terminal(bterminal);
     utils::TempFile fterm_temp;
     std::ofstream fterm(fterm_temp.name(), ios::binary);
     terminal.serialize(fterm);
     fterm.flush();
+    
+    std::vector<std::unique_ptr<bit_vector>> cols(2);
+    cols[0] = std::make_unique<bit_vector_sd>(std::move(cols_concrete[0]));
+    cols[1] = std::make_unique<bit_vector_sd>(std::move(cols_concrete[1]));
 
     Vector<uint64_t> diffs = { 1, 0, 1, 0, 0, 1 };
     sdsl::bit_vector boundary = { 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1 };
-
-
-    std::vector<std::unique_ptr<bit_vector>> cols(2);
-    cols[0] = std::make_unique<bit_vector_sd>(
-            std::initializer_list<bool>({0, 0, 1, 0, 0, 0, 1, 0, 1, 0 }));
-    cols[1] = std::make_unique<bit_vector_sd>(
-            std::initializer_list<bool>({0, 1, 1, 0, 0, 0, 0, 0, 1, 0 }));
 
     ColumnMajor mat(std::move(cols));
 
     RowDiff<ColumnMajor> annot(&graph, std::move(mat));
     annot.load_anchor(fterm_temp.name());
 
-    EXPECT_EQ("CTAG", graph.get_node_sequence(1));
-    ASSERT_THAT(annot.get_rows({0})[0], ElementsAre(0, 1));
+    EXPECT_EQ("CTAG", graph.get_node_sequence(graph.select_node(1)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(1))})[0],
+                ElementsAre(0, 1));
+    EXPECT_EQ("CTAT", graph.get_node_sequence(graph.select_node(2)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(2))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("CTAT", graph.get_node_sequence(2));
-    ASSERT_THAT(annot.get_rows({1})[0], ElementsAre(1));
+    EXPECT_EQ("TACT", graph.get_node_sequence(graph.select_node(3)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(3))})[0],
+                ElementsAre(0));
 
-    EXPECT_EQ("TACT", graph.get_node_sequence(3));
-    ASSERT_THAT(annot.get_rows({2})[0], ElementsAre(0));
+    EXPECT_EQ("AGCT", graph.get_node_sequence(graph.select_node(4)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(4))})[0],
+                ElementsAre(0, 1));
 
-    EXPECT_EQ("AGCT", graph.get_node_sequence(4));
-    ASSERT_THAT(annot.get_rows({3})[0], ElementsAre(0, 1));
+    EXPECT_EQ("CTCT", graph.get_node_sequence(graph.select_node(5)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(5))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("CTCT", graph.get_node_sequence(5));
-    ASSERT_THAT(annot.get_rows({4})[0], ElementsAre(1));
+    EXPECT_EQ("TAGC", graph.get_node_sequence(graph.select_node(6)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(6))})[0],
+                ElementsAre(0, 1));
 
-    EXPECT_EQ("TAGC", graph.get_node_sequence(6));
-    ASSERT_THAT(annot.get_rows({5})[0], ElementsAre(0, 1));
+    EXPECT_EQ("ACTA", graph.get_node_sequence(graph.select_node(7)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(7))})[0],
+                ElementsAre(0));
 
-    EXPECT_EQ("ACTA", graph.get_node_sequence(7));
-    ASSERT_THAT(annot.get_rows({6})[0], ElementsAre(0));
+    EXPECT_EQ("ACTC", graph.get_node_sequence(graph.select_node(8)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(8))})[0],
+                ElementsAre(1));
 
-    EXPECT_EQ("ACTC", graph.get_node_sequence(8));
-    ASSERT_THAT(annot.get_rows({7})[0], ElementsAre(1));
+    EXPECT_EQ("GCTA", graph.get_node_sequence(graph.select_node(9)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(9))})[0],
+                ElementsAre(0, 1));
 
-    EXPECT_EQ("GCTA", graph.get_node_sequence(9));
-    ASSERT_THAT(annot.get_rows({8})[0], ElementsAre(0, 1));
-
-    EXPECT_EQ("TCTA", graph.get_node_sequence(10));
-    ASSERT_THAT(annot.get_rows({9})[0], ElementsAre(1));
+    EXPECT_EQ("TCTA", graph.get_node_sequence(graph.select_node(10)));
+    ASSERT_THAT(annot.get_rows({graph_to_anno_index(graph.select_node(10))})[0],
+                ElementsAre(1));
 }
 
 } // namespace
