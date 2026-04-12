@@ -210,7 +210,8 @@ TupleRowDiff<BaseMatrix>::get_row_tuples_labeled(const std::vector<Row> &row_ids
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
 
     // get row-diff paths
-    auto [rd_ids, rd_paths_trunc, times_traversed] = get_rd_ids(row_ids);
+    // TODO: read extraction use num_threads parameter
+    auto [rd_ids, rd_paths_trunc, times_traversed, groups] = get_rd_ids(row_ids);
 
     std::vector<RowTuples> rd_rows = diffs_.get_row_tuples_labeled(rd_ids, labels_of_interest);
     for (auto &row : rd_rows) {

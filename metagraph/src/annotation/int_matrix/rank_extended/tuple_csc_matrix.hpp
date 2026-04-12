@@ -46,7 +46,7 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
                                           size_t num_threads = 1) const;
 
     std::vector<RowTuples>
-    get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
+    get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest, size_t num_threads = 1) const;
 
     uint64_t num_columns() const { return binary_matrix_.num_columns(); }
     uint64_t num_rows() const { return binary_matrix_.num_rows(); }
@@ -133,8 +133,8 @@ TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(const std::vector<Row
 
 template <class BaseMatrix, class Values, class Delims>
 inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const {
-    const auto &column_ranks = binary_matrix_.get_column_ranks(rows);
+TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest, size_t num_threads) const {
+    const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
     std::vector<RowTuples> row_tuples(rows.size());
     // TODO: reshape?
     for (size_t i = 0; i < rows.size(); ++i) {

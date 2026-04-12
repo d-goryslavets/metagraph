@@ -62,10 +62,6 @@ class IRowDiff {
                std::vector<std::vector<size_t>>>
     get_rd_ids(const std::vector<BinaryMatrix::Row> &row_ids, size_t num_threads = 1) const;
 
-    std::pair<std::vector<BinaryMatrix::Row>, std::vector<size_t>>
-    get_rd_ids(BinaryMatrix::Row row, std::vector<BinaryMatrix::Row> &rd_ids,
-    VectorMap<BinaryMatrix::Row, size_t> &node_to_rd, const graph::boss::BOSS &boss, const bit_vector &rd_succ) const;
-
     template <class F, class G, class H, class Callback>
     void call_rows(const std::vector<BinaryMatrix::Row> &row_ids, F call_rd_rows, G add_diff,
                    H decode_diffs, Callback call_row, size_t num_threads) const;
