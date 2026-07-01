@@ -729,29 +729,22 @@ void TupleRowDiff<BaseMatrix>
     Determine if the graph needs to be traversed more by exploring 
     coordinate increase at boundary nodes' 
     */
-
-    std::unordered_map<Row, std::vector<Row>> processed_boundaries;
     for (auto & [col, coords]: boundaries) {
         if (!active_samples.count(col))
             continue;
         bool traverse_more = false;
         for (uint64_t c : coords) {
             auto boundary_node = graph::AnnotatedSequenceGraph::anno_to_graph_index(paths.at(col).at(c));
-            if (processed_boundaries.count(boundary_node)) {
-                for (auto & unvisited_boundary_candidate: processed_boundaries[boundary_node])
-                    queue.push_front(unvisited_boundary_candidate);
-                continue;
-            }
-
-            std::vector<Row> unvisited_boundary_candidates;
 
             auto expand = [&](auto next, char c) {
                 if (c != graph::boss::BOSS::kSentinel) {
                     Row next_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
+
+                    // if there is at least one unvisited node at the branching point
+                    // we will traverse the graph more
                     if (!visited.count(next_anno)) {
                         queue.push_front(next_anno);
-                        unvisited_boundary_candidates.push_back(next_anno);
-                        traverse_more = true; // the read is not fully traversed yet
+                        traverse_more = true; // the read possibly is not fully traversed yet
                     }
                 }
             };
@@ -761,10 +754,11 @@ void TupleRowDiff<BaseMatrix>
             } else {
                 graph_->call_incoming_kmers(boundary_node, expand);
             }
-
-            processed_boundaries.try_emplace(boundary_node, unvisited_boundary_candidates);
         }
-
+        
+        // if all nodes at the branching point of the read end (start) were visited 
+        // and verified to be not read continuations
+        // we don't need to decompress the annotations for the current sample
         if (!traverse_more) {
             mtg::common::logger->trace("Finished processing sample {}", col);
             active_samples.erase(col);
