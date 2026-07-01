@@ -45,8 +45,9 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
     std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows,
                                           size_t num_threads = 1) const;
 
-    std::vector<RowTuples>
-    get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest, size_t num_threads = 1) const;
+    std::vector<RowTuples> get_row_tuples_labelled(const std::vector<Row> &rows, 
+                                                  const std::unordered_set<Column> &labels_of_interest,
+                                                  size_t num_threads = 1) const;
 
     uint64_t num_columns() const { return binary_matrix_.num_columns(); }
     uint64_t num_rows() const { return binary_matrix_.num_rows(); }
@@ -133,16 +134,19 @@ TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(const std::vector<Row
 
 template <class BaseMatrix, class Values, class Delims>
 inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest, size_t num_threads) const {
+TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labelled(const std::vector<Row> &rows, 
+                                                                   const std::unordered_set<Column> &labels_of_interest, 
+                                                                   size_t num_threads) const {
     const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
     std::vector<RowTuples> row_tuples(rows.size());
     // TODO: reshape?
+    #pragma omp parallel for num_threads(num_threads)
     for (size_t i = 0; i < rows.size(); ++i) {
         row_tuples[i].reserve(column_ranks[i].size());
         for (auto [j, r] : column_ranks[i]) {
             assert(r >= 1 && "matches can't have zero-rank");
+            // skip irrelevant columns
             if (!labels_of_interest.count(j)) {
-                // row_tuples[i].emplace_back(j, Tuple()); // DEBUG
                 continue;
             }
             size_t begin = delimiters_[j].select1(r) + 1 - r;

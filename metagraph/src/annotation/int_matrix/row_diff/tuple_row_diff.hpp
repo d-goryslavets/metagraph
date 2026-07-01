@@ -50,7 +50,6 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     std::vector<Row> get_column(Column j) const override;
     std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows) const override;
     RowTuples get_row_tuples(Row i) const;
-    std::vector<RowTuples> get_row_tuples_labeled(const std::vector<Row> &rows, std::unordered_set<Column> labels_of_interest) const;
 
     /** Returns all labeled traces that pass through a given row.
      * 
@@ -79,7 +78,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     // pre-traverse graph to find samples with reads containing full query sequence
     std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const;
 
-    std::vector<std::unordered_set<uint64_t>> get_labels_of_rows(std::vector<Row> i) const;
+    std::vector<std::unordered_set<uint64_t>> get_labels_of_rows(const std::vector<Row> &i, size_t num_threads = 1) const;
     
     // no deduplication: see class comment on RowDiff::get_rows_dict (speed vs limited size win)
     std::vector<SetBitPositions>
@@ -88,6 +87,12 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
                                           size_t num_threads = 1) const override;
     std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows,
                                           size_t num_threads = 1) const override;
+
+    // used in read extraction query to limit decompression to samples of interest only
+    std::vector<RowTuples> get_row_tuples_labelled(const std::vector<Row> &rows, 
+                                                  const std::unordered_set<Column> &labels_of_interest, 
+                                                  size_t num_threads = 1) const;
+
 
     uint64_t num_columns() const override { return diffs_.num_columns(); }
     uint64_t num_relations() const override { return diffs_.num_relations(); }
@@ -105,7 +110,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
   private:
     static void decode_diffs(RowTuples *diffs);
     static void add_diff(const RowTuples &diff, RowTuples *row);
-    static void add_diff_labeled(const RowTuples &diff, RowTuples *row, std::unordered_set<Column> labels_of_interest);
+    static void add_diff_labelled(const RowTuples &diff, RowTuples *row, const std::unordered_set<Column> &labels_of_interest);
 
     using CoordMap = std::map<uint64_t, Row>;
 
@@ -253,47 +258,20 @@ TupleRowDiff<BaseMatrix>::get_row_tuples(const std::vector<Row> &row_ids, size_t
 
 template <class BaseMatrix>
 std::vector<MultiIntMatrix::RowTuples>
-TupleRowDiff<BaseMatrix>::get_row_tuples_labeled(const std::vector<Row> &row_ids, std::unordered_set<Column> labels_of_interest) const {
-    // assert(graph_ && "graph must be loaded");
-    // assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
-    // assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
-
-    // get row-diff paths
-    // TODO: read extraction use num_threads parameter
-    auto [rd_ids, rd_paths_trunc, times_traversed, groups] = get_rd_ids(row_ids);
-
-    std::vector<RowTuples> rd_rows = diffs_.get_row_tuples_labeled(rd_ids, labels_of_interest);
-    for (auto &row : rd_rows) {
-        decode_diffs(&row);
-    }
-
-    rd_ids = std::vector<Row>();
-
-    // reconstruct annotation rows from row-diff
+TupleRowDiff<BaseMatrix>::get_row_tuples_labelled(const std::vector<Row> &row_ids, const std::unordered_set<Column> &labels_of_interest, 
+size_t num_threads) const {
     std::vector<RowTuples> rows(row_ids.size());
-
-    for (size_t i = 0; i < row_ids.size(); ++i) {
-        RowTuples &result = rows[i];
-
-        auto it = rd_paths_trunc[i].rbegin();
-        std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
-        result = rd_rows[*it];
-        // propagate back and reconstruct full annotations for predecessors
-        for (++it ; it != rd_paths_trunc[i].rend(); ++it) {
-            std::sort(rd_rows[*it].begin(), rd_rows[*it].end());
-            add_diff_labeled(rd_rows[*it], &result, labels_of_interest);
-            // replace diff row with full reconstructed annotation
-            if (--times_traversed[*it]) {
-                rd_rows[*it] = result;
-            } else {
-                // free memory
-                rd_rows[*it] = {};
-            }
-        }
-        assert(std::all_of(result.begin(), result.end(),
-                           [](auto &p) { return p.second.size(); }));
-    }
-
+    call_rows(row_ids,
+        [this, &labels_of_interest](const std::vector<Row> &rd_ids, size_t num_threads) {
+            return diffs_.get_row_tuples_labelled(rd_ids, labels_of_interest, num_threads);
+        },
+        [this, &labels_of_interest](const RowTuples &diff, RowTuples *row) {
+            return add_diff_labelled(diff, row, labels_of_interest);
+        },
+        decode_diffs,
+        [&](size_t i, const RowTuples &row) { rows[i] = row; },
+        num_threads
+    );
     return rows;
 }
 
@@ -369,7 +347,7 @@ void TupleRowDiff<BaseMatrix>::add_diff(const RowTuples &diff, RowTuples *row) {
 }
 
 template <class BaseMatrix>
-void TupleRowDiff<BaseMatrix>::add_diff_labeled(const RowTuples &diff, RowTuples *row, std::unordered_set<Column> labels_of_interest) {
+void TupleRowDiff<BaseMatrix>::add_diff_labelled(const RowTuples &diff, RowTuples *row, const std::unordered_set<Column> &labels_of_interest) {
     assert(std::is_sorted(row->begin(), row->end()));
     assert(std::is_sorted(diff.begin(), diff.end()));
 
@@ -394,6 +372,9 @@ void TupleRowDiff<BaseMatrix>::add_diff_labeled(const RowTuples &diff, RowTuples
                     std::set_symmetric_difference(it->second.begin(), it->second.end(),
                                                   it2->second.begin(), it2->second.end(),
                                                   std::back_inserter(result.back().second));
+                    // just for safety, normally rows without coordinates shouldn't be annotated
+                    if (result.back().second.empty())
+                        result.pop_back();
                 }
                 ++it;
                 ++it2;
@@ -409,19 +390,21 @@ void TupleRowDiff<BaseMatrix>::add_diff_labeled(const RowTuples &diff, RowTuples
     }
 
     assert(std::is_sorted(row->begin(), row->end()));
+    assert(std::all_of(row->begin(), row->end(),
+                       [](auto &p) { return p.second.size(); }));
     for (auto &[j, tuple] : *row) {
-        assert(std::is_sorted(tuple.begin(), tuple.end()));
         for (uint64_t &c : tuple) {
             c -= SHIFT;
         }
+        assert(std::is_sorted(tuple.begin(), tuple.end()));
     }
 }
 
 template <class BaseMatrix>
 std::vector<std::unordered_set<uint64_t>> TupleRowDiff<BaseMatrix>
-::get_labels_of_rows(std::vector<Row> i) const {
+::get_labels_of_rows(const std::vector<Row> &i, size_t num_threads) const {
     std::vector<std::unordered_set<uint64_t>> result;
-    auto row_tuples = get_row_tuples(i);
+    auto row_tuples = get_row_tuples(i, num_threads);
 
     for (auto &rowt : row_tuples) {
         std::unordered_set<uint64_t> labels_set;
@@ -541,7 +524,7 @@ void TupleRowDiff<BaseMatrix>
     std::unordered_map<Column, CoordMap>& paths
 ) const {
 
-    auto tuples = get_row_tuples_labeled(query_rows, samples);
+    auto tuples = get_row_tuples_labelled(query_rows, samples);
 
     for (size_t i = 0; i < query_rows.size(); ++i) {
         Row r = query_rows[i];
@@ -869,7 +852,7 @@ void TupleRowDiff<BaseMatrix>
         }
 
         // --- Decompression ---
-        auto annotations = get_row_tuples_labeled(batch, active_samples);
+        auto annotations = get_row_tuples_labelled(batch, active_samples);
 
         // --- Merge into paths ---
         for (size_t i = 0; i < batch.size(); ++i) {

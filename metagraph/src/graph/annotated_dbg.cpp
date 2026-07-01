@@ -759,13 +759,14 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
     logger->trace("Getting samples with query...");
     std::unordered_set<Column> samples_with_query = tuple_row_diff->get_samples_containing_query(rows);
 
-    logger->trace(fmt::format("Num of samples matching query: {}", samples_with_query.size()));
+    uint64_t num_samples_matching_query = samples_with_query.size();
+    logger->trace(fmt::format("Num of samples matching query: {}", num_samples_matching_query));
     logger->trace(fmt::format("Traversal batch size: {}", traversal_batch_size));
 
 
     const uint64_t effective_batch_size =
-        column_batch_size == 0
-            ? samples_with_query.size()
+        column_batch_size == 0 || column_batch_size >= num_samples_matching_query
+            ? num_samples_matching_query
             : column_batch_size;
 
     logger->trace(fmt::format("Column batch size: {}; Effective column batch size: {}", column_batch_size, effective_batch_size));
