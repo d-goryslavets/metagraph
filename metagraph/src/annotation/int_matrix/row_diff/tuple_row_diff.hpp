@@ -71,10 +71,6 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
         const std::unordered_set<Column>& samples_with_query,
         uint64_t traversal_batch_size) const;
 
-    // iteratively processes batches of columns
-    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_reborn(std::vector<Row> i,
-    uint64_t columns_batch_size = 50) const; // TODO: DEBUG and if ok add this parameter to cli
-
     // pre-traverse graph to find samples with reads containing full query sequence
     std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const;
 
@@ -478,44 +474,6 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
     return labels_matching_query_result;
 }
 
-
-template <class BaseMatrix>
-std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
-::get_traces_with_row_reborn(std::vector<Row> i, uint64_t columns_batch_size) const {
-    // assert(graph_ && "graph must be loaded");
-    // assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
-    // assert(!fork_succ_.size() || fork_succ_.size() == graph_->get_boss().get_last().size());
-
-    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
-
-    auto samples_with_query = get_samples_containing_query(i);
-
-
-    
-    std::vector<Column> samples_with_query_vec;
-    samples_with_query_vec.reserve(samples_with_query.size());
-    samples_with_query_vec.insert(samples_with_query_vec.end(), 
-    samples_with_query.begin(), samples_with_query.end());
-
-    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += columns_batch_size) {
-        size_t cur_end = std::min(curColumn + columns_batch_size, samples_with_query_vec.size());
-
-        std::vector<Column> samples_with_query_batch;
-        samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,
-        samples_with_query_vec.begin() + cur_end);
-
-        std::unordered_set<Column> columns_batch(samples_with_query_batch.begin(), samples_with_query_batch.end());
-
-        auto retrieved_reads = get_traces_with_row_labelled(i, columns_batch, 500); // TODO DEBUG obsolete function
-
-        // extend result with newly retrieved reads
-        result.reserve(result.size() + distance(retrieved_reads.begin(), retrieved_reads.end()));
-        result.insert(result.end(), retrieved_reads.begin(), retrieved_reads.end());
-
-    }
-
-    return result;
-}
 template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::initialise_paths(

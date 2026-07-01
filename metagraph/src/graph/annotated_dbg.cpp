@@ -821,25 +821,6 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
         }
     }
 
-
-
-    // auto traces = tuple_row_diff->get_traces_with_row_reborn(rows);
-    // logger->trace("Spelling paths...");
-
-    // for (size_t i = 0; i < traces.size(); ++i) {
-    //     const auto & [row_trace, j, input_start_pos_in_ref] = traces[i];
-    //     Label label = annotator_->get_label_encoder().decode(j);
-    //     std::vector<node_index> trace_to_graph_index;
-    //     trace_to_graph_index.reserve(row_trace.size());
-    //     for (const row_index & row_in_trace : row_trace)
-    //         trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
-
-    //     std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
-    //     std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
-
-    //     result.push_back(row_result);
-    // }
-
     return {};
 }
 
