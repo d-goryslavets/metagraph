@@ -714,17 +714,17 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size) const {
+AnnotatedDBG::get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size, uint64_t column_batch_size) const {
     
     if (sequence.size() < dbg_.get_k())
         return {};
 
     std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes, sequence, traversal_batch_size);
+    return get_overlapping_reads(nodes, sequence, traversal_batch_size, column_batch_size);
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size) const {
+AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size, uint64_t column_batch_size) const {
     
     if (!nodes.size())
         return {};    
@@ -745,8 +745,8 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
         assert(anno_to_graph_index(rows[i]) == nodes[rows_to_nodes[i]]);
     }
 
-    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
-    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
+    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
+    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
     if (!tuple_row_diff) {
         logger->error("k-mer coordinates are not indexed in this annotator");
         exit(1);
@@ -756,14 +756,19 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
 
     logger->trace("Extracting reads...");
     
-
-    // TODO: make this as parameter, not hardcoded
-    uint64_t column_batch_size = 100;
-
     logger->trace("Getting samples with query...");
     std::unordered_set<Column> samples_with_query = tuple_row_diff->get_samples_containing_query(rows);
 
     logger->trace(fmt::format("Num of samples matching query: {}", samples_with_query.size()));
+    logger->trace(fmt::format("Traversal batch size: {}", traversal_batch_size));
+
+
+    const uint64_t effective_batch_size =
+        column_batch_size == 0
+            ? samples_with_query.size()
+            : column_batch_size;
+
+    logger->trace(fmt::format("Column batch size: {}; Effective column batch size: {}", column_batch_size, effective_batch_size));
 
     std::vector<Column> samples_with_query_vec;
     samples_with_query_vec.reserve(samples_with_query.size());
@@ -773,10 +778,10 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
     logger->trace("Processing columns in batches...");
     std::ofstream outfile;
     
-    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += column_batch_size) {
+    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += effective_batch_size) {
         // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result; // result for current batch of columns
 
-        size_t cur_end = std::min(curColumn + column_batch_size, samples_with_query_vec.size());
+        size_t cur_end = std::min(curColumn + effective_batch_size, samples_with_query_vec.size());
 
         std::vector<Column> samples_with_query_batch;
         samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,

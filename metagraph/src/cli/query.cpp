@@ -374,6 +374,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
                                              double discovery_fraction,
                                              double presence_fraction,
                                              uint64_t traversal_batch_size,
+                                             uint64_t column_batch_size,
                                              const graph::AnnotatedDBG &anno_graph) {
     // Perform a different action depending on the type (specified by config flags)
     SeqSearchResult::result_type result;
@@ -431,7 +432,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
         case READS: {
             // TODO: add config_.label_based option use for --anno-header graphs
             // TODO: change config_.label_based -> config_.header_based
-            result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size);
+            result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size, column_batch_size);
         }
     }
 
@@ -1219,7 +1220,9 @@ SeqSearchResult query_sequence(QuerySequence&& sequence,
     SeqSearchResult result = QueryExecutor::execute_query(std::move(sequence),
             config.query_mode,
             config.num_top_labels, config.discovery_fraction,
-            config.presence_fraction, config.traversal_batch_size, anno_graph);
+            config.presence_fraction, 
+            config.traversal_batch_size, config.column_batch_size,
+            anno_graph);
 
     if (aligner_config)
         result.get_alignment() = alignment;

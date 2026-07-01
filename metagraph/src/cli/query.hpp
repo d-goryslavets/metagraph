@@ -216,6 +216,7 @@ class QueryExecutor {
                                          double discovery_fraction,
                                          double presence_fraction,
                                          uint64_t traversal_batch_size,
+                                         uint64_t column_batch_size,
                                          const graph::AnnotatedDBG &anno_graph);
 
   private:

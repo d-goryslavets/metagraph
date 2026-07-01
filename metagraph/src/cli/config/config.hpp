@@ -113,6 +113,11 @@ class Config {
 
     // Read extraction options
     uint64_t traversal_batch_size = 500;
+    // Number of columns (e.g. samples) for which
+    // coordinate annotations will be decompressed
+    // during read extraction traversal at once
+    uint64_t column_batch_size = 0; // by default will be set to the total number of columns
+    std::string extracted_reads_outfile = "extracted_reads.tsv"; // TODO: use in the read extraction API
 
     // Alignment options
     bool alignment_edit_distance = false;

@@ -314,6 +314,8 @@ Config::Config(int argc, char *argv[]) {
             num_top_labels = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--traversal-batch-size")) {
             traversal_batch_size = atoi(get_value(i++));
+        } else if (!strcmp(argv[i], "--column-batch-size")) {
+            column_batch_size = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--port")) {
             port = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--address")) {
@@ -1350,6 +1352,9 @@ if (advanced) {
             fprintf(stderr, "\t   --min-kmers-fraction-label [FLOAT] \tmin fraction of k-mers from the query required to be present in a label [0.7]\n");
             fprintf(stderr, "\t   --min-kmers-fraction-graph [FLOAT] \tmin fraction of k-mers from the query required to be present in the graph [0.0]\n");
             fprintf(stderr, "\t   --no-coord-mapping \t\t\tquery without mapping coords to sequence headers even if the .seq index exists [off]\n");
+            fprintf(stderr, "\t   --traversal-batch-size \t\tnumber of nodes in a batch during coordinate-aware read extraction graph traversal [500]\n");
+            fprintf(stderr, "\t   --column-batch-size \t\t\tnumber of columns (labels) to decompress annotations for in one iteration if the coordinate-aware read extraction graph traversal. \
+By default this value will be equal to the total number of columns in the annotation matrix.\n");
 if (advanced) {
             fprintf(stderr, "\t   --labels-delimiter [STR]\tdelimiter for annotation labels [\":\"]\n");
             fprintf(stderr, "\t   --suppress-unlabeled \tdo not show results for sequences missing in graph [off]\n");
