@@ -30,11 +30,22 @@ namespace matrix {
 template <class BaseMatrix>
 class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix {
   public:
+    // 1. Define the structures inside the class (Public so the caller can use them)
+    struct Interval {
+        uint64_t start;
+        uint64_t end;
+    };
+
     static_assert(std::is_convertible<BaseMatrix*, MultiIntMatrix*>::value);
     static const int SHIFT = 1; // coordinates increase by 1 at each edge
 
     // check graph traversal in batches
     static const uint64_t TRAVERSAL_BATCH_SIZE = 500; //  50'000
+
+    // TODO: implement this as a configurable command line parameter
+    // preferably optional. Then, if no value is passed, the fallback is 
+    // to assume that the sequences can be of arbitrary length
+    static const uint64_t MAX_READ_LENGTH = 25'000; // PacBio HIFI reads
 
     // TupleRowDiff() {}
 
@@ -109,12 +120,30 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     static void add_diff_labelled(const RowTuples &diff, RowTuples *row, const std::unordered_set<Column> &labels_of_interest);
 
     using CoordMap = std::map<uint64_t, Row>;
+    using AdmissibleRanges = std::unordered_map<Column, std::vector<Interval>>;
+
+
+    // 2. Function declarations
+    void build_admissible_ranges(
+        const std::unordered_map<Column, CoordMap>& paths, 
+        AdmissibleRanges& col_to_ranges
+    ) const;
+
+    bool is_admissible(
+        const std::vector<Interval>& ranges, 
+        uint64_t x
+    ) const;
 
     void initialise_paths(
         const std::vector<Row>& query_rows,
         const std::unordered_set<Column>& samples,
         std::unordered_map<Column, CoordMap>& paths
     ) const;
+
+    // void get_coordinate_range(
+    //     const std::unordered_map<Column, CoordMap>& paths, 
+    //     std::unordered_map<Column, std::pair<uint64_t, uint64_t>>& sample_to_min_max_coord
+    // ) const;
 
     void compute_initial_boundaries(
         const std::unordered_map<Column, CoordMap>& paths,
@@ -128,7 +157,8 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
         std::unordered_map<Column, CoordMap>& paths,
         std::unordered_map<Column, std::set<uint64_t>>& boundaries,
         std::unordered_set<Column>& active_samples,
-        uint64_t batch_size
+        uint64_t batch_size, 
+        AdmissibleRanges& valid_ranges
     ) const;
 
     void refine_boundaries(
@@ -144,7 +174,8 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
         const std::unordered_set<Row>& visited,
         std::deque<Row>& queue,
         std::unordered_set<Column>& active_samples,
-        bool forward
+        bool forward, 
+        AdmissibleRanges& valid_ranges
     ) const;
 
     void build_result(
@@ -496,6 +527,88 @@ void TupleRowDiff<BaseMatrix>
     }
 }
 
+// template <class BaseMatrix>
+// void TupleRowDiff<BaseMatrix>
+// ::get_coordinate_range(
+//     const std::unordered_map<Column, CoordMap>& paths, 
+//     std::unordered_map<Column, std::pair<uint64_t, uint64_t>>& sample_to_min_max_coord
+// ) const {
+//     // get the smallest and largest possible coordinate to store during decompression
+//     // for each sample
+//     for (const auto& [col, coords] : paths) {
+//         if (coords.empty())
+//             continue;
+    
+//         // std::map is automatically sorted, so first and last elements are min and max
+//         uint64_t min_c = coords.begin()->first;
+//         uint64_t max_c = coords.rbegin()->first;
+
+//         // Calculate boundaries, protecting against unsigned integer underflow
+//         uint64_t min_boundary = (min_c > MAX_READ_LENGTH) ? (min_c - MAX_READ_LENGTH) : 0;
+//         uint64_t max_boundary = max_c + MAX_READ_LENGTH;
+
+//         sample_to_min_max_coord[col] = {min_boundary, max_boundary};
+//     }
+// }
+
+template <class BaseMatrix>
+void TupleRowDiff<BaseMatrix>::build_admissible_ranges(
+    const std::unordered_map<Column, CoordMap>& paths, 
+    AdmissibleRanges& col_to_ranges
+) const {
+    for (const auto& [col, coords] : paths) {
+        std::vector<Interval> merged;
+        
+        for (const auto& [c, row] : coords) {
+            // Calculate interval, protecting against unsigned underflow
+            uint64_t start = (c > MAX_READ_LENGTH) ? (c - MAX_READ_LENGTH) : 0;
+            uint64_t end = c + MAX_READ_LENGTH; 
+
+            if (merged.empty()) {
+                merged.push_back({start, end});
+            } else {
+                auto& last = merged.back();
+                // Because 'c' is sorted, 'start' is guaranteed to be >= previous start.
+                // If the new interval overlaps or touches the last one, merge them.
+                if (start <= last.end) {
+                    // We only need to update the end since the new end is guaranteed 
+                    // to be >= the last end due to the sorted nature of 'c'.
+                    last.end = end;
+                } else {
+                    // No overlap, create a new disjoint interval
+                    merged.push_back({start, end});
+                }
+            }
+        }
+        
+        col_to_ranges[col] = std::move(merged);
+    }
+}
+
+
+template <class BaseMatrix>
+bool TupleRowDiff<BaseMatrix>::is_admissible(
+    const std::vector<Interval>& ranges, 
+    uint64_t x
+) const {
+    if (ranges.empty()) {
+        return false;
+    }
+
+    // Binary search for the first interval where interval.end >= x
+    auto it = std::lower_bound(ranges.begin(), ranges.end(), x, 
+        [](const Interval& interval, uint64_t val) {
+            return interval.end < val;
+        });
+
+    // If we found such an interval, check if x is also >= interval.start
+    if (it != ranges.end() && x >= it->start) {
+        return true;
+    }
+
+    return false;
+}
+
 template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::compute_initial_boundaries(
@@ -664,7 +777,8 @@ void TupleRowDiff<BaseMatrix>
     const std::unordered_set<Row>& visited,
     std::deque<Row>& queue,
     std::unordered_set<Column>& active_samples,
-    bool forward
+    bool forward, 
+    AdmissibleRanges& valid_ranges
 ) const {
     /*
     Determine if the graph needs to be traversed more by exploring 
@@ -703,6 +817,12 @@ void TupleRowDiff<BaseMatrix>
         if (!traverse_more) {
             mtg::common::logger->trace("Finished processing sample {}", col);
             active_samples.erase(col);
+
+            // // note, this is incorrect as this loop processed individual boundaries
+            // // but valid ranges contains ranges centered around each position of each k-mer in the query
+            // // which means that 
+            // valid_ranges.erase(col);
+
         }
     }
 }
@@ -775,7 +895,8 @@ void TupleRowDiff<BaseMatrix>
     std::unordered_map<Column, CoordMap>& paths,
     std::unordered_map<Column, std::set<uint64_t>>& boundaries,
     std::unordered_set<Column>& active_samples,
-    uint64_t batch_size
+    uint64_t batch_size, 
+    AdmissibleRanges& valid_ranges
 ) const {
 
     std::deque<Row> queue{seed};
@@ -821,9 +942,13 @@ void TupleRowDiff<BaseMatrix>
                     continue;
 
                 auto& map = paths.at(col);
+                const auto& ranges = valid_ranges.at(col);
 
-                for (uint64_t c : coords)
-                    map.emplace(c, r);
+                for (uint64_t c : coords) {
+                    if (is_admissible(ranges, c))
+                        map.emplace(c, r);
+                }
+                    
             }
         }
 
@@ -832,7 +957,7 @@ void TupleRowDiff<BaseMatrix>
 
         // --- Next frontier ---
         queue.clear();
-        collect_frontier(paths, boundaries, visited, queue, active_samples, forward);
+        collect_frontier(paths, boundaries, visited, queue, active_samples, forward, valid_ranges);
 
         if (queue.empty())
             break;
@@ -857,10 +982,19 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
 
     std::unordered_map<Column, CoordMap> paths;
+    std::unordered_map<Column, std::pair<uint64_t, uint64_t>> sample_to_min_max_coord;
 
     mtg::common::logger->trace("Initialising paths");
     // 1. seed reads to extract
     initialise_paths(query_rows, samples, paths);
+
+    // // 1.5. Set the coordinate cap based on the initial coordinates and 
+    // // the max read length
+    // get_coordinate_range(paths, sample_to_min_max_coord);
+
+    // 1. Build ranges once
+    AdmissibleRanges valid_ranges;
+    build_admissible_ranges(paths, valid_ranges);
 
     mtg::common::logger->trace("Computing initial boundaries");
     // 2. get read boundaries
@@ -870,12 +1004,12 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     // 3. traverse graph forward to reach ends of all reads containing query
     auto active_samples = samples;
     mtg::common::logger->trace("Traversing the graph forwards");
-    traverse_direction(true, query_rows.back(), paths, ends, active_samples, batch_size);
+    traverse_direction(true, query_rows.back(), paths, ends, active_samples, batch_size, valid_ranges);
 
     // 4. traverse graph backward to reach reads' starts
     active_samples = samples;
     mtg::common::logger->trace("Traversing the graph backwards");
-    traverse_direction(false, query_rows.front(), paths, starts, active_samples, batch_size);
+    traverse_direction(false, query_rows.front(), paths, starts, active_samples, batch_size, valid_ranges);
 
     mtg::common::logger->trace("Traversing the graph backwards");
     // 5. get traces along coordinates to reconstruct representing reads
