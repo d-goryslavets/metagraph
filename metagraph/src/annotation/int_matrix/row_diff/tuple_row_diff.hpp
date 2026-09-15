@@ -481,24 +481,47 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
         labels_matching_query[j] = coord_set;
         labels_matching_query_result.insert(j);
     }
+
     for (annot_i = 1; annot_i < query_annot.size(); ++annot_i) {
-        // search for at least one coord increase in every sample        
-        for (auto & [j, tuple] : query_annot[annot_i]) {
-            bool found_coord_increase_in_child = false;
-            for (uint64_t &c : tuple) {
-                if (c == 0) continue;
-                if (labels_matching_query[j].count(c - SHIFT)) {
-                    found_coord_increase_in_child = true;
-                    break;
+        // search for at least one coord increase in every sample
+
+        // Use explicit iterators to allow safe erasing during traversal
+        for (auto it = labels_matching_query.begin(); it != labels_matching_query.end(); ) {
+            const Column& j = it->first;
+            const std::unordered_set<uint64_t>& tuple = it->second;
+            
+            bool found_match = false;
+
+            for (const auto& [j_next, tuple_next] : query_annot[annot_i]) {
+                if (j_next != j) continue;
+
+                std::unordered_set<uint64_t> intersection_with_succ;
+
+                for (const uint64_t& x : tuple_next) {
+                    if (x == 0) continue;
+                    uint64_t transformed = x - SHIFT;
+                    if (tuple.count(transformed)) {
+                        intersection_with_succ.insert(x);
+                    }
                 }
+
+                if (!intersection_with_succ.empty()) {
+                    // Update the mapped value in place using move semantics
+                    it->second = std::move(intersection_with_succ);
+                    found_match = true;
+                }
+                break; // Stop inner loop once we found the matching 'j'
             }
-            // no path consistent with the query found
-            if (!found_coord_increase_in_child) {
-                labels_matching_query.erase(j);
+
+            // If the intersection was empty, OR if 'j' wasn't in query_annot at all
+            if (!found_match) {
                 labels_matching_query_result.erase(j);
+                // erase() returns the iterator to the next element
+                it = labels_matching_query.erase(it); 
             } else {
-                labels_matching_query[j] = std::unordered_set<uint64_t>(tuple.begin(), tuple.end());
-            }       
+                // Only increment manually if we didn't erase
+                ++it;
+            }
         }
     }
 
@@ -877,6 +900,9 @@ void TupleRowDiff<BaseMatrix>
 
             // TODO: double check why this is needed
             // seems to be a bug
+
+            // if (contains_first_input_kmer && contains_last_input_kmer) 
+            // DEBUG: test this condition
             if (contains_first_input_kmer && contains_last_input_kmer)
                 result.push_back(std::make_tuple(curr_read_trace_no_coords, col, input_row_coord_in_read - cur_read_start_coord));
 
@@ -884,6 +910,9 @@ void TupleRowDiff<BaseMatrix>
             it_end++;
         }
     }
+
+    // mtg::common::logger->trace("Total num of traces found {}", result.size());
+
 }
 
 
