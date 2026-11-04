@@ -117,6 +117,9 @@ class Config {
     // coordinate annotations will be decompressed
     // during read extraction traversal at once
     uint64_t column_batch_size = 0; // by default will be set to the total number of columns
+    uint64_t flank_length = 25000;
+    uint64_t max_query_distance = 25000;
+    bool joint_query = false;
     std::string extracted_reads_outfile = "extracted_reads.tsv"; // TODO: use in the read extraction API
 
     // Alignment options

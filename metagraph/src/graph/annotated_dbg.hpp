@@ -4,6 +4,8 @@
 #include <cassert>
 #include <memory>
 #include <mutex>
+#include <string_view>
+#include <vector>
 
 #include <sdsl/int_vector.hpp>
 
@@ -137,28 +139,29 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
                          double discovery_fraction,
                          double presence_fraction) const;
 
-    /** Returns all labeled reads from the graph that match the sequence.
-     * TODO: UPDATE
-     * @param sequence DNA sequence.
-     * 
-     * @return Vector of tuples 
-     * (path_spelling, label, position_in_input_sequence, position_in_ref_sequence) is returned.
-     */
+    /** Returns labeled source windows that contain the query sequence. */
     std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size, uint64_t column_batch_size) const;
+    get_overlapping_reads(std::string_view sequence,
+                          uint64_t traversal_batch_size,
+                          uint64_t column_batch_size,
+                          uint64_t flank_length = 25000,
+                          uint64_t max_query_distance = 25000) const;
 
-    /** Returns all labeled reads that match the corresponding sequence of k-mers. 
-     * TODO: UPDATE
-     * @param nodes Vector of nodes.
-     * @param sequence query sequence that serves as ID for output filename with extracted reads
-     * 
-     * @return Vector of tuples
-     * (path_spelling, label, position_in_input_sequence, position_in_ref_sequence) is returned.
-     * 
-     * Also iterativelt saves extracted reads for groups of columns (samples) in a .txt file
-     */
+    /** Returns labeled source windows that contain every query sequence. */
     std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size, uint64_t colum_batch_size) const;
+    get_overlapping_reads(const std::vector<std::string_view> &sequences,
+                          uint64_t traversal_batch_size,
+                          uint64_t column_batch_size,
+                          uint64_t flank_length = 25000,
+                          uint64_t max_query_distance = 25000) const;
+
+    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
+    get_overlapping_reads(const std::vector<node_index> &nodes,
+                          std::string_view sequence,
+                          uint64_t traversal_batch_size,
+                          uint64_t column_batch_size,
+                          uint64_t flank_length = 25000,
+                          uint64_t max_query_distance = 25000) const;
 
     std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>
     get_top_label_signatures(std::string_view sequence,
@@ -171,6 +174,15 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
                                      int32_t mismatch_score = 2) const;
 
   private:
+    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
+    get_overlapping_reads(const std::vector<std::vector<row_index>> &query_rows,
+                          std::string_view output_sequence,
+                          uint64_t first_query_pos_in_input,
+                          uint64_t traversal_batch_size,
+                          uint64_t column_batch_size,
+                          uint64_t flank_length,
+                          uint64_t max_query_distance) const;
+
     DeBruijnGraph &dbg_;
     std::unique_ptr<annot::CoordToHeader> coord_to_header_;
 };

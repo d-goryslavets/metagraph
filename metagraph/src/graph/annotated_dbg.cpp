@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <fstream> // for batched read extaction DEBUG
+#include <unordered_set>
 
 #include <tsl/hopscotch_set.h>
 #include <tsl/hopscotch_map.h>
@@ -714,24 +715,74 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(std::string_view sequence, uint64_t traversal_batch_size, uint64_t column_batch_size) const {
-    
+AnnotatedDBG::get_overlapping_reads(std::string_view sequence,
+                                    uint64_t traversal_batch_size,
+                                    uint64_t column_batch_size,
+                                    uint64_t flank_length,
+                                    uint64_t max_query_distance) const {
     if (sequence.size() < dbg_.get_k())
         return {};
 
     std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes, sequence, traversal_batch_size, column_batch_size);
+    return get_overlapping_reads(nodes, sequence, traversal_batch_size, column_batch_size,
+                                 flank_length, max_query_distance);
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::string_view sequence, uint64_t traversal_batch_size, uint64_t column_batch_size) const {
-    
-    if (!nodes.size())
-        return {};    
-    
+AnnotatedDBG::get_overlapping_reads(const std::vector<std::string_view> &sequences,
+                                    uint64_t traversal_batch_size,
+                                    uint64_t column_batch_size,
+                                    uint64_t flank_length,
+                                    uint64_t max_query_distance) const {
+    if (sequences.empty())
+        return {};
+
+    std::vector<std::vector<row_index>> query_rows;
+    query_rows.reserve(sequences.size());
+    uint64_t first_query_pos = 0;
+
+    for (size_t q = 0; q < sequences.size(); ++q) {
+        if (sequences[q].size() < dbg_.get_k())
+            return {};
+
+        std::vector<node_index> nodes = map_to_nodes(dbg_, sequences[q]);
+        std::vector<row_index> rows;
+        rows.reserve(nodes.size());
+        size_t first_pos = 0;
+        bool found = false;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i] > 0) {
+                if (!found) {
+                    first_pos = i;
+                    found = true;
+                }
+                rows.push_back(graph_to_anno_index(nodes[i]));
+            }
+        }
+        if (rows.empty())
+            return {};
+        if (q == 0)
+            first_query_pos = first_pos;
+        query_rows.push_back(std::move(rows));
+    }
+
+    return get_overlapping_reads(query_rows, sequences.front(), first_query_pos,
+                                 traversal_batch_size, column_batch_size,
+                                 flank_length, max_query_distance);
+}
+
+std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
+AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes,
+                                    std::string_view sequence,
+                                    uint64_t traversal_batch_size,
+                                    uint64_t column_batch_size,
+                                    uint64_t flank_length,
+                                    uint64_t max_query_distance) const {
+    if (nodes.empty())
+        return {};
+
     std::vector<row_index> rows;
     rows.reserve(nodes.size());
-
     std::vector<size_t> rows_to_nodes;
 
     for (size_t i = 0; i < nodes.size(); ++i) {
@@ -741,87 +792,116 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes, std::s
         }
     }
 
-    for (size_t i = 0; i < rows.size(); ++i) {
-        assert(anno_to_graph_index(rows[i]) == nodes[rows_to_nodes[i]]);
-    }
+    if (rows.empty())
+        return {};
 
-    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(&annotator_->get_matrix());
-    // const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<BRWT>> *>(&annotator_->get_matrix());
+    return get_overlapping_reads(std::vector<std::vector<row_index>>{ std::move(rows) },
+                                 sequence, rows_to_nodes.front(),
+                                 traversal_batch_size, column_batch_size,
+                                 flank_length, max_query_distance);
+}
+
+std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
+AnnotatedDBG::get_overlapping_reads(const std::vector<std::vector<row_index>> &query_rows,
+                                    std::string_view output_sequence,
+                                    uint64_t first_query_pos_in_input,
+                                    uint64_t traversal_batch_size,
+                                    uint64_t column_batch_size,
+                                    uint64_t flank_length,
+                                    uint64_t max_query_distance) const {
+    if (query_rows.empty())
+        return {};
+
+    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(
+        &annotator_->get_matrix());
     if (!tuple_row_diff) {
         logger->error("k-mer coordinates are not indexed in this annotator");
         exit(1);
     }
 
-    // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
-
     logger->trace("Extracting reads...");
-    
     logger->trace("Getting samples with query...");
-    std::unordered_set<Column> samples_with_query = tuple_row_diff->get_samples_containing_query(rows);
+
+    std::unordered_set<Column> samples_with_query;
+    bool first_query = true;
+    for (const auto &rows : query_rows) {
+        if (rows.empty())
+            return {};
+        auto samples = tuple_row_diff->get_samples_containing_query(rows);
+        if (first_query) {
+            samples_with_query = std::move(samples);
+            first_query = false;
+        } else {
+            for (auto it = samples_with_query.begin(); it != samples_with_query.end(); ) {
+                if (!samples.count(*it))
+                    it = samples_with_query.erase(it);
+                else
+                    ++it;
+            }
+        }
+        if (samples_with_query.empty())
+            return {};
+    }
 
     uint64_t num_samples_matching_query = samples_with_query.size();
     logger->trace(fmt::format("Num of samples matching query: {}", num_samples_matching_query));
     logger->trace(fmt::format("Traversal batch size: {}", traversal_batch_size));
-
 
     const uint64_t effective_batch_size =
         column_batch_size == 0 || column_batch_size >= num_samples_matching_query
             ? num_samples_matching_query
             : column_batch_size;
 
-    logger->trace(fmt::format("Column batch size: {}; Effective column batch size: {}", column_batch_size, effective_batch_size));
+    if (effective_batch_size == 0)
+        return {};
 
-    std::vector<Column> samples_with_query_vec;
-    samples_with_query_vec.reserve(samples_with_query.size());
-    samples_with_query_vec.insert(samples_with_query_vec.end(), 
-    samples_with_query.begin(), samples_with_query.end());
+    logger->trace(fmt::format("Column batch size: {}; Effective column batch size: {}",
+                              column_batch_size, effective_batch_size));
+
+    std::vector<Column> samples_with_query_vec(samples_with_query.begin(), samples_with_query.end());
 
     logger->trace("Processing columns in batches...");
+    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
     std::ofstream outfile;
-    
-    for (size_t curColumn = 0; curColumn <= samples_with_query_vec.size(); curColumn += effective_batch_size) {
-        // std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result; // result for current batch of columns
 
+    for (size_t curColumn = 0; curColumn < samples_with_query_vec.size();
+            curColumn += effective_batch_size) {
         size_t cur_end = std::min(curColumn + effective_batch_size, samples_with_query_vec.size());
-
-        std::vector<Column> samples_with_query_batch;
-        samples_with_query_batch = std::vector<Column>(samples_with_query_vec.begin() + curColumn,
-        samples_with_query_vec.begin() + cur_end);
-
-        std::unordered_set<Column> columns_batch(samples_with_query_batch.begin(), samples_with_query_batch.end());
-
+        std::unordered_set<Column> columns_batch(samples_with_query_vec.begin() + curColumn,
+                                                 samples_with_query_vec.begin() + cur_end);
+        if (columns_batch.empty())
+            continue;
 
         logger->trace("Column batch getting traces...");
-        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(rows, columns_batch, traversal_batch_size);
+        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(
+            query_rows, columns_batch, traversal_batch_size, flank_length, max_query_distance);
 
-
-        // Spell paths for curr batch of columns
         logger->trace("Column batch spelling paths...");
         for (size_t i = 0; i < retrieved_traces.size(); ++i) {
-            const auto & [row_trace, j, input_start_pos_in_ref] = retrieved_traces[i];
+            const auto &[row_trace, j, input_start_pos_in_ref] = retrieved_traces[i];
             Label label = annotator_->get_label_encoder().decode(j);
             std::vector<node_index> trace_to_graph_index;
             trace_to_graph_index.reserve(row_trace.size());
-            for (const row_index & row_in_trace : row_trace)
+            for (const row_index &row_in_trace : row_trace)
                 trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
 
             std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
-            // std::tuple<std::string, Label, uint64_t, uint64_t> row_result = std::make_tuple(path_spelling, label, rows_to_nodes[0], input_start_pos_in_ref);
-            // result.push_back(row_result);
+            result.emplace_back(path_spelling, label, first_query_pos_in_input, input_start_pos_in_ref);
 
-            // save column batch result to a file
-            std::string dummy_query_idx = "query_idx"; // DEBUG
-            std::string dummy_query_name = "query_name"; // DEBUG
-            std::string read_result = dummy_query_idx + "\t" + dummy_query_name + "\t" + path_spelling + "\t" + label + "\t" + \
-            std::to_string(rows_to_nodes[0]) + "\t" + std::to_string(input_start_pos_in_ref);
+            std::string dummy_query_idx = "query_idx";
+            std::string dummy_query_name = "query_name";
+            std::string read_result = dummy_query_idx + "\t" + dummy_query_name + "\t"
+                + path_spelling + "\t" + label + "\t"
+                + std::to_string(first_query_pos_in_input) + "\t"
+                + std::to_string(input_start_pos_in_ref);
 
-            outfile.open(fmt::format("extracted_reads_{}.txt", sequence), std::ios_base::app); // TODO make as parameter in config
+            outfile.open(fmt::format("extracted_reads_{}.txt", output_sequence), std::ios_base::app);
             outfile << read_result << "\n";
             outfile.close();
         }
     }
 
-    return {};
+    return result;
 }
 
 std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>

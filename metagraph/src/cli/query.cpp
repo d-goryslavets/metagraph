@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <sstream>
+#include <string_view>
 
 #include <omp.h>
 #include <ips4o.hpp>
@@ -375,6 +376,8 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
                                              double presence_fraction,
                                              uint64_t traversal_batch_size,
                                              uint64_t column_batch_size,
+                                             uint64_t flank_length,
+                                             uint64_t max_query_distance,
                                              const graph::AnnotatedDBG &anno_graph) {
     // Perform a different action depending on the type (specified by config flags)
     SeqSearchResult::result_type result;
@@ -432,7 +435,9 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
         case READS: {
             // TODO: add config_.label_based option use for --anno-header graphs
             // TODO: change config_.label_based -> config_.header_based
-            result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size, column_batch_size);
+            result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size,
+                                                      column_batch_size, flank_length,
+                                                      max_query_distance);
         }
     }
 
@@ -1222,6 +1227,7 @@ SeqSearchResult query_sequence(QuerySequence&& sequence,
             config.num_top_labels, config.discovery_fraction,
             config.presence_fraction, 
             config.traversal_batch_size, config.column_batch_size,
+            config.flank_length, config.max_query_distance,
             anno_graph);
 
     if (aligner_config)
@@ -1275,6 +1281,37 @@ size_t QueryExecutor::query_fasta(const string &file,
             else
                 logger->warn("Querying reads in batch mode is currently not supported. Querying sequentially...");
         }
+    }
+
+    if (config_.query_mode == READS && config_.joint_query) {
+        std::vector<QuerySequence> stored;
+        size_t num_bp = 0;
+        size_t seq_count = 0;
+        for (const seq_io::kseq_t &kseq : fasta_parser) {
+            stored.push_back(QuerySequence { seq_count++, std::string(kseq.name.s),
+                                             std::string(kseq.seq.s) });
+            num_bp += kseq.seq.l;
+        }
+
+        std::vector<std::string_view> views;
+        views.reserve(stored.size());
+        for (const auto &qs : stored)
+            views.emplace_back(qs.sequence);
+
+        SeqSearchResult::result_type result = anno_graph_.get_overlapping_reads(
+            views, config_.traversal_batch_size, config_.column_batch_size,
+            config_.flank_length, config_.max_query_distance);
+
+        QuerySequence first = stored.empty()
+            ? QuerySequence { 0, "", "" }
+            : std::move(stored.front());
+        for (size_t i = 1; i < stored.size(); ++i) {
+            first.name += ",";
+            first.name += stored[i].name;
+        }
+
+        callback(SeqSearchResult(std::move(first), std::move(result)));
+        return num_bp;
     }
 
     // Query sequences independently

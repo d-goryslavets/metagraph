@@ -8,6 +8,8 @@
 #include <vector>
 #include <queue>
 #include <deque>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -82,6 +84,13 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
         const std::unordered_set<Column>& samples_with_query,
         uint64_t traversal_batch_size) const;
 
+    std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> get_traces_with_row_labelled(
+        const std::vector<std::vector<Row>>& queries,
+        const std::unordered_set<Column>& samples_with_query,
+        uint64_t traversal_batch_size,
+        uint64_t flank_length,
+        uint64_t max_query_distance) const;
+
     // pre-traverse graph to find samples with reads containing full query sequence
     std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const;
 
@@ -122,10 +131,33 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     using CoordMap = std::map<uint64_t, Row>;
     using AdmissibleRanges = std::unordered_map<Column, std::vector<Interval>>;
 
+    struct QueryCluster {
+        uint64_t min_start;
+        uint64_t max_end;
+    };
+
 
     // 2. Function declarations
+    bool query_matches_at(
+        const CoordMap& map,
+        const std::vector<Row>& query,
+        uint64_t start
+    ) const;
+
+    void find_query_clusters(
+        const CoordMap& map,
+        const std::vector<std::vector<Row>>& queries,
+        uint64_t max_query_distance,
+        std::vector<QueryCluster>& clusters
+    ) const;
+
+    void merge_intervals(std::vector<Interval>& intervals) const;
+
     void build_admissible_ranges(
-        const std::unordered_map<Column, CoordMap>& paths, 
+        const std::unordered_map<Column, CoordMap>& paths,
+        const std::vector<std::vector<Row>>& queries,
+        uint64_t flank_length,
+        uint64_t max_query_distance,
         AdmissibleRanges& col_to_ranges
     ) const;
 
@@ -135,30 +167,27 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
     ) const;
 
     void initialise_paths(
-        const std::vector<Row>& query_rows,
+        const std::vector<std::vector<Row>>& queries,
         const std::unordered_set<Column>& samples,
         std::unordered_map<Column, CoordMap>& paths
     ) const;
 
-    // void get_coordinate_range(
-    //     const std::unordered_map<Column, CoordMap>& paths, 
-    //     std::unordered_map<Column, std::pair<uint64_t, uint64_t>>& sample_to_min_max_coord
-    // ) const;
-
     void compute_initial_boundaries(
         const std::unordered_map<Column, CoordMap>& paths,
+        const AdmissibleRanges& valid_ranges,
         std::unordered_map<Column, std::set<uint64_t>>& starts,
         std::unordered_map<Column, std::set<uint64_t>>& ends
     ) const;
 
     void traverse_direction(
         bool forward,
-        Row seed,
+        const std::vector<Row>& seeds,
         std::unordered_map<Column, CoordMap>& paths,
         std::unordered_map<Column, std::set<uint64_t>>& boundaries,
         std::unordered_set<Column>& active_samples,
         uint64_t batch_size, 
-        AdmissibleRanges& valid_ranges
+        AdmissibleRanges& valid_ranges,
+        std::unordered_set<Row> visited
     ) const;
 
     void refine_boundaries(
@@ -180,9 +209,9 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
 
     void build_result(
         const std::unordered_map<Column, CoordMap>& paths,
-        const std::unordered_map<Column, std::set<uint64_t>>& starts,
-        const std::unordered_map<Column, std::set<uint64_t>>& ends,
-        const std::vector<Row>& query_rows,
+        const std::vector<std::vector<Row>>& queries,
+        uint64_t flank_length,
+        uint64_t max_query_distance,
         std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>& result
     ) const;
 
@@ -410,8 +439,14 @@ void TupleRowDiff<BaseMatrix>::add_diff_labelled(const RowTuples &diff, RowTuple
                 ++it2;
             }
         }
-        std::copy(it, row->end(), std::back_inserter(result));
-        std::copy(it2, diff.end(), std::back_inserter(result));
+        for (; it != row->end(); ++it) {
+            if (labels_of_interest.count(it->first))
+                result.push_back(*it);
+        }
+        for (; it2 != diff.end(); ++it2) {
+            if (labels_of_interest.count(it2->first))
+                result.push_back(*it2);
+        }
 
         row->swap(result);
     }
@@ -529,17 +564,129 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
 }
 
 template <class BaseMatrix>
+bool TupleRowDiff<BaseMatrix>::query_matches_at(
+    const CoordMap& map,
+    const std::vector<Row>& query,
+    uint64_t start
+) const {
+    if (query.empty())
+        return false;
+
+    for (size_t i = 0; i < query.size(); ++i) {
+        auto it = map.find(start + static_cast<uint64_t>(i) * static_cast<uint64_t>(SHIFT));
+        if (it == map.end() || it->second != query[i])
+            return false;
+    }
+    return true;
+}
+
+template <class BaseMatrix>
+void TupleRowDiff<BaseMatrix>::find_query_clusters(
+    const CoordMap& map,
+    const std::vector<std::vector<Row>>& queries,
+    uint64_t max_query_distance,
+    std::vector<QueryCluster>& clusters
+) const {
+    clusters.clear();
+    if (queries.empty() || map.empty())
+        return;
+
+    struct Occ {
+        uint64_t start;
+        uint64_t end;
+        size_t query_id;
+    };
+
+    std::vector<Occ> occs;
+    for (size_t q = 0; q < queries.size(); ++q) {
+        const auto &query = queries[q];
+        if (query.empty())
+            return;
+
+        const uint64_t span = static_cast<uint64_t>(query.size() - 1) * static_cast<uint64_t>(SHIFT);
+        for (const auto &[c, row] : map) {
+            if (row != query.front())
+                continue;
+            if (query_matches_at(map, query, c))
+                occs.push_back({ c, c + span, q });
+        }
+    }
+
+    if (occs.empty())
+        return;
+
+    std::sort(occs.begin(), occs.end(), [](const Occ &a, const Occ &b) {
+        return a.start < b.start || (a.start == b.start && a.query_id < b.query_id);
+    });
+
+    std::vector<size_t> count(queries.size(), 0);
+    std::multiset<uint64_t> ends;
+    size_t have = 0;
+    size_t left = 0;
+
+    auto add = [&](const Occ &o) {
+        if (count[o.query_id]++ == 0)
+            ++have;
+        ends.insert(o.end);
+    };
+    auto remove = [&](const Occ &o) {
+        ends.erase(ends.find(o.end));
+        if (--count[o.query_id] == 0)
+            --have;
+    };
+
+    for (size_t right = 0; right < occs.size(); ++right) {
+        add(occs[right]);
+        while (have == queries.size()) {
+            const uint64_t min_start = occs[left].start;
+            const uint64_t max_end = *ends.rbegin();
+            if (max_end >= min_start && max_end - min_start <= max_query_distance)
+                clusters.push_back({ min_start, max_end });
+            remove(occs[left]);
+            ++left;
+        }
+    }
+}
+
+template <class BaseMatrix>
+void TupleRowDiff<BaseMatrix>::merge_intervals(std::vector<Interval>& intervals) const {
+    if (intervals.size() < 2)
+        return;
+
+    std::sort(intervals.begin(), intervals.end(), [](const Interval &a, const Interval &b) {
+        return a.start < b.start;
+    });
+
+    std::vector<Interval> merged;
+    merged.reserve(intervals.size());
+    merged.push_back(intervals.front());
+    for (size_t i = 1; i < intervals.size(); ++i) {
+        if (intervals[i].start <= merged.back().end)
+            merged.back().end = std::max(merged.back().end, intervals[i].end);
+        else
+            merged.push_back(intervals[i]);
+    }
+    intervals.swap(merged);
+}
+
+template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::initialise_paths(
-    const std::vector<Row>& query_rows,
+    const std::vector<std::vector<Row>>& queries,
     const std::unordered_set<Column>& samples,
     std::unordered_map<Column, CoordMap>& paths
 ) const {
+    std::vector<Row> all_rows;
+    for (const auto &query : queries)
+        all_rows.insert(all_rows.end(), query.begin(), query.end());
 
-    auto tuples = get_row_tuples_labelled(query_rows, samples);
+    if (all_rows.empty())
+        return;
 
-    for (size_t i = 0; i < query_rows.size(); ++i) {
-        Row r = query_rows[i];
+    auto tuples = get_row_tuples_labelled(all_rows, samples);
+
+    for (size_t i = 0; i < all_rows.size(); ++i) {
+        Row r = all_rows[i];
 
         for (auto& [col, coords] : tuples[i]) {
             auto& map = paths[col];
@@ -576,35 +723,27 @@ void TupleRowDiff<BaseMatrix>
 
 template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>::build_admissible_ranges(
-    const std::unordered_map<Column, CoordMap>& paths, 
+    const std::unordered_map<Column, CoordMap>& paths,
+    const std::vector<std::vector<Row>>& queries,
+    uint64_t flank_length,
+    uint64_t max_query_distance,
     AdmissibleRanges& col_to_ranges
 ) const {
     for (const auto& [col, coords] : paths) {
-        std::vector<Interval> merged;
-        
-        for (const auto& [c, row] : coords) {
-            // Calculate interval, protecting against unsigned underflow
-            uint64_t start = (c > MAX_READ_LENGTH) ? (c - MAX_READ_LENGTH) : 0;
-            uint64_t end = c + MAX_READ_LENGTH; 
+        std::vector<QueryCluster> clusters;
+        find_query_clusters(coords, queries, max_query_distance, clusters);
+        if (clusters.empty())
+            continue;
 
-            if (merged.empty()) {
-                merged.push_back({start, end});
-            } else {
-                auto& last = merged.back();
-                // Because 'c' is sorted, 'start' is guaranteed to be >= previous start.
-                // If the new interval overlaps or touches the last one, merge them.
-                if (start <= last.end) {
-                    // We only need to update the end since the new end is guaranteed 
-                    // to be >= the last end due to the sorted nature of 'c'.
-                    last.end = end;
-                } else {
-                    // No overlap, create a new disjoint interval
-                    merged.push_back({start, end});
-                }
-            }
+        std::vector<Interval> ranges;
+        ranges.reserve(clusters.size());
+        for (const auto &cluster : clusters) {
+            uint64_t start = (cluster.min_start > flank_length)
+                ? (cluster.min_start - flank_length) : 0;
+            ranges.push_back({ start, cluster.max_end + flank_length });
         }
-        
-        col_to_ranges[col] = std::move(merged);
+        merge_intervals(ranges);
+        col_to_ranges[col] = std::move(ranges);
     }
 }
 
@@ -636,12 +775,15 @@ template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::compute_initial_boundaries(
     const std::unordered_map<Column, CoordMap>& paths,
+    const AdmissibleRanges& valid_ranges,
     std::unordered_map<Column, std::set<uint64_t>>& starts,
     std::unordered_map<Column, std::set<uint64_t>>& ends
 ) const {
 
     // mtg::common::logger->trace("Getting initial starts and ends of the reads");
     for (const auto& [col, coords] : paths) {
+        if (!valid_ranges.count(col) || coords.empty())
+            continue;
 
         auto it = coords.begin();
         uint64_t prev_coord = it->first;
@@ -854,65 +996,65 @@ template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::build_result(
     const std::unordered_map<Column, CoordMap>& paths,
-    const std::unordered_map<Column, std::set<uint64_t>>& starts,
-    const std::unordered_map<Column, std::set<uint64_t>>& ends,
-    const std::vector<Row>& query_rows,
+    const std::vector<std::vector<Row>>& queries,
+    uint64_t flank_length,
+    uint64_t max_query_distance,
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>>& result
 ) const {
 
     mtg::common::logger->trace("Reconstructing the paths...");
 
-    for (auto & [col, coords] : starts) {
+    if (queries.empty())
+        return;
 
-        // assert(coords.size() == ends[col].size());
+    for (const auto &[col, coords] : paths) {
+        if (coords.empty())
+            continue;
 
-        auto it_start = coords.begin();
-        auto it_end = ends.at(col).begin();
+        std::vector<QueryCluster> clusters;
+        find_query_clusters(coords, queries, max_query_distance, clusters);
 
-        uint64_t cur_read_start_coord = *it_start;
-        std::vector<Row> curr_read_trace_no_coords;
+        std::set<std::pair<uint64_t, uint64_t>> emitted;
+        for (const auto &cluster : clusters) {
+            uint64_t window_start = (cluster.min_start > flank_length)
+                ? (cluster.min_start - flank_length) : 0;
+            uint64_t window_end = cluster.max_end + flank_length;
 
-        while (it_start != coords.end() && it_end != ends.at(col).end()) {
-            curr_read_trace_no_coords.clear();
-            cur_read_start_coord = *it_start;
+            while (window_start < cluster.min_start && !coords.count(window_start))
+                ++window_start;
+            while (window_end > cluster.max_end && !coords.count(window_end))
+                --window_end;
 
-            bool contains_first_input_kmer = false;
-            bool contains_last_input_kmer = false;
-            uint64_t input_row_coord_in_read = 0;
-            bool found_first_occurence_of_the_first_kmer = false; // TODO: DEBUG
+            if (window_start > window_end || !coords.count(window_start) || !coords.count(window_end))
+                continue;
 
-            for (uint64_t cur_read_coord_ind = cur_read_start_coord; cur_read_coord_ind <= *it_end; ++cur_read_coord_ind) {
-                if (paths.at(col).at(cur_read_coord_ind) == *(query_rows.begin()) &&
-                    !found_first_occurence_of_the_first_kmer) {
-                    found_first_occurence_of_the_first_kmer = true;
+            if (!emitted.insert({ window_start, window_end }).second)
+                continue;
 
-                    input_row_coord_in_read = cur_read_coord_ind;
-                    contains_first_input_kmer = true;
+            std::vector<Row> trace;
+            bool contiguous = true;
+            for (uint64_t c = window_start; c <= window_end; ++c) {
+                auto it = coords.find(c);
+                if (it == coords.end()) {
+                    contiguous = false;
+                    break;
                 }
-                // query can consist of a single k-mer (or end with the same as the first one)
-                // so these conditions must be separate 
-                if (paths.at(col).at(cur_read_coord_ind) == *(query_rows.rbegin())) {
-                    // TODO: clarify the neccessity of this condition
-                    contains_last_input_kmer = true;
+                trace.push_back(it->second);
+            }
+            if (!contiguous || trace.empty())
+                continue;
+
+            uint64_t first_query_start = cluster.min_start;
+            for (uint64_t c = window_start; c <= window_end; ++c) {
+                if (query_matches_at(coords, queries.front(), c)) {
+                    first_query_start = c;
+                    break;
                 }
-                curr_read_trace_no_coords.push_back(paths.at(col).at(cur_read_coord_ind));
             }
 
-            // TODO: double check why this is needed
-            // seems to be a bug
-
-            // if (contains_first_input_kmer && contains_last_input_kmer) 
-            // DEBUG: test this condition
-            if (contains_first_input_kmer && contains_last_input_kmer)
-                result.push_back(std::make_tuple(curr_read_trace_no_coords, col, input_row_coord_in_read - cur_read_start_coord));
-
-            it_start++;
-            it_end++;
+            result.emplace_back(std::move(trace), col, first_query_start - window_start);
         }
     }
-
-    // mtg::common::logger->trace("Total num of traces found {}", result.size());
-
 }
 
 
@@ -920,23 +1062,26 @@ template <class BaseMatrix>
 void TupleRowDiff<BaseMatrix>
 ::traverse_direction(
     bool forward,
-    Row seed,
+    const std::vector<Row>& seeds,
     std::unordered_map<Column, CoordMap>& paths,
     std::unordered_map<Column, std::set<uint64_t>>& boundaries,
     std::unordered_set<Column>& active_samples,
     uint64_t batch_size, 
-    AdmissibleRanges& valid_ranges
+    AdmissibleRanges& valid_ranges,
+    std::unordered_set<Row> visited
 ) const {
 
-    std::deque<Row> queue{seed};
-    std::unordered_set<Row> visited;
+    if (!batch_size)
+        batch_size = 1;
+
+    std::deque<Row> queue(seeds.begin(), seeds.end());
+    collect_frontier(paths, boundaries, visited, queue, active_samples, forward, valid_ranges);
 
     while (!queue.empty()) {
 
         std::vector<Row> batch;
         batch.reserve(batch_size);
 
-        // --- BFS batch ---
         while (!queue.empty() && batch.size() < batch_size) {
             Row r = queue.front();
             queue.pop_front();
@@ -945,51 +1090,36 @@ void TupleRowDiff<BaseMatrix>
                 continue;
 
             batch.push_back(r);
-
-            auto node = graph::AnnotatedSequenceGraph::anno_to_graph_index(r);
-
-            auto expand = [&](auto next, char c) {
-                if (c != graph::boss::BOSS::kSentinel)
-                    queue.push_back(graph::AnnotatedSequenceGraph::graph_to_anno_index(next));
-            };
-
-            if (forward)
-                graph_->call_outgoing_kmers(node, expand);
-            else
-                graph_->call_incoming_kmers(node, expand);
         }
 
-        // --- Decompression ---
-        auto annotations = get_row_tuples_labelled(batch, active_samples);
+        if (!batch.empty()) {
+            auto annotations = get_row_tuples_labelled(batch, active_samples);
 
-        // --- Merge into paths ---
-        for (size_t i = 0; i < batch.size(); ++i) {
-            Row r = batch[i];
+            for (size_t i = 0; i < batch.size(); ++i) {
+                Row r = batch[i];
 
-            for (auto& [col, coords] : annotations[i]) {
-                if (!active_samples.count(col))
-                    continue;
+                for (auto& [col, coords] : annotations[i]) {
+                    if (!active_samples.count(col))
+                        continue;
 
-                auto& map = paths.at(col);
-                const auto& ranges = valid_ranges.at(col);
+                    auto path_it = paths.find(col);
+                    auto range_it = valid_ranges.find(col);
+                    if (path_it == paths.end() || range_it == valid_ranges.end())
+                        continue;
 
-                for (uint64_t c : coords) {
-                    if (is_admissible(ranges, c))
-                        map.emplace(c, r);
+                    auto& map = path_it->second;
+
+                    for (uint64_t c : coords) {
+                        if (is_admissible(range_it->second, c))
+                            map.emplace(c, r);
+                    }
                 }
-                    
             }
+
+            refine_boundaries(paths, boundaries, active_samples, forward);
         }
 
-        // --- Boundary refinement ---
-        refine_boundaries(paths, boundaries, active_samples, forward);
-
-        // --- Next frontier ---
-        queue.clear();
         collect_frontier(paths, boundaries, visited, queue, active_samples, forward, valid_ranges);
-
-        if (queue.empty())
-            break;
     }
 }
 
@@ -1000,6 +1130,20 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
     const std::unordered_set<Column>& samples,
     uint64_t batch_size
 ) const {
+    return get_traces_with_row_labelled(
+        std::vector<std::vector<Row>>{ query_rows },
+        samples, batch_size, MAX_READ_LENGTH, MAX_READ_LENGTH);
+}
+
+template <class BaseMatrix>
+std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> TupleRowDiff<BaseMatrix>
+::get_traces_with_row_labelled(
+    const std::vector<std::vector<Row>>& queries,
+    const std::unordered_set<Column>& samples,
+    uint64_t batch_size,
+    uint64_t flank_length,
+    uint64_t max_query_distance
+) const {
 
     assert(graph_ && "graph must be loaded");
     assert(diffs_.num_rows() == graph_->max_index());
@@ -1007,42 +1151,58 @@ std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uin
 
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->max_index() + 1);
 
-    // graph paths representing reads
     std::vector<std::tuple<std::vector<Row>, Column, uint64_t>> result;
 
+    if (queries.empty() || samples.empty())
+        return result;
+
+    std::vector<Row> forward_seeds;
+    std::vector<Row> backward_seeds;
+    std::unordered_set<Row> query_rows_visited;
+    forward_seeds.reserve(queries.size());
+    backward_seeds.reserve(queries.size());
+
+    for (const auto &query : queries) {
+        if (query.empty())
+            return result;
+        forward_seeds.push_back(query.back());
+        backward_seeds.push_back(query.front());
+        query_rows_visited.insert(query.begin(), query.end());
+    }
+
     std::unordered_map<Column, CoordMap> paths;
-    std::unordered_map<Column, std::pair<uint64_t, uint64_t>> sample_to_min_max_coord;
 
     mtg::common::logger->trace("Initialising paths");
-    // 1. seed reads to extract
-    initialise_paths(query_rows, samples, paths);
+    initialise_paths(queries, samples, paths);
+    if (paths.empty())
+        return result;
 
-    // // 1.5. Set the coordinate cap based on the initial coordinates and 
-    // // the max read length
-    // get_coordinate_range(paths, sample_to_min_max_coord);
-
-    // 1. Build ranges once
     AdmissibleRanges valid_ranges;
-    build_admissible_ranges(paths, valid_ranges);
+    build_admissible_ranges(paths, queries, flank_length, max_query_distance, valid_ranges);
+    if (valid_ranges.empty())
+        return result;
+
+    std::unordered_set<Column> active_samples;
+    for (const auto &[col, _] : valid_ranges)
+        active_samples.insert(col);
 
     mtg::common::logger->trace("Computing initial boundaries");
-    // 2. get read boundaries
     std::unordered_map<Column, std::set<uint64_t>> starts, ends;
-    compute_initial_boundaries(paths, starts, ends);
+    compute_initial_boundaries(paths, valid_ranges, starts, ends);
 
-    // 3. traverse graph forward to reach ends of all reads containing query
-    auto active_samples = samples;
     mtg::common::logger->trace("Traversing the graph forwards");
-    traverse_direction(true, query_rows.back(), paths, ends, active_samples, batch_size, valid_ranges);
+    traverse_direction(true, forward_seeds, paths, ends, active_samples, batch_size,
+                       valid_ranges, query_rows_visited);
 
-    // 4. traverse graph backward to reach reads' starts
-    active_samples = samples;
-    mtg::common::logger->trace("Traversing the graph backwards");
-    traverse_direction(false, query_rows.front(), paths, starts, active_samples, batch_size, valid_ranges);
+    active_samples.clear();
+    for (const auto &[col, _] : valid_ranges)
+        active_samples.insert(col);
 
     mtg::common::logger->trace("Traversing the graph backwards");
-    // 5. get traces along coordinates to reconstruct representing reads
-    build_result(paths, starts, ends, query_rows, result);
+    traverse_direction(false, backward_seeds, paths, starts, active_samples, batch_size,
+                       valid_ranges, query_rows_visited);
+
+    build_result(paths, queries, flank_length, max_query_distance, result);
 
     return result;
 }

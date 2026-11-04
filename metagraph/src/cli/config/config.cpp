@@ -316,6 +316,12 @@ Config::Config(int argc, char *argv[]) {
             traversal_batch_size = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--column-batch-size")) {
             column_batch_size = atoi(get_value(i++));
+        } else if (!strcmp(argv[i], "--flank-length")) {
+            flank_length = atoll(get_value(i++));
+        } else if (!strcmp(argv[i], "--max-query-distance")) {
+            max_query_distance = atoll(get_value(i++));
+        } else if (!strcmp(argv[i], "--joint-query")) {
+            joint_query = true;
         } else if (!strcmp(argv[i], "--port")) {
             port = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--address")) {
@@ -1355,6 +1361,9 @@ if (advanced) {
             fprintf(stderr, "\t   --traversal-batch-size \t\tnumber of nodes in a batch during coordinate-aware read extraction graph traversal [500]\n");
             fprintf(stderr, "\t   --column-batch-size \t\t\tnumber of columns (labels) to decompress annotations for in one iteration if the coordinate-aware read extraction graph traversal. \
 By default this value will be equal to the total number of columns in the annotation matrix.\n");
+            fprintf(stderr, "\t   --flank-length [INT] \t\tflanks around the span covering all queries for --query-mode reads [25000]\n");
+            fprintf(stderr, "\t   --max-query-distance [INT] \tmax coord span covering all joint queries for --query-mode reads [25000]\n");
+            fprintf(stderr, "\t   --joint-query \t\ttreat all FASTA records as one AND-query for --query-mode reads [off]\n");
 if (advanced) {
             fprintf(stderr, "\t   --labels-delimiter [STR]\tdelimiter for annotation labels [\":\"]\n");
             fprintf(stderr, "\t   --suppress-unlabeled \tdo not show results for sequences missing in graph [off]\n");
