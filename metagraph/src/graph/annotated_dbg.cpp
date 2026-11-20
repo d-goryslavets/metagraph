@@ -39,6 +39,8 @@ using Column = mtg::annot::matrix::BinaryMatrix::Column;
 using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
 
 using mtg::annot::matrix::TupleRowDiff;
+using mtg::annot::matrix::ITupleRowDiff;
+
 using mtg::annot::matrix::TupleCSCMatrix;
 using mtg::annot::matrix::ColumnMajor;
 using mtg::annot::matrix::BRWT;
@@ -812,8 +814,9 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<std::vector<row_index>> &q
     if (query_rows.empty())
         return {};
 
-    const auto *tuple_row_diff = dynamic_cast<const TupleRowDiff<TupleCSCMatrix<ColumnMajor>> *>(
+    const auto *tuple_row_diff = dynamic_cast<const ITupleRowDiff *>(
         &annotator_->get_matrix());
+
     if (!tuple_row_diff) {
         logger->error("k-mer coordinates are not indexed in this annotator");
         exit(1);

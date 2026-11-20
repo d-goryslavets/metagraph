@@ -12,6 +12,8 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <type_traits>
+#include <utility>
 
 #include "common/vectors/bit_vector_adaptive.hpp"
 #include "common/vector_map.hpp"
@@ -29,8 +31,37 @@ namespace mtg {
 namespace annot {
 namespace matrix {
 
+
+// Detection idiom to check at compile time if class has get_row_tuples_labelled method
+template <typename T, typename = void>
+struct has_get_row_tuples_labelled : std::false_type {};
+
+template <typename T>
+struct has_get_row_tuples_labelled<
+    T,
+    std::void_t<decltype(std::declval<const T&>().get_row_tuples_labelled(
+        std::declval<const std::vector<BinaryMatrix::Row>&>(),
+        std::declval<const std::unordered_set<BinaryMatrix::Column>&>(),
+        std::declval<size_t>()))>> : std::true_type {};
+
+
+class ITupleRowDiff {
+  public:
+    virtual ~ITupleRowDiff() = default;
+
+    virtual std::unordered_set<BinaryMatrix::Column> get_samples_containing_query(const std::vector<BinaryMatrix::Row> &i) const = 0;
+
+    virtual std::vector<std::tuple<std::vector<BinaryMatrix::Row>, BinaryMatrix::Column, uint64_t>> get_traces_with_row_labelled(
+        const std::vector<std::vector<BinaryMatrix::Row>>& queries,
+        const std::unordered_set<BinaryMatrix::Column>& samples_with_query,
+        uint64_t traversal_batch_size,
+        uint64_t flank_length,
+        uint64_t max_query_distance) const = 0;
+
+};
+
 template <class BaseMatrix>
-class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix {
+class TupleRowDiff : public ITupleRowDiff, public IRowDiff, public BinaryMatrix, public MultiIntMatrix {
   public:
     // 1. Define the structures inside the class (Public so the caller can use them)
     struct Interval {
@@ -89,10 +120,10 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
         const std::unordered_set<Column>& samples_with_query,
         uint64_t traversal_batch_size,
         uint64_t flank_length,
-        uint64_t max_query_distance) const;
+        uint64_t max_query_distance) const override;
 
     // pre-traverse graph to find samples with reads containing full query sequence
-    std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const;
+    std::unordered_set<Column> get_samples_containing_query(const std::vector<Row> &i) const override;
 
     std::vector<std::unordered_set<uint64_t>> get_labels_of_rows(const std::vector<Row> &i, size_t num_threads = 1) const;
     
@@ -314,21 +345,27 @@ TupleRowDiff<BaseMatrix>::get_row_tuples(const std::vector<Row> &row_ids, size_t
 
 template <class BaseMatrix>
 std::vector<MultiIntMatrix::RowTuples>
-TupleRowDiff<BaseMatrix>::get_row_tuples_labelled(const std::vector<Row> &row_ids, const std::unordered_set<Column> &labels_of_interest, 
-size_t num_threads) const {
-    std::vector<RowTuples> rows(row_ids.size());
-    call_rows(row_ids,
-        [this, &labels_of_interest](const std::vector<Row> &rd_ids, size_t num_threads) {
-            return diffs_.get_row_tuples_labelled(rd_ids, labels_of_interest, num_threads);
-        },
-        [this, &labels_of_interest](const RowTuples &diff, RowTuples *row) {
-            return add_diff_labelled(diff, row, labels_of_interest);
-        },
-        decode_diffs,
-        [&](size_t i, const RowTuples &row) { rows[i] = row; },
-        num_threads
-    );
-    return rows;
+TupleRowDiff<BaseMatrix>::get_row_tuples_labelled(
+        const std::vector<Row> &row_ids,
+        const std::unordered_set<Column> &labels_of_interest,
+        size_t num_threads) const {
+    if constexpr (has_get_row_tuples_labelled<BaseMatrix>::value) {
+        std::vector<RowTuples> rows(row_ids.size());
+        call_rows(row_ids,
+            [this, &labels_of_interest](const std::vector<Row> &rd_ids, size_t num_threads) {
+                return diffs_.get_row_tuples_labelled(rd_ids, labels_of_interest, num_threads);
+            },
+            [this, &labels_of_interest](const RowTuples &diff, RowTuples *row) {
+                return add_diff_labelled(diff, row, labels_of_interest);
+            },
+            decode_diffs,
+            [&](size_t i, const RowTuples &row) { rows[i] = row; },
+            num_threads
+        );
+        return rows;
+    } else {
+        throw std::runtime_error("get_row_tuples_labelled is not supported for this BaseMatrix");
+    }
 }
 
 
