@@ -269,7 +269,7 @@ if(${CMAKE_BUILD_TYPE} MATCHES GPROFILE)
 endif()
 
 # Debug build type
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
+set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g")
 
 # Link time optimization
 if(LINK_OPT)
