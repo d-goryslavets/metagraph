@@ -516,28 +516,28 @@ class TestAPIClientMultiple(TestingBase):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G1'])
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_1, 3), df.shape)
+        self.assertEqual((self.expected_rows_1, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches_1)
 
     def test_api_query_df_multiple_2(self):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G2'])
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_2, 3), df.shape)
+        self.assertEqual((self.expected_rows_2, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches_2)
 
     def test_api_query_df_multiple_3(self):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G3'])
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_3, 3), df.shape)
+        self.assertEqual((self.expected_rows_3, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches_3)
 
     def test_api_query_df_multiple_12(self):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G1', 'G2'])
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_1 + self.expected_rows_2, 3), df.shape)
+        self.assertEqual((self.expected_rows_1 + self.expected_rows_2, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(),
                          self.expected_matches_1 + self.expected_matches_2)
 
@@ -545,7 +545,7 @@ class TestAPIClientMultiple(TestingBase):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G1', 'G2', 'G3'])
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_1 + self.expected_rows_2 + self.expected_rows_3, 3), df.shape)
+        self.assertEqual((self.expected_rows_1 + self.expected_rows_2 + self.expected_rows_3, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(),
                          self.expected_matches_1 + self.expected_matches_2 + self.expected_matches_3)
 
@@ -553,7 +553,7 @@ class TestAPIClientMultiple(TestingBase):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01)
         df = ret[self.graph_name]
-        self.assertEqual((self.expected_rows_1 + self.expected_rows_2 + self.expected_rows_3, 3), df.shape)
+        self.assertEqual((self.expected_rows_1 + self.expected_rows_2 + self.expected_rows_3, 5), df.shape)
         self.assertEqual(df['kmer_count'].sum(),
                          self.expected_matches_1 + self.expected_matches_2 + self.expected_matches_3)
 
