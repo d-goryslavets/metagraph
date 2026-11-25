@@ -4,7 +4,6 @@
 #include <iterator>
 #include <mutex>
 #include <sstream>
-#include <string_view>
 
 #include <omp.h>
 #include <ips4o.hpp>
@@ -26,6 +25,7 @@
 #include "load/load_annotated_graph.hpp"
 #include "graph/alignment/score_kmer_presence_mask.hpp"
 #include "cli/align.hpp"
+#include "cli/extract_reads.hpp"
 
 
 namespace mtg {
@@ -215,23 +215,39 @@ Json::Value get_label_as_json(const std::string &label) {
 
 
 
-Json::Value SeqSearchResult::to_json(bool verbose_output, size_t k) const {
+Json::Value get_sequence_json(const QuerySequence &sequence,
+                              const std::optional<Alignment> &alignment) {
     Json::Value root;
 
     // Add seq information
-    root[SEQ_DESCRIPTION_JSON_FIELD] = sequence_.name;
+    root[SeqSearchResult::SEQ_DESCRIPTION_JSON_FIELD] = sequence.name;
 
     // Add alignment information if there is any
-    if (alignment_) {
+    if (alignment) {
         // Recover alignment sequence sequence string
-        root[SEQUENCE_JSON_FIELD] = Json::Value(sequence_.sequence);
+        root[SeqSearchResult::SEQUENCE_JSON_FIELD] = Json::Value(sequence.sequence);
 
         // Alignment metrics
-        root[SCORE_JSON_FIELD] = Json::Value(alignment_->score);
-        root[MAX_SCORE_JSON_FIELD] = Json::Value(alignment_->max_score);
-        root[CIGAR_JSON_FIELD] = Json::Value(alignment_->cigar);
-        root[ORIENTATION_JSON_FIELD] = Json::Value(alignment_->orientation);
+        root[SeqSearchResult::SCORE_JSON_FIELD] = Json::Value(alignment->score);
+        root[SeqSearchResult::MAX_SCORE_JSON_FIELD] = Json::Value(alignment->max_score);
+        root[SeqSearchResult::CIGAR_JSON_FIELD] = Json::Value(alignment->cigar);
+        root[SeqSearchResult::ORIENTATION_JSON_FIELD] = Json::Value(alignment->orientation);
     }
+    return root;
+}
+
+std::string get_sequence_name(const QuerySequence &sequence,
+                              const std::optional<Alignment> &alignment) {
+    if (!alignment)
+        return sequence.name;
+
+    // Get modified name if sequence has an alignment result
+    return fmt::format(ALIGNED_SEQ_HEADER_FORMAT, sequence.name, sequence.sequence,
+                       alignment->score, alignment->cigar);
+}
+
+Json::Value SeqSearchResult::to_json(bool verbose_output, size_t k) const {
+    Json::Value root = get_sequence_json(sequence_, alignment_);
 
     // Add discovered labels and extra results
     root["results"] = Json::Value(Json::arrayValue);
@@ -327,18 +343,9 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
     if (suppress_unlabeled && !std::visit([] (auto&& vec) { return vec.size(); }, result_))
         return "";
 
-    std::string output;
-
     // Print sequence ID and name
-    if (alignment_) {
-        // Get modified name if sequence has an alignment result
-        const std::string &mod_seq_name
-            = fmt::format(ALIGNED_SEQ_HEADER_FORMAT, sequence_.name, sequence_.sequence,
-                                   alignment_->score, alignment_->cigar);
-        output = fmt::format("{}\t{}", sequence_.id, mod_seq_name);
-    } else {
-        output = fmt::format("{}\t{}", sequence_.id, sequence_.name);
-    }
+    std::string output = fmt::format("{}\t{}", sequence_.id,
+                                     get_sequence_name(sequence_, alignment_));
 
     // ... with diff result output depending on the type of result being stored.
     if (const auto *v = std::get_if<LabelVec>(&result_)) {
@@ -373,18 +380,6 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
                 });
             }
         }
-    } else if (const auto *v = std::get_if<LabelOverlappingReads>(&result_)) {
-        // output += fmt::format("\n");
-        uint64_t counter = 0;
-        for (const auto & [read_seq, read_lab, pos_in_input, pos_in_ref] : *v) {
-            if (!counter)
-                output += fmt::format("\t{}\t{}\t{}\t{}", read_seq, read_lab, pos_in_input, pos_in_ref);
-            else
-                output += fmt::format("\n{}\t{}\t{}\t{}\t{}\t{}", sequence_.id, sequence_.name, read_seq, read_lab, pos_in_input, pos_in_ref);
-            ++counter;
-        // output += fmt::format("\n");
-        }
-
     } else {
         // Kmer coordinates
         for (const auto &[label, count, tuples, num_kmers_in_target]
@@ -413,10 +408,6 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
                               size_t num_top_labels,
                               double discovery_fraction,
                               double presence_fraction,
-                              uint64_t traversal_batch_size,
-                              uint64_t column_batch_size,
-                              uint64_t flank_length,
-                              uint64_t max_query_distance,
                               const graph::AnnotatedDBG &anno_graph) {
     // Perform a different action depending on the type (specified by config flags)
     SeqSearchResult::result_type result;
@@ -473,18 +464,14 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
             break;
         }
         case READS: {
-            // TODO: add config.label_based option use for --anno-header graphs
-            // TODO: change config.label_based -> config.header_based
-            result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size,
-                                                      column_batch_size, flank_length,
-                                                      max_query_distance);
-            break;
+            // the reads are streamed by extract_reads()
+            throw std::invalid_argument("Reads can't be returned as a search result");
         }
     }
 
     // Create seq search instance and move sequence into it
     return SeqSearchResult(std::move(sequence), std::move(result), {},
-                           query_mode == LABELS || query_mode == COUNTS_SUM || query_mode == READS
+                           query_mode == LABELS || query_mode == COUNTS_SUM
                                ? std::nullopt : std::optional<graph::SearchCut>(cut));
 }
 
@@ -1178,6 +1165,9 @@ int query_graph(Config *config) {
     }
     graph.reset();
 
+    if (config->query_mode == READS)
+        return extract_reads(*config, *anno_graph, aligner_config.get());
+
     size_t k = anno_graph->get_graph().get_k();
 
     // iterate over input files
@@ -1189,9 +1179,6 @@ int query_graph(Config *config) {
                 std::ostringstream ss;
                 ss << result.to_json(config->verbose_output, k) << "\n";
                 std::cout << ss.str();
-            } else if (config->query_mode == READS) {
-                // get_overlapping_reads writes the reads to a file as they are extracted
-                std::cout << "Extracted reads are written in file." << "\n";
             } else {
                 std::cout << result.to_string(config->anno_labels_delimiter,
                                               config->suppress_unlabeled,
@@ -1259,10 +1246,7 @@ SeqSearchResult query_sequence(QuerySequence&& sequence,
     SeqSearchResult result = execute_query(std::move(sequence),
             config.query_mode,
             config.num_top_labels, config.discovery_fraction,
-            config.presence_fraction,
-            config.traversal_batch_size, config.column_batch_size,
-            config.flank_length, config.max_query_distance,
-            anno_graph);
+            config.presence_fraction, anno_graph);
 
     if (aligner_config)
         result.get_alignment() = alignment;
@@ -1314,48 +1298,13 @@ size_t query_fasta(const std::string &file,
     }
 
     if (config.query_batch_size) {
-        if (config.query_mode != COORDS && config.query_mode != READS
-                && !anno_graph.get_coord_to_header()) {
+        if (config.query_mode != COORDS && !anno_graph.get_coord_to_header()) {
             // Construct a query graph and query against it
             return batched_query_fasta(fasta_parser, callback, config, anno_graph, aligner_config);
         } else {
             // TODO: Implement batch mode for query_coords queries
-            if (config.query_mode == READS)
-                logger->warn("Querying reads in batch mode is currently not supported. Querying sequentially...");
-            else
-                logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
+            logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
         }
-    }
-
-    if (config.query_mode == READS && config.joint_query) {
-        std::vector<QuerySequence> stored;
-        size_t num_bp = 0;
-        size_t seq_count = 0;
-        for (const seq_io::kseq_t &kseq : fasta_parser) {
-            stored.push_back(QuerySequence { seq_count++, std::string(kseq.name.s),
-                                             std::string(kseq.seq.s) });
-            num_bp += kseq.seq.l;
-        }
-
-        std::vector<std::string_view> views;
-        views.reserve(stored.size());
-        for (const auto &qs : stored)
-            views.emplace_back(qs.sequence);
-
-        SeqSearchResult::result_type result = anno_graph.get_overlapping_reads(
-            views, config.traversal_batch_size, config.column_batch_size,
-            config.flank_length, config.max_query_distance);
-
-        QuerySequence first = stored.empty()
-            ? QuerySequence { 0, "", "" }
-            : std::move(stored.front());
-        for (size_t i = 1; i < stored.size(); ++i) {
-            first.name += ",";
-            first.name += stored[i].name;
-        }
-
-        callback(SeqSearchResult(std::move(first), std::move(result)));
-        return num_bp;
     }
 
     // Query sequences independently

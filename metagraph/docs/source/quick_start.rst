@@ -592,6 +592,46 @@ Note that if neither ``--query-mode coords`` nor ``--query-mode counts`` is pass
     actual fraction-of-target-covered figure, take the **union** of the k-mer positions
     those triplets cover (merging any overlaps) and divide by ``kmers_in_target``.
 
+.. _extract_reads:
+
+Extract the indexed sequences containing the query
+""""""""""""""""""""""""""""""""""""""""""""""""""
+With the query mode ``reads``, the graph is traversed from the k-mers of the query in both directions, following
+the consecutive k-mer coordinates, to reconstruct the indexed sequences (reads, contigs, genomes) that contain the
+query as-is::
+
+    metagraph query --query-mode reads -i graph.dbg -a annotation.row_diff_brwt_coord.annodbg queries.fa
+
+This requires a graph in the ``basic`` mode and a coordinate-aware annotation of any type.
+Each extracted sequence is written to the standard output, or to the file passed with ``-o``, as soon as it is
+reconstructed. It is a row with six tab-separated columns: the id and the name of the query, the extracted
+sequence, its label, and the first position of their match in the query and in the extracted sequence
+(0-based)::
+
+    0    query1    GCTAGCTAAC    sample1.fa    0    3
+    0    query1    TTGCTAAC      sample2.fa    0    1
+    1    query2    GCTAGCTAAC    sample1.fa    0    5
+
+The rows of different queries may be interleaved if multiple threads are used (``-p``), but every row is complete and
+carries the id of its query. Queries without matches have no rows. With ``--json``, each row is a JSON object with the
+fields ``read``, ``sample``, and ``queries``.
+
+By default, each query is processed independently. With ``--joint-query``, all sequences in an input file form one
+query, and only the sequences containing *all* of them are extracted. There is one row per extracted sequence, with
+the ids, names, and positions of the queries comma-separated in the order of the queries::
+
+    0,1    query1,query2    GCTAGCTAAC    sample1.fa    0,0    3,5
+
+The distance between the joint queries is limited with ``--max-query-distance``, and the length of the sequence
+extracted on each side of the query is limited with ``--flank-length`` (both in k-mers).
+K-mers missing in the graph are ignored at the ends of a query. A query with missing k-mers in the middle has no matches.
+
+.. note::
+    If the ``.seqs`` mapping is available (see :ref:`index_header_coords`), the extracted sequences are cut exactly
+    at the boundaries of the indexed sequences and labeled with their headers. Otherwise, they are labeled with the
+    annotation labels, and two sequences that follow one another in the same label can't be told apart if the
+    second one starts with the last ``k-1`` characters of the first one.
+
 .. _align_nt_coordinates:
 
 Align nucleotide coordinates

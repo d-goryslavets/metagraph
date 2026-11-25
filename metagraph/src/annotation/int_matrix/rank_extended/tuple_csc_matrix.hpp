@@ -1,8 +1,6 @@
 #ifndef __TUPLE_CSC_MATRIX_HPP__
 #define __TUPLE_CSC_MATRIX_HPP__
 
-#include <span>
-#include <unordered_set>
 #include <vector>
 
 #include <sdsl/packed_vector_view.hpp>
@@ -61,11 +59,16 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
 
     // return entries of the matrix -- where each entry is a set of integers
     std::vector<RowTuples> get_row_tuples(std::span<const Row> rows,
-                                          size_t num_threads = 1) const;
+                                          size_t num_threads = 1) const {
+        return decode_row_tuples(rows, [](Column) { return true; }, num_threads);
+    }
 
-    std::vector<RowTuples> get_row_tuples_labelled(std::span<const Row> rows, 
-                                                  const std::unordered_set<Column> &labels_of_interest,
-                                                  size_t num_threads = 1) const;
+    std::vector<RowTuples>
+    get_row_tuples_in_columns(std::span<const Row> rows,
+                              const std::unordered_set<Column> &columns,
+                              size_t num_threads = 1) const {
+        return decode_row_tuples(rows, [&](Column j) { return columns.count(j); }, num_threads);
+    }
 
     uint64_t num_columns() const { return binary_matrix_.num_columns(); }
     uint64_t num_rows() const { return binary_matrix_.num_rows(); }
@@ -91,6 +94,12 @@ class TupleCSCMatrix : public BinaryMatrix, public MultiIntMatrix, public GetEnt
     const BaseMatrix& get_binary_matrix() const { return binary_matrix_; }
 
   private:
+    // decode the tuples in the columns for which |in_columns| returns true
+    template <class InColumns>
+    std::vector<RowTuples> decode_row_tuples(std::span<const Row> rows,
+                                             const InColumns &in_columns,
+                                             size_t num_threads) const;
+
     BaseMatrix binary_matrix_;
     std::vector<Delims> delimiters_;
     std::vector<Values> column_values_;
@@ -126,9 +135,11 @@ uint64_t TupleCSCMatrix<BaseMatrix, Values, Delims>::num_attributes() const {
 }
 
 template <class BaseMatrix, class Values, class Delims>
+template <class InColumns>
 inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(std::span<const Row> rows,
-                                                           size_t num_threads) const {
+TupleCSCMatrix<BaseMatrix, Values, Delims>::decode_row_tuples(std::span<const Row> rows,
+                                                              const InColumns &in_columns,
+                                                              size_t num_threads) const {
     const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
     std::vector<RowTuples> row_tuples(rows.size());
     // TODO: reshape?
@@ -137,36 +148,8 @@ TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples(std::span<const Row> 
         row_tuples[i].reserve(column_ranks[i].size());
         for (auto [j, r] : column_ranks[i]) {
             assert(r >= 1 && "matches can't have zero-rank");
-            size_t begin = delimiters_[j].select1(r) + 1 - r;
-            size_t end = delimiters_[j].select1(r + 1) - r;
-            Tuple tuple;
-            tuple.reserve(end - begin);
-            for (size_t t = begin; t < end; ++t) {
-                tuple.push_back(column_values_[j][t]);
-            }
-            row_tuples[i].emplace_back(j, std::move(tuple));
-        }
-    }
-    return row_tuples;
-}
-
-template <class BaseMatrix, class Values, class Delims>
-inline std::vector<typename TupleCSCMatrix<BaseMatrix, Values, Delims>::RowTuples>
-TupleCSCMatrix<BaseMatrix, Values, Delims>::get_row_tuples_labelled(std::span<const Row> rows, 
-                                                                   const std::unordered_set<Column> &labels_of_interest, 
-                                                                   size_t num_threads) const {
-    const auto &column_ranks = binary_matrix_.get_column_ranks(rows, num_threads);
-    std::vector<RowTuples> row_tuples(rows.size());
-    // TODO: reshape?
-    #pragma omp parallel for num_threads(num_threads)
-    for (size_t i = 0; i < rows.size(); ++i) {
-        row_tuples[i].reserve(column_ranks[i].size());
-        for (auto [j, r] : column_ranks[i]) {
-            assert(r >= 1 && "matches can't have zero-rank");
-            // skip irrelevant columns
-            if (!labels_of_interest.count(j)) {
+            if (!in_columns(j))
                 continue;
-            }
             size_t begin = delimiters_[j].select1(r) + 1 - r;
             size_t end = delimiters_[j].select1(r + 1) - r;
             Tuple tuple;

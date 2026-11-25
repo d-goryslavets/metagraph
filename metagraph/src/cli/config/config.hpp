@@ -41,7 +41,6 @@ class Config {
     bool initialize_bloom = false;
     bool count_kmers = false;
     bool query_presence = false;
-    bool label_based = false;
     bool verbose_output = false;
     bool filter_present = false;
     bool dump_text_anno = false;
@@ -119,16 +118,12 @@ class Config {
 
     uint8_t count_width = 8;
 
-    // Read extraction options
+    // Read extraction options, see graph::ReadExtractionConfig
     uint64_t traversal_batch_size = 500;
-    // Number of columns (e.g. samples) for which
-    // coordinate annotations will be decompressed
-    // during read extraction traversal at once
-    uint64_t column_batch_size = 0; // by default will be set to the total number of columns
-    uint64_t flank_length = 25000;
-    uint64_t max_query_distance = 25000;
+    uint64_t column_batch_size = 0;
+    uint64_t flank_length = 25'000;
+    uint64_t max_query_distance = 25'000;
     bool joint_query = false;
-    std::string extracted_reads_outfile = "extracted_reads.tsv"; // TODO: use in the read extraction API
 
     // Alignment options
     bool alignment_edit_distance = false;
@@ -174,7 +169,6 @@ class Config {
     std::vector<std::string> infbase_annotators;
     std::string outfbase;
     std::string infbase;
-    std::string manifest_file;
     std::string rename_instructions_file;
     std::string remap_graph;
     std::string refpath;

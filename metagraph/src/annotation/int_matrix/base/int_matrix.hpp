@@ -1,6 +1,8 @@
 #ifndef __INT_MATRIX_HPP__
 #define __INT_MATRIX_HPP__
 
+#include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "annotation/binary_matrix/base/binary_matrix.hpp"
@@ -44,6 +46,14 @@ class MultiIntMatrix : public IntMatrix {
     // return entries of the matrix -- where each entry is a set of integers
     virtual std::vector<RowTuples> get_row_tuples(std::span<const BinaryMatrix::Row> rows,
                                                   size_t num_threads = 1) const = 0;
+
+    // Same as get_row_tuples, but return only the entries in |columns|. By default, all
+    // entries are decoded and then filtered. Matrices that can skip the other columns
+    // when decoding override this.
+    virtual std::vector<RowTuples>
+    get_row_tuples_in_columns(std::span<const BinaryMatrix::Row> rows,
+                              const std::unordered_set<BinaryMatrix::Column> &columns,
+                              size_t num_threads = 1) const;
 };
 
 } // namespace matrix

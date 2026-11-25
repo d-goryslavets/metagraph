@@ -2034,5 +2034,185 @@ class TestQueryRepeatedKmerDecodedOnce(TestingBase):
         self.assertEqual(':' + self._ranges(), value)
 
 
+class TestReadExtraction(TestingBase):
+    """Query mode 'reads': extract the indexed sequences that contain the query"""
+
+    ANNO_TYPES = ['column_coord', 'brwt_coord',
+                  'row_diff_coord', 'row_diff_brwt_coord', 'row_diff_disk_coord']
+    k = 11
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tempdir = TemporaryDirectory()
+        rng = np.random.default_rng(1)
+
+        def random_seq(length):
+            return ''.join(rng.choice(list('ACGT'), length))
+
+        shared = random_seq(30)
+        cls.shared = shared
+        cls.query_b = random_seq(20)
+        # all records share a segment
+        cls.reads = {
+            'r1': random_seq(100) + shared + random_seq(50),
+            'r2': random_seq(20) + shared + random_seq(40) + cls.query_b + random_seq(10),
+            'r3': shared + random_seq(600),
+        }
+        cls.files = {cls.tempdir.name + '/f1.fa': ['r1', 'r2'],
+                     cls.tempdir.name + '/f2.fa': ['r3']}
+        for fname, names in cls.files.items():
+            cls._write_fasta(fname, [(name, cls.reads[name]) for name in names])
+        cls.file_of = {name: fname for fname, names in cls.files.items() for name in names}
+
+        cls.graph = cls.tempdir.name + '/graph.dbg'
+        cls._build_graph(list(cls.files), cls.tempdir.name + '/graph', cls.k, 'succinct')
+        for anno_type in cls.ANNO_TYPES:
+            base = f'{cls.tempdir.name}/{anno_type}'
+            cls._annotate_graph(list(cls.files), cls.graph, base, anno_type, anno_type='filename')
+        # an annotation with a header index
+        cls.anno_base = f'{cls.tempdir.name}/headers'
+        cls._annotate_graph(list(cls.files), cls.graph, cls.anno_base, 'row_diff_coord',
+                            anno_type='filename', num_threads=1)  # keep the order of the columns
+        res = subprocess.run([f'{METAGRAPH} annotate --anno-filename --index-header-coords '
+                              f'-i {cls.graph} -o {cls.anno_base} ' + ' '.join(cls.files)],
+                             shell=True, stdout=PIPE, stderr=PIPE)
+        assert res.returncode == 0, res.stderr.decode()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tempdir.cleanup()
+
+    @staticmethod
+    def _write_fasta(fname, records):
+        with open(fname, 'w') as f:
+            f.write(''.join(f'>{name}\n{seq}\n' for name, seq in records))
+
+    def _run(self, queries, flags='', anno=None):
+        """Run in an empty directory, where no files may be created"""
+        anno = anno or self.tempdir.name + '/row_diff_coord.row_diff_coord.annodbg'
+        with TemporaryDirectory() as cwd, TemporaryDirectory() as query_dir:
+            query = query_dir + '/query.fa'
+            self._write_fasta(query, queries)
+            res = subprocess.run(f'{METAGRAPH} query --query-mode reads '
+                                 f'-i {self.graph} -a {anno} {flags} {query}'.split(),
+                                 stdout=PIPE, stderr=PIPE, cwd=cwd)
+            self.assertEqual([], os.listdir(cwd))
+        return res
+
+    def _query(self, *args, **kwargs):
+        res = self._run(*args, **kwargs)
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+        return sorted(res.stdout.decode().splitlines())
+
+    def _row(self, query_id, query_name, read, query, label=None):
+        seq = self.reads[read]
+        return '\t'.join([str(query_id), query_name, seq, label or self.file_of[read],
+                          '0', str(seq.index(query))])
+
+    @parameterized.expand(ANNO_TYPES)
+    def test_multiple_queries(self, anno_type):
+        queries = [('a', self.shared), ('b', self.query_b), ('none', 'ACGT' * 10),
+                   ('long', self.reads['r3'])]
+        expected = sorted([self._row(0, 'a', 'r1', self.shared),
+                           self._row(0, 'a', 'r2', self.shared),
+                           self._row(0, 'a', 'r3', self.shared),
+                           self._row(1, 'b', 'r2', self.query_b),
+                           self._row(3, 'long', 'r3', self.reads['r3'])])
+        anno = f'{self.tempdir.name}/{anno_type}{anno_file_extension[anno_type]}'
+        for flags in ['', '-p 4', '--column-batch-size 1 --traversal-batch-size 1']:
+            self.assertEqual(expected, self._query(queries, flags, anno))
+
+    @parameterized.expand(ANNO_TYPES)
+    def test_joint_query(self, anno_type):
+        anno = f'{self.tempdir.name}/{anno_type}{anno_file_extension[anno_type]}'
+        queries = [('b', self.query_b), ('a', self.shared)]
+        seq = self.reads['r2']
+        self.assertEqual(
+            ['\t'.join(['0,1', 'b,a', seq, self.file_of['r2'], '0,0',
+                        f'{seq.index(self.query_b)},{seq.index(self.shared)}'])],
+            self._query(queries, '--joint-query', anno))
+        self.assertEqual([], self._query(queries, '--joint-query --max-query-distance 50', anno))
+        self.assertEqual([], self._query(queries + [('none', 'ACGT' * 10)], '--joint-query', anno))
+
+    def test_flank_length(self):
+        i = self.reads['r2'].index(self.query_b)
+        self.assertEqual(['\t'.join(['0', 'b', self.reads['r2'][i - 5:i + len(self.query_b) + 5],
+                                     self.file_of['r2'], '0', '5'])],
+                         self._query([('b', self.query_b)], '--flank-length 5'))
+
+    def test_header_labels(self):
+        anno = self.anno_base + anno_file_extension['row_diff_coord']
+        expected = [self._row(0, 'a', read, self.shared, label=read) for read in self.reads]
+        self.assertEqual(sorted(expected), self._query([('a', self.shared)], anno=anno))
+        expected = [self._row(0, 'a', read, self.shared) for read in self.reads]
+        self.assertEqual(sorted(expected),
+                         self._query([('a', self.shared)], '--no-coord-mapping', anno=anno))
+
+    def test_json(self):
+        rows = [json.loads(line) for line in self._query([('a', self.shared)], '--json')]
+        self.assertEqual(
+            sorted((seq, self.file_of[read], seq.index(self.shared))
+                   for read, seq in self.reads.items()),
+            sorted((row['read'], row['sample'], row['queries'][0]['read_pos']) for row in rows))
+        for row in rows:
+            self.assertEqual(1, len(row['queries']))
+            self.assertEqual((0, 'a', 0), tuple(row['queries'][0][key]
+                                                for key in ['id', 'seq_description', 'query_pos']))
+
+        rows = self._query([('a', self.shared), ('b', self.query_b)], '--joint-query --json')
+        self.assertEqual(1, len(rows))
+        self.assertEqual(['a', 'b'], [query['seq_description']
+                                      for query in json.loads(rows[0])['queries']])
+
+    def test_output_file(self):
+        queries = [('a', self.shared), ('b', self.query_b)]
+        out = self.tempdir.name + '/reads.tsv'
+        self.assertEqual([], self._query(queries, f'-o {out}'))
+        with open(out) as f:
+            self.assertEqual(self._query(queries), sorted(f.read().splitlines()))
+
+    @unittest.skipIf(PROTEIN_MODE, "No reverse complement for protein alphabets")
+    def test_fwd_and_reverse(self):
+        complement = self.query_b[::-1].translate(str.maketrans('ACGT', 'TGCA'))
+        self.assertEqual([], self._query([('b', complement)]))
+        self.assertEqual([self._row(1, 'b', 'r2', self.query_b)],
+                         self._query([('b', complement)], '--fwd-and-reverse'))
+
+    @unittest.skipIf(PROTEIN_MODE, "The alignment scores are for DNA")
+    def test_align(self):
+        # a substitution in the middle of the query is corrected by the alignment
+        i = len(self.shared) // 2
+        query = self.shared[:i] + ('C' if self.shared[i] != 'C' else 'G') + self.shared[i + 1:]
+        self.assertEqual([], self._query([('a', query)]))
+        rows = self._query([('a', query)], '--align --align-min-seed-length 7')
+        self.assertEqual(sorted(self.reads.values()), sorted(row.split('\t')[2] for row in rows))
+
+    def test_write_error(self):
+        if not os.path.exists('/dev/full'):
+            self.skipTest('requires /dev/full')
+        res = self._run([('a', self.shared)], '-o /dev/full')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Cannot write extracted reads', res.stderr.decode())
+
+    @parameterized.expand([
+        ('--joint-query --fwd-and-reverse', "can't be used with --fwd-and-reverse"),
+        ('--traversal-batch-size 0', '--traversal-batch-size must be > 0'),
+        ('--flank-length -1', 'must be a whole number'),
+        ('--query-mode labels --joint-query', '--joint-query requires --query-mode reads'),
+    ])
+    def test_bad_options(self, flags, error):
+        res = self._run([('a', self.shared)], flags)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(error, res.stderr.decode())
+
+    def test_no_coordinates(self):
+        base = self.tempdir.name + '/binary'
+        self._annotate_graph(list(self.files), self.graph, base, 'row_diff_brwt',
+                             anno_type='filename')
+        res = self._run([('a', self.shared)], anno=base + anno_file_extension['row_diff_brwt'])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('does not support k-mer coordinate queries', res.stderr.decode())
+
+
 if __name__ == '__main__':
     unittest.main()

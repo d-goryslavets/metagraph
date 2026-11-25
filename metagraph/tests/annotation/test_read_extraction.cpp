@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -10,6 +12,9 @@
 #include "test_annotated_dbg_helpers.hpp"
 
 #include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
+#include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
+#include "graph/read_extraction.hpp"
+#include "graph/representation/hash/dbg_hash_fast.hpp"
 #include "graph/representation/succinct/dbg_succinct.hpp"
 
 namespace {
@@ -18,7 +23,9 @@ using namespace mtg;
 using namespace mtg::graph;
 using namespace mtg::test;
 
-using Extracted = std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>>;
+// read, label, positions of the queries in the queries and in the read
+using Positions = std::vector<uint64_t>;
+using Extracted = std::vector<std::tuple<std::string, std::string, Positions, Positions>>;
 
 std::unique_ptr<AnnotatedDBG> make_coord_graph(uint64_t k,
                                                const std::vector<std::string> &sequences,
@@ -28,135 +35,183 @@ std::unique_ptr<AnnotatedDBG> make_coord_graph(uint64_t k,
         k, sequences, labels, DeBruijnGraph::BASIC, true, coord_starts);
 }
 
-Extracted sorted(Extracted result) {
+// all reads in a sorted order
+Extracted extract(const AnnotatedDBG &anno_graph,
+                  const std::vector<std::string_view> &queries,
+                  const ReadExtractionConfig &config = {}) {
+    Extracted result;
+    ReadExtractor(anno_graph, config).call_reads(queries, [&](ExtractedRead&& read) {
+        Positions query_pos;
+        Positions read_pos;
+        for (const auto &match : read.matches) {
+            query_pos.push_back(match.query_pos);
+            read_pos.push_back(match.read_pos);
+        }
+        result.emplace_back(read.sequence, read.label, query_pos, read_pos);
+    });
     std::sort(result.begin(), result.end());
     return result;
 }
 
-TEST(ReadExtraction, LinearSharedKmer) {
-    const uint64_t k = 4;
-    const std::vector<std::string> sequences { "CAATGCTGCTAATGCTT", "CAATGCTT" };
-    const std::vector<std::string> labels { "A", "B" };
-    auto anno_graph = make_coord_graph(k, sequences, labels);
+template <typename GraphAnnotationPair>
+class ReadExtractionTest : public ::testing::Test {};
 
-    auto obs = sorted(anno_graph->get_overlapping_reads("AATG", 50, 2));
+typedef ::testing::Types<std::pair<DBGSuccinct, annot::RowDiffColumnAnnotator>,
+                         std::pair<DBGHashFast, annot::RowDiffColumnAnnotator>,
+                         std::pair<DBGSuccinct, annot::ColumnCompressed<>>,
+                         std::pair<DBGHashFast, annot::ColumnCompressed<>>> GraphAnnotationTypes;
+TYPED_TEST_SUITE(ReadExtractionTest, GraphAnnotationTypes);
+
+TYPED_TEST(ReadExtractionTest, LinearSharedKmer) {
+    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
+                                       typename TypeParam::second_type>(
+        4, { "CAATGCTGCTAATGCTT", "CAATGCTT" }, { "A", "B" }, DeBruijnGraph::BASIC, true);
+
     Extracted ref {
-        { "CAATGCTGCTAATGCTT", "A", 0, 1 },
-        { "CAATGCTT", "B", 0, 1 },
+        { "CAATGCTGCTAATGCTT", "A", { 0 }, { 1 } },
+        { "CAATGCTT", "B", { 0 }, { 1 } },
     };
-    EXPECT_EQ(sorted(ref), obs);
+    EXPECT_EQ(ref, extract(*anno_graph, { "AATG" }));
+    // the batch sizes don't affect the result
+    for (uint64_t traversal_batch_size : { 1, 2, 50 }) {
+        for (uint64_t column_batch_size : { 1, 2, 3 }) {
+            EXPECT_EQ(ref, extract(*anno_graph, { "AATG" },
+                                   { .traversal_batch_size = traversal_batch_size,
+                                     .column_batch_size = column_batch_size }));
+        }
+    }
 }
 
 TEST(ReadExtraction, MultiQueryAnd) {
-    const uint64_t k = 4;
-    const std::vector<std::string> sequences { "CAATGCTGCTAATGCTT", "CAATGCTT" };
-    const std::vector<std::string> labels { "A", "B" };
-    auto anno_graph = make_coord_graph(k, sequences, labels);
+    auto anno_graph = make_coord_graph(4, { "CAATGCTGCTAATGCTT", "CAATGCTT" }, { "A", "B" });
 
-    const std::vector<std::string_view> queries { "GCTG", "AATG" };
-    auto obs = anno_graph->get_overlapping_reads(queries, 50, 2);
-    ASSERT_EQ(1u, obs.size());
-    EXPECT_EQ(std::make_tuple(std::string("CAATGCTGCTAATGCTT"), std::string("A"),
-                              uint64_t{0}, uint64_t{4}),
-              obs[0]);
+    // one read with the first match of each query, in the order of the queries
+    EXPECT_EQ((Extracted {{ "CAATGCTGCTAATGCTT", "A", { 0, 0 }, { 4, 1 } }}),
+              extract(*anno_graph, { "GCTG", "AATG" }));
+    EXPECT_EQ((Extracted {{ "CAATGCTGCTAATGCTT", "A", { 0, 0 }, { 1, 4 } }}),
+              extract(*anno_graph, { "AATG", "GCTG" }));
 }
 
 TEST(ReadExtraction, BranchUsesCoordinates) {
-    const uint64_t k = 4;
-    const std::vector<std::string> sequences { "ACGTAAAA", "ACGTCCCC" };
-    const std::vector<std::string> labels { "A", "B" };
-    auto anno_graph = make_coord_graph(k, sequences, labels);
+    auto anno_graph = make_coord_graph(4, { "ACGTAAAA", "ACGTCCCC" }, { "A", "B" });
 
-    auto shared = sorted(anno_graph->get_overlapping_reads("ACGT", 8, 2));
-    Extracted shared_ref {
-        { "ACGTAAAA", "A", 0, 0 },
-        { "ACGTCCCC", "B", 0, 0 },
-    };
-    EXPECT_EQ(sorted(shared_ref), shared);
-
-    auto only_b = anno_graph->get_overlapping_reads("CCCC", 8, 2);
-    ASSERT_EQ(1u, only_b.size());
-    EXPECT_EQ(std::make_tuple(std::string("ACGTCCCC"), std::string("B"),
-                              uint64_t{0}, uint64_t{4}),
-              only_b[0]);
+    EXPECT_EQ((Extracted { { "ACGTAAAA", "A", { 0 }, { 0 } }, { "ACGTCCCC", "B", { 0 }, { 0 } } }),
+              extract(*anno_graph, { "ACGT" }));
+    EXPECT_EQ((Extracted {{ "ACGTCCCC", "B", { 0 }, { 4 } }}), extract(*anno_graph, { "CCCC" }));
 }
 
 TEST(ReadExtraction, TandemRepeatFollowsCoordinates) {
-    const uint64_t k = 3;
-    const std::string seq = "ACACACACAC";
-    auto anno_graph = make_coord_graph(k, { seq }, { "A" });
+    auto anno_graph = make_coord_graph(3, { "ACACACACAC" }, { "A" });
 
-    auto obs = anno_graph->get_overlapping_reads("ACA", 20, 1);
-    ASSERT_EQ(1u, obs.size());
-    EXPECT_EQ(seq, std::get<0>(obs[0]));
-    EXPECT_EQ("A", std::get<1>(obs[0]));
+    // the read is extracted once, for k-mers repeated in the read and in the query
+    for (std::string_view query : { "ACA", "ACACA", "ACACACACAC" }) {
+        EXPECT_EQ((Extracted {{ "ACACACACAC", "A", { 0 }, { 0 } }}), extract(*anno_graph, { query }));
+    }
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "ACACACACACAC" }));
 }
 
 TEST(ReadExtraction, WindowCrop) {
-    const uint64_t k = 4;
-    const std::string seq = "ATGCGGATTACAATGCGTCCGGAT";
-    auto anno_graph = make_coord_graph(k, { seq }, { "A" });
+    auto anno_graph = make_coord_graph(4, { "ATGCGGATTACAATGCGTCCGGAT" }, { "A" });
 
-    auto obs = anno_graph->get_overlapping_reads("TACA", 20, 1, /*flank_length=*/2);
-    ASSERT_EQ(1u, obs.size());
-    EXPECT_EQ(std::make_tuple(std::string("ATTACAAT"), std::string("A"),
-                              uint64_t{0}, uint64_t{2}),
-              obs[0]);
+    EXPECT_EQ((Extracted {{ "ATTACAAT", "A", { 0 }, { 2 } }}),
+              extract(*anno_graph, { "TACA" }, { .flank_length = 2 }));
+    EXPECT_EQ((Extracted {{ "TACA", "A", { 0 }, { 0 } }}),
+              extract(*anno_graph, { "TACA" }, { .flank_length = 0 }));
 }
 
 TEST(ReadExtraction, MaxQueryDistance) {
-    const uint64_t k = 4;
     const std::string source = "ATGCGGATCATTGCTAGATCGATGCTATGACCGGATTCATG";
-    auto anno_graph = make_coord_graph(k, { source }, { "A" });
+    auto anno_graph = make_coord_graph(4, { source }, { "A" });
 
-    const std::vector<std::string_view> queries { "CATT", "TGAC" };
-    auto too_close = anno_graph->get_overlapping_reads(queries, 20, 1, 25000, 5);
-    EXPECT_TRUE(too_close.empty());
-
-    auto far_enough = anno_graph->get_overlapping_reads(queries, 20, 1, 25000, 20);
-    ASSERT_EQ(1u, far_enough.size());
-    EXPECT_EQ(source, std::get<0>(far_enough[0]));
-    EXPECT_EQ("A", std::get<1>(far_enough[0]));
-    EXPECT_EQ(8u, std::get<3>(far_enough[0]));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "CATT", "TGAC" }, { .max_query_distance = 5 }));
+    EXPECT_EQ((Extracted {{ source, "A", { 0, 0 }, { 8, 27 } }}),
+              extract(*anno_graph, { "CATT", "TGAC" }, { .max_query_distance = 20 }));
 }
 
 TEST(ReadExtraction, MultipleReadsPerLabel) {
-    const uint64_t k = 4;
     // two reads containing the query and one without it, all with the same label
     const std::vector<std::string> sequences {
         "ATGCGGATTACAATG", "CCTGATTACAGCTTC", "GGTCAAGGC"
     };
-    auto anno_graph = make_coord_graph(k, sequences, { "A", "A", "A" }, { 0, 12, 24 });
+    auto anno_graph = make_coord_graph(4, sequences, { "A", "A", "A" }, { 0, 12, 24 });
 
-    Extracted ref {
-        { sequences[0], "A", 0, 5 },
-        { sequences[1], "A", 0, 3 },
-    };
-    EXPECT_EQ(sorted(ref), sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1)));
+    EXPECT_EQ((Extracted { { sequences[0], "A", { 0 }, { 5 } }, { sequences[1], "A", { 0 }, { 3 } } }),
+              extract(*anno_graph, { "GATTACA" }));
 
     // the flanks are cropped at the ends of each read
-    EXPECT_EQ(sorted({ { "CGGATTACAAT", "A", 0, 2 }, { "CTGATTACAGC", "A", 0, 2 } }),
-              sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1, /*flank_length=*/2)));
-    EXPECT_EQ(sorted({ { "TGCGGATTACAATG", "A", 0, 4 }, { "CCTGATTACAGCTT", "A", 0, 3 } }),
-              sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1, /*flank_length=*/4)));
+    EXPECT_EQ((Extracted { { "CGGATTACAAT", "A", { 0 }, { 2 } }, { "CTGATTACAGC", "A", { 0 }, { 2 } } }),
+              extract(*anno_graph, { "GATTACA" }, { .flank_length = 2 }));
+    EXPECT_EQ((Extracted { { "CCTGATTACAGCTT", "A", { 0 }, { 3 } }, { "TGCGGATTACAATG", "A", { 0 }, { 4 } } }),
+              extract(*anno_graph, { "GATTACA" }, { .flank_length = 4 }));
 
     // queries must match in the same read
-    const std::vector<std::string_view> same { "GCGG", "CAAT" };
-    auto joint = anno_graph->get_overlapping_reads(same, 20, 1);
-    ASSERT_EQ(1u, joint.size());
-    EXPECT_EQ(sequences[0], std::get<0>(joint[0]));
-    const std::vector<std::string_view> different { "GCGG", "CTTC" };
-    EXPECT_TRUE(anno_graph->get_overlapping_reads(different, 20, 1).empty());
+    EXPECT_EQ((Extracted {{ sequences[0], "A", { 0, 0 }, { 2, 10 } }}),
+              extract(*anno_graph, { "GCGG", "CAAT" }));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "GCGG", "CTTC" }));
+}
+
+TEST(ReadExtraction, SequenceHeaders) {
+    // the second read starts with the last k-1 characters of the first one, hence there
+    // is an edge between the last k-mer of the first read and the first k-mer of the second
+    const std::vector<std::string> sequences { "ATGCGGATTACA", "ACAGCTTC" };
+    auto anno_graph = make_coord_graph(4, sequences, { "A", "A" }, { 0, 9 });
+
+    // without the header index, the reads can't be told apart
+    EXPECT_EQ((Extracted {{ "ATGCGGATTACAGCTTC", "A", { 0 }, { 5 } }}),
+              extract(*anno_graph, { "GATT" }));
+
+    anno_graph = with_coord_to_header(std::move(anno_graph), {{ "read_1", "read_2" }}, {{ 9, 5 }});
+    EXPECT_EQ((Extracted {{ sequences[0], "read_1", { 0 }, { 5 } }}), extract(*anno_graph, { "GATT" }));
+    EXPECT_EQ((Extracted {{ sequences[1], "read_2", { 0 }, { 3 } }}), extract(*anno_graph, { "GCTT" }));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "TTACAGC" }));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "GATT", "GCTT" }));
 }
 
 TEST(ReadExtraction, MissingQuery) {
-    const uint64_t k = 4;
-    auto anno_graph = make_coord_graph(k, { "CAATGCTT" }, { "A" });
+    auto anno_graph = make_coord_graph(4, { "CAATGCTT" }, { "A" });
 
-    EXPECT_TRUE(anno_graph->get_overlapping_reads("GGGG", 20, 1).empty());
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "GGGG" }));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "AATG", "GGGG" }));
+    // shorter than k
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "AAT" }));
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, {}));
+}
 
-    const std::vector<std::string_view> queries { "AATG", "GGGG" };
-    EXPECT_TRUE(anno_graph->get_overlapping_reads(queries, 20, 1).empty());
+TEST(ReadExtraction, MissingKmers) {
+    auto anno_graph = make_coord_graph(4, { "GGCTAAAAAAATCCG" }, { "A" });
+
+    // missing k-mers at the ends of the query are ignored
+    EXPECT_EQ((Extracted {{ "GGCTAAAAAAATCCG", "A", { 1 }, { 1 } }}),
+              extract(*anno_graph, { "CGCTAAC" }));
+    // the k-mers around the missing ones are consecutive in the read, but not in the query
+    EXPECT_EQ((Extracted {}), extract(*anno_graph, { "AAAACAAAA" }));
+}
+
+// the reads are passed to the callback as they are extracted, and the errors are passed through
+TEST(ReadExtraction, Streaming) {
+    auto anno_graph = make_coord_graph(4, { "CAATGCTGC", "CAATGCTT" }, { "A", "B" });
+
+    size_t num_reads = 0;
+    const std::vector<std::string_view> queries { "AATG" };
+    EXPECT_THROW(ReadExtractor(*anno_graph).call_reads(queries, [&](ExtractedRead&&) {
+        num_reads++;
+        throw std::runtime_error("stop");
+    }), std::runtime_error);
+    EXPECT_EQ(1u, num_reads);
+}
+
+TEST(ReadExtraction, Unsupported) {
+    // no coordinates
+    auto binary = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(4, { "CAATGCTT" }, { "A" });
+    EXPECT_THROW(ReadExtractor { *binary }, std::invalid_argument);
+
+    auto canonical = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
+        5, { "CAATGCTT" }, { "A" }, DeBruijnGraph::CANONICAL, true);
+    EXPECT_THROW(ReadExtractor { *canonical }, std::invalid_argument);
+
+    auto anno_graph = make_coord_graph(4, { "CAATGCTT" }, { "A" });
+    EXPECT_THROW((ReadExtractor { *anno_graph, { .traversal_batch_size = 0 } }),
+                 std::invalid_argument);
 }
 
 } // namespace

@@ -4,8 +4,6 @@
 #include <cassert>
 #include <memory>
 #include <mutex>
-#include <string_view>
-#include <vector>
 
 #include <sdsl/int_vector.hpp>
 
@@ -140,30 +138,6 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
                          double discovery_fraction,
                          double presence_fraction, SearchCut *cut = nullptr) const;
 
-    /** Returns labeled source windows that contain the query sequence. */
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(std::string_view sequence,
-                          uint64_t traversal_batch_size,
-                          uint64_t column_batch_size,
-                          uint64_t flank_length = 25000,
-                          uint64_t max_query_distance = 25000) const;
-
-    /** Returns labeled source windows that contain every query sequence. */
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(const std::vector<std::string_view> &sequences,
-                          uint64_t traversal_batch_size,
-                          uint64_t column_batch_size,
-                          uint64_t flank_length = 25000,
-                          uint64_t max_query_distance = 25000) const;
-
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(const std::vector<node_index> &nodes,
-                          std::string_view sequence,
-                          uint64_t traversal_batch_size,
-                          uint64_t column_batch_size,
-                          uint64_t flank_length = 25000,
-                          uint64_t max_query_distance = 25000) const;
-
     // With |num_passed|, also report how many labels passed the thresholds, before the cut
     // to |num_top_labels|. With |header_labels| false, rank annotation columns even when a
     // CoordToHeader mapping is loaded.
@@ -176,15 +150,6 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
                              bool header_labels = true, SearchCut *cut = nullptr) const;
 
   private:
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-    get_overlapping_reads(const std::vector<std::vector<row_index>> &query_rows,
-                          std::string_view output_sequence,
-                          uint64_t first_query_pos_in_input,
-                          uint64_t traversal_batch_size,
-                          uint64_t column_batch_size,
-                          uint64_t flank_length,
-                          uint64_t max_query_distance) const;
-
     template <class Values>
     std::vector<std::tuple<Label, size_t, Values>>
     get_header_results(std::string_view sequence, size_t num_top_labels,

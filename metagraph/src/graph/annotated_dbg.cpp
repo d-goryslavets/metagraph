@@ -2,10 +2,8 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <fstream> // for batched read extaction DEBUG
 #include <limits>
 #include <span>
-#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -14,23 +12,17 @@
 #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
 #include "annotation/binary_matrix/row_vector/unique_row_binmat.hpp"
 #include "annotation/int_matrix/base/int_matrix.hpp"
-#include "annotation/binary_matrix/multi_brwt/brwt.hpp"
 #include "annotation/int_matrix/csr_matrix/csr_matrix.hpp"
 #include "graph/representation/canonical_dbg.hpp"
 #include "annotation/coord_to_header.hpp"
 #include "common/algorithms.hpp"
 #include "common/utils/template_utils.hpp"
 #include "common/vector_map.hpp"
-#include "common/logger.hpp"
-#include "annotation/int_matrix/row_diff/tuple_row_diff.hpp"
-#include "annotation/int_matrix/rank_extended/tuple_csc_matrix.hpp"
-#include "graph/alignment/alignment.hpp"
 
 
 namespace mtg {
 namespace graph {
 
-using mtg::common::logger;
 using mtg::annot::matrix::BinaryMatrix;
 using mtg::annot::matrix::IntMatrix;
 using mtg::annot::matrix::MultiIntMatrix;
@@ -38,13 +30,6 @@ using mtg::annot::matrix::CSRMatrix;
 using mtg::annot::matrix::RowMajor;
 using mtg::annot::matrix::UniqueRowBinmat;
 using Column = mtg::annot::matrix::BinaryMatrix::Column;
-
-using mtg::annot::matrix::TupleRowDiff;
-using mtg::annot::matrix::ITupleRowDiff;
-
-using mtg::annot::matrix::TupleCSCMatrix;
-using mtg::annot::matrix::ColumnMajor;
-using mtg::annot::matrix::BRWT;
 
 typedef AnnotatedDBG::Label Label;
 typedef std::pair<Label, size_t> StringCountPair;
@@ -1320,197 +1305,6 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
         with_lengths.emplace_back(std::move(label), count, std::move(coords), 0);
     }
     return with_lengths;
-}
-
-std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(std::string_view sequence,
-                                    uint64_t traversal_batch_size,
-                                    uint64_t column_batch_size,
-                                    uint64_t flank_length,
-                                    uint64_t max_query_distance) const {
-    if (sequence.size() < dbg_.get_k())
-        return {};
-
-    std::vector<node_index> nodes = map_to_nodes(dbg_, sequence);
-    return get_overlapping_reads(nodes, sequence, traversal_batch_size, column_batch_size,
-                                 flank_length, max_query_distance);
-}
-
-std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<std::string_view> &sequences,
-                                    uint64_t traversal_batch_size,
-                                    uint64_t column_batch_size,
-                                    uint64_t flank_length,
-                                    uint64_t max_query_distance) const {
-    if (sequences.empty())
-        return {};
-
-    std::vector<std::vector<row_index>> query_rows;
-    query_rows.reserve(sequences.size());
-    uint64_t first_query_pos = 0;
-
-    for (size_t q = 0; q < sequences.size(); ++q) {
-        if (sequences[q].size() < dbg_.get_k())
-            return {};
-
-        std::vector<node_index> nodes = map_to_nodes(dbg_, sequences[q]);
-        std::vector<row_index> rows;
-        rows.reserve(nodes.size());
-        size_t first_pos = 0;
-        bool found = false;
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            if (nodes[i] > 0) {
-                if (!found) {
-                    first_pos = i;
-                    found = true;
-                }
-                rows.push_back(graph_to_anno_index(nodes[i]));
-            }
-        }
-        if (rows.empty())
-            return {};
-        if (q == 0)
-            first_query_pos = first_pos;
-        query_rows.push_back(std::move(rows));
-    }
-
-    return get_overlapping_reads(query_rows, sequences.front(), first_query_pos,
-                                 traversal_batch_size, column_batch_size,
-                                 flank_length, max_query_distance);
-}
-
-std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<node_index> &nodes,
-                                    std::string_view sequence,
-                                    uint64_t traversal_batch_size,
-                                    uint64_t column_batch_size,
-                                    uint64_t flank_length,
-                                    uint64_t max_query_distance) const {
-    if (nodes.empty())
-        return {};
-
-    std::vector<row_index> rows;
-    rows.reserve(nodes.size());
-    std::vector<size_t> rows_to_nodes;
-
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        if (nodes[i] > 0) {
-            rows.push_back(graph_to_anno_index(nodes[i]));
-            rows_to_nodes.push_back(i);
-        }
-    }
-
-    if (rows.empty())
-        return {};
-
-    return get_overlapping_reads(std::vector<std::vector<row_index>>{ std::move(rows) },
-                                 sequence, rows_to_nodes.front(),
-                                 traversal_batch_size, column_batch_size,
-                                 flank_length, max_query_distance);
-}
-
-std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
-AnnotatedDBG::get_overlapping_reads(const std::vector<std::vector<row_index>> &query_rows,
-                                    std::string_view output_sequence,
-                                    uint64_t first_query_pos_in_input,
-                                    uint64_t traversal_batch_size,
-                                    uint64_t column_batch_size,
-                                    uint64_t flank_length,
-                                    uint64_t max_query_distance) const {
-    if (query_rows.empty())
-        return {};
-
-    const auto *tuple_row_diff = dynamic_cast<const ITupleRowDiff *>(
-        &annotator_->get_matrix());
-
-    if (!tuple_row_diff) {
-        logger->error("k-mer coordinates are not indexed in this annotator");
-        exit(1);
-    }
-
-    logger->trace("Extracting reads...");
-    logger->trace("Getting samples with query...");
-
-    std::unordered_set<Column> samples_with_query;
-    bool first_query = true;
-    for (const auto &rows : query_rows) {
-        if (rows.empty())
-            return {};
-        auto samples = tuple_row_diff->get_samples_containing_query(rows);
-        if (first_query) {
-            samples_with_query = std::move(samples);
-            first_query = false;
-        } else {
-            for (auto it = samples_with_query.begin(); it != samples_with_query.end(); ) {
-                if (!samples.count(*it))
-                    it = samples_with_query.erase(it);
-                else
-                    ++it;
-            }
-        }
-        if (samples_with_query.empty())
-            return {};
-    }
-
-    uint64_t num_samples_matching_query = samples_with_query.size();
-    logger->trace(fmt::format("Num of samples matching query: {}", num_samples_matching_query));
-    logger->trace(fmt::format("Traversal batch size: {}", traversal_batch_size));
-
-    const uint64_t effective_batch_size =
-        column_batch_size == 0 || column_batch_size >= num_samples_matching_query
-            ? num_samples_matching_query
-            : column_batch_size;
-
-    if (effective_batch_size == 0)
-        return {};
-
-    logger->trace(fmt::format("Column batch size: {}; Effective column batch size: {}",
-                              column_batch_size, effective_batch_size));
-
-    std::vector<Column> samples_with_query_vec(samples_with_query.begin(), samples_with_query.end());
-
-    logger->trace("Processing columns in batches...");
-    std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> result;
-    std::ofstream outfile;
-
-    for (size_t curColumn = 0; curColumn < samples_with_query_vec.size();
-            curColumn += effective_batch_size) {
-        size_t cur_end = std::min(curColumn + effective_batch_size, samples_with_query_vec.size());
-        std::unordered_set<Column> columns_batch(samples_with_query_vec.begin() + curColumn,
-                                                 samples_with_query_vec.begin() + cur_end);
-        if (columns_batch.empty())
-            continue;
-
-        logger->trace("Column batch getting traces...");
-        auto retrieved_traces = tuple_row_diff->get_traces_with_row_labelled(
-            query_rows, columns_batch, traversal_batch_size, flank_length, max_query_distance);
-
-        logger->trace("Column batch spelling paths...");
-        for (size_t i = 0; i < retrieved_traces.size(); ++i) {
-            const auto &[row_trace, j, input_start_pos_in_ref] = retrieved_traces[i];
-            Label label = annotator_->get_label_encoder().decode(j);
-            std::vector<node_index> trace_to_graph_index;
-            trace_to_graph_index.reserve(row_trace.size());
-            for (const row_index &row_in_trace : row_trace)
-                trace_to_graph_index.push_back(anno_to_graph_index(row_in_trace));
-
-            std::string path_spelling = mtg::graph::align::spell_path(dbg_, trace_to_graph_index);
-            result.emplace_back(path_spelling, label, first_query_pos_in_input, input_start_pos_in_ref);
-
-            std::string dummy_query_idx = "query_idx";
-            std::string dummy_query_name = "query_name";
-            std::string read_result = dummy_query_idx + "\t" + dummy_query_name + "\t"
-                + path_spelling + "\t" + label + "\t"
-                + std::to_string(first_query_pos_in_input) + "\t"
-                + std::to_string(input_start_pos_in_ref);
-
-            outfile.open(fmt::format("extracted_reads_{}.txt", output_sequence), std::ios_base::app);
-            outfile << read_result << "\n";
-            outfile.close();
-        }
-    }
-
-    return result;
 }
 
 std::vector<std::tuple<Label, size_t, PresenceRuns>>

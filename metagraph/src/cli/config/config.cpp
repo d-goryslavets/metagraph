@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <iostream>
+#include <optional>
 #include <unordered_set>
 #include <filesystem>
 
@@ -37,15 +38,19 @@ constexpr unsigned int kDefaultBuildK = kPacked64Capacity;
 constexpr unsigned int kDefaultBuildK = kPacked64Capacity - (kPacked64Capacity % 2 == 0);
 #endif
 
-// A limit given as a whole number. Anything else reads as 0, which the limit checks refuse
-static uint64_t parse_limit(const std::string &value) {
+static std::optional<uint64_t> parse_whole_number(const std::string &value) {
     if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
-        return 0;
+        return std::nullopt;
     try {
         return std::stoull(value);
     } catch (const std::exception &) {
-        return 0;
+        return std::nullopt;
     }
+}
+
+// A limit given as a whole number. Anything else reads as 0, which the limit checks refuse
+static uint64_t parse_limit(const std::string &value) {
+    return parse_whole_number(value).value_or(0);
 }
 
 void print_welcome_message() {
@@ -137,6 +142,17 @@ Config::Config(int argc, char *argv[]) {
     };
 
     bool print_usage_and_exit = false;
+
+    const auto get_whole_number = [&](int i) -> uint64_t {
+        auto value = parse_whole_number(get_value(i));
+        if (!value) {
+            std::cerr << "Error: the value of " << argv[i]
+                      << " must be a whole number" << std::endl;
+            print_usage_and_exit = true;
+        }
+        return value.value_or(0);
+    };
+
     bool anno_type_given = false;
     bool xdrop_override = false;
 
@@ -260,10 +276,6 @@ Config::Config(int argc, char *argv[]) {
             presence_fraction = std::stof(get_value(i++));
         } else if (!strcmp(argv[i], "--query-presence")) {
             query_presence = true;
-        } else if (!strcmp(argv[i], "--label-based")) {
-            label_based = true;
-        } else if (!strcmp(argv[i], "--manifest-file")) {
-            manifest_file = std::string(get_value(i++));
         } else if (!strcmp(argv[i], "--verbose-output")) {
             verbose_output = true;
         } else if (!strcmp(argv[i], "--filter-present")) {
@@ -340,13 +352,13 @@ Config::Config(int argc, char *argv[]) {
         } else if (!strcmp(argv[i], "--num-top-labels")) {
             num_top_labels = atoi(get_value(i++));
         } else if (!strcmp(argv[i], "--traversal-batch-size")) {
-            traversal_batch_size = atoi(get_value(i++));
+            traversal_batch_size = get_whole_number(i++);
         } else if (!strcmp(argv[i], "--column-batch-size")) {
-            column_batch_size = atoi(get_value(i++));
+            column_batch_size = get_whole_number(i++);
         } else if (!strcmp(argv[i], "--flank-length")) {
-            flank_length = atoll(get_value(i++));
+            flank_length = get_whole_number(i++);
         } else if (!strcmp(argv[i], "--max-query-distance")) {
-            max_query_distance = atoll(get_value(i++));
+            max_query_distance = get_whole_number(i++);
         } else if (!strcmp(argv[i], "--joint-query")) {
             joint_query = true;
         } else if (!strcmp(argv[i], "--port")) {
@@ -607,6 +619,22 @@ Config::Config(int argc, char *argv[]) {
     if (identity == QUERY && align_sequences
                           && alignment_num_alternative_paths != 1)
         print_usage_and_exit = true;
+
+    if (identity == QUERY && query_mode == READS && !traversal_batch_size) {
+        std::cerr << "Error: --traversal-batch-size must be > 0" << std::endl;
+        print_usage_and_exit = true;
+    }
+
+    if (joint_query && (identity != QUERY || query_mode != READS)) {
+        std::cerr << "Error: --joint-query requires --query-mode reads" << std::endl;
+        print_usage_and_exit = true;
+    }
+
+    // a sequence and its reverse complement are alternatives, not parts of one query
+    if (joint_query && forward_and_reverse) {
+        std::cerr << "Error: --joint-query can't be used with --fwd-and-reverse" << std::endl;
+        print_usage_and_exit = true;
+    }
 
     if (identity == ALIGN && infbase.empty())
         print_usage_and_exit = true;
@@ -1487,7 +1515,6 @@ if (advanced) {
 if (advanced) {
             fprintf(stderr, "\t                %s \tprint sum of counts for the matched k-mers, requires count or coord annotation (...)\n", querymode_to_string(COUNTS_SUM).c_str());
 }
-            fprintf(stderr, "\t                %s \t\tprint all reads that overlap with the query in FASTA format \n", querymode_to_string(READS).c_str());
             fprintf(stderr, "\t                %s \t\tprint k-mer counts, requires count or coord annotation (...)\n", querymode_to_string(COUNTS).c_str());
             fprintf(stderr, "\t                \t\t\t\tOutput format: '<pos in query>=<abundance>' (single k-mer match)\n"
                             "\t                \t\t\t\t    or '<first pos>-<last pos>=<abundance>' (segment match)\n"
@@ -1496,6 +1523,10 @@ if (advanced) {
             fprintf(stderr, "\t                \t\t\t\tOutput format: '<pos in query>-<pos in sample>' (single k-mer match)\n"
                             "\t                \t\t\t\t    or '<start pos in query>-<first pos in sample>-<last pos in sample>' (segment match)\n"
                             "\t                \t\t\t\tAll positions start with 0\n");
+            fprintf(stderr, "\t                %s \t\tprint the indexed sequences (reads, contigs) that contain the query, requires coord annotation (...)\n", querymode_to_string(READS).c_str());
+            fprintf(stderr, "\t                \t\t\t\tOutput format: '<query id>\\t<query name>\\t<sequence>\\t<label>\\t<pos in query>\\t<pos in sequence>',\n"
+                            "\t                \t\t\t\t    one row per extracted sequence (with --json: one JSON object per line)\n"
+                            "\t                \t\t\t\tAll positions start with 0\n");
 if (advanced) {
             fprintf(stderr, "\t   --verbose-output \t\tfor coords/counts: do not collapse ranges; for signature: print full mask instead of RLE [off]\n");
 }
@@ -1503,12 +1534,6 @@ if (advanced) {
             fprintf(stderr, "\t   --min-kmers-fraction-label [FLOAT] \tmin fraction of k-mers from the query required to be present in a label [0.7]\n");
             fprintf(stderr, "\t   --min-kmers-fraction-graph [FLOAT] \tmin fraction of k-mers from the query required to be present in the graph [0.0]\n");
             fprintf(stderr, "\t   --no-coord-mapping \t\t\tquery without mapping coords to sequence headers even if the .seqs index exists [off]\n");
-            fprintf(stderr, "\t   --traversal-batch-size \t\tnumber of nodes in a batch during coordinate-aware read extraction graph traversal [500]\n");
-            fprintf(stderr, "\t   --column-batch-size \t\t\tnumber of columns (labels) to decompress annotations for in one iteration if the coordinate-aware read extraction graph traversal. \
-By default this value will be equal to the total number of columns in the annotation matrix.\n");
-            fprintf(stderr, "\t   --flank-length [INT] \t\tflanks around the span covering all queries for --query-mode reads [25000]\n");
-            fprintf(stderr, "\t   --max-query-distance [INT] \tmax coord span covering all joint queries for --query-mode reads [25000]\n");
-            fprintf(stderr, "\t   --joint-query \t\ttreat all FASTA records as one AND-query for --query-mode reads [off]\n");
 if (advanced) {
             fprintf(stderr, "\t   --labels-delimiter [STR]\tdelimiter for annotation labels [\":\"]\n");
             fprintf(stderr, "\t   --suppress-unlabeled \tdo not show results for sequences missing in graph [off]\n");
@@ -1522,6 +1547,17 @@ if (advanced) {
             fprintf(stderr, "\t   --RA-ivbuff-size [INT] \tsize (in bytes) of int_vector_buffer used in random access mode (e.g. by row disk annotator) [16384]\n");
 }
             fprintf(stderr, "\t   --one-pass-brwt \tuse one-pass parallel BRWT traversal for queries [off]\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Available options for --query-mode reads:\n");
+            fprintf(stderr, "\t-o --outfile-base [STR] \twrite the extracted sequences to this file []\n");
+            fprintf(stderr, "\t   --joint-query \t\textract only the sequences that contain all queries from the same input file [off]\n");
+            fprintf(stderr, "\t                 \t\t(ids, names, and positions of the queries are comma-separated in the output)\n");
+            fprintf(stderr, "\t   --max-query-distance [INT] \tmax number of k-mers between the first and the last k-mer matching the query (or the joint queries) [25'000]\n");
+            fprintf(stderr, "\t   --flank-length [INT] \tmax number of k-mers to extract on each side of the query (or the joint queries) [25'000]\n");
+if (advanced) {
+            fprintf(stderr, "\t   --traversal-batch-size [INT] \tnumber of nodes to decompress annotations for at once [500]\n");
+            fprintf(stderr, "\t   --column-batch-size [INT] \tnumber of labels to extract sequences from at once (0 for all) [0]\n");
+}
             fprintf(stderr, "\n");
             fprintf(stderr, "Available options for --align:\n");
 if (advanced) {

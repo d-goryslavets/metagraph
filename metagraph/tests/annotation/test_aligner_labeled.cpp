@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <random>
-#include <string_view>
 #include <unordered_set>
 
 #include "../graph/all/test_dbg_helpers.hpp"
@@ -64,68 +62,6 @@ typedef ::testing::Types<std::pair<DBGHashFast, annot::ColumnCompressed<>>,
                          std::pair<DBGHashFast, annot::RowDiffColumnAnnotator>> FewGraphAnnotationPairTypes;
 
 TYPED_TEST_SUITE(LabeledAlignerTest, FewGraphAnnotationPairTypes);
-
-TYPED_TEST(LabeledAlignerTest, GetTracesWithRow) {
-    if constexpr(!std::is_same_v<typename TypeParam::second_type, annot::RowDiffColumnAnnotator>) {
-        return;
-    }
-     size_t k = 4;
-    /*
-        A    A    AB    B    B    B
-        GCAA-CAAT-AATG-ATGC-TGCT-GCTT
-        2    1    5    4    3    6
-        
-        "GCAATG",
-        "AATGCTT"         
-
-
-        A       AB      AB      B       B       B    
-        GCAA(2)-CAAT(1)-AATG(6)-ATGC(4)-TGCT(3)-GCTT(7)
-                         \ A
-                          ATGT(5)
-        "GCAATGT",
-        "CAATGCTT"
-
-        ATGAACAACATCCGAA
-        GAACAACATCAACCGAT
-
-        "CAATGCTGCTAATGCTT"
-        "CAATGCTT"
-    */
-
-   const std::vector<std::string> sequences {
-        "CAATGCTGCTAATGCTT",
-        "CAATGCTT"
-    };
-    const std::vector<std::string> labels { "A", "B" };
-
-    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
-                                       typename TypeParam::second_type>(k, sequences, labels, DeBruijnGraph::BASIC, true);
-
-
-    // CAATGCTGCTAATGCTT
-    std::string_view start_seq = "AATG";
-
-    // std::unordered_set<std::string> manifest_labels = { "A", "B" };
-
-
-    uint64_t traversal_batch_size = 50; // nodes at once
-    uint64_t column_batch_size = 2;
-
-    auto obs = anno_graph->get_overlapping_reads(start_seq, traversal_batch_size, column_batch_size);
-
-    std::tuple ref_tuple1 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTGCTAATGCTT", "A", 0, 1);
-    std::tuple ref_tuple2 = std::make_tuple<std::string, std::string, uint64_t, uint64_t>("CAATGCTT", "B", 0, 1);
-
-    std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>> ref = {ref_tuple2, ref_tuple1};
-
-    auto by_label = [](const auto &lhs, const auto &rhs) {
-        return std::get<1>(lhs) < std::get<1>(rhs);
-    };
-    std::sort(obs.begin(), obs.end(), by_label);
-    std::sort(ref.begin(), ref.end(), by_label);
-    EXPECT_EQ(ref, obs);
-}
 
 TYPED_TEST(LabeledAlignerTest, CachedColumnSetsKeepTheirAddress) {
     // The labeled extender holds references to cached column sets while it

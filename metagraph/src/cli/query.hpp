@@ -95,14 +95,12 @@ class SeqSearchResult {
     // element is 0 when no CoordToHeader mapping is loaded (the label refers to
     // a whole annotation column rather than a single indexed sequence).
     typedef std::vector<std::tuple<Label, size_t, graph::PositionCoords, size_t>> LabelCountCoordsVec;
-    typedef std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> LabelOverlappingReads;
 
     typedef std::variant<LabelVec,
                          LabelCountVec,
                          LabelSigVec,
                          LabelCountAbundancesVec,
-                         LabelCountCoordsVec,
-                         LabelOverlappingReads> result_type;
+                         LabelCountCoordsVec> result_type;
 
     // JSON Field Keys
     static constexpr auto SEQ_DESCRIPTION_JSON_FIELD = "seq_description";
@@ -204,6 +202,22 @@ size_t query_fasta(const std::string &file_path,
                    const Config &config,
                    const graph::AnnotatedDBG &anno_graph,
                    const graph::align::DBGAlignerConfig *aligner_config);
+
+// The name and alignment of a query sequence in the JSON output
+Json::Value get_sequence_json(const QuerySequence &sequence,
+                              const std::optional<Alignment> &alignment);
+
+// The name of a query sequence in the text output, followed by its alignment (if any)
+std::string get_sequence_name(const QuerySequence &sequence,
+                              const std::optional<Alignment> &alignment);
+
+// A label with its properties as a JSON object
+Json::Value get_label_as_json(const std::string &label);
+
+// Replace |seq| with its best alignment to |graph|
+Alignment align_sequence(std::string *seq,
+                         const graph::DeBruijnGraph &graph,
+                         const graph::align::DBGAlignerConfig &aligner_config);
 
 int query_graph(Config *config);
 

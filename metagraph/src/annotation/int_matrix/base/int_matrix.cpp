@@ -1,5 +1,7 @@
 #include "int_matrix.hpp"
 
+#include <algorithm>
+
 #include <tsl/hopscotch_map.h>
 
 #include "common/algorithms.hpp"
@@ -73,6 +75,19 @@ IntMatrix::sum_row_values(const std::vector<std::pair<Row, size_t>> &index_count
         }
     }
     return result;
+}
+
+std::vector<MultiIntMatrix::RowTuples>
+MultiIntMatrix::get_row_tuples_in_columns(std::span<const Row> rows,
+                                          const std::unordered_set<Column> &columns,
+                                          size_t num_threads) const {
+    auto row_tuples = get_row_tuples(rows, num_threads);
+    for (auto &row : row_tuples) {
+        row.erase(std::remove_if(row.begin(), row.end(),
+                                 [&](const auto &entry) { return !columns.count(entry.first); }),
+                  row.end());
+    }
+    return row_tuples;
 }
 
 } // namespace matrix
