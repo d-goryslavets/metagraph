@@ -1018,35 +1018,50 @@ void TupleRowDiff<BaseMatrix>
         std::vector<QueryCluster> clusters;
         find_query_clusters(coords, queries, max_query_distance, clusters);
 
+        // Check that coordinates |c| and |c + 1| belong to the same read. The last k-mer of
+        // a read and the first k-mer of the next one have consecutive coordinates as well,
+        // but normally there is no edge between them.
+        auto continues = [&, &coords=coords](uint64_t c) {
+            auto it = coords.find(c);
+            auto next = coords.find(c + SHIFT);
+            if (it == coords.end() || next == coords.end())
+                return false;
+            const auto next_nodes = graph_->adjacent_outgoing_nodes(
+                graph::AnnotatedSequenceGraph::anno_to_graph_index(it->second));
+            return std::ranges::find(next_nodes,
+                                     graph::AnnotatedSequenceGraph::anno_to_graph_index(next->second))
+                        != next_nodes.end();
+        };
+
         std::set<std::pair<uint64_t, uint64_t>> emitted;
         for (const auto &cluster : clusters) {
-            uint64_t window_start = (cluster.min_start > flank_length)
-                ? (cluster.min_start - flank_length) : 0;
-            uint64_t window_end = cluster.max_end + flank_length;
-
-            while (window_start < cluster.min_start && !coords.count(window_start))
-                ++window_start;
-            while (window_end > cluster.max_end && !coords.count(window_end))
-                --window_end;
-
-            if (window_start > window_end || !coords.count(window_start) || !coords.count(window_end))
+            // the queries may match in different reads of the same label
+            bool same_read = true;
+            for (uint64_t c = cluster.min_start; same_read && c < cluster.max_end; ++c) {
+                same_read = continues(c);
+            }
+            if (!same_read)
                 continue;
+
+            // add the flanks, up to the ends of the read
+            uint64_t window_start = cluster.min_start;
+            while (window_start && cluster.min_start - window_start < flank_length
+                    && continues(window_start - 1)) {
+                --window_start;
+            }
+            uint64_t window_end = cluster.max_end;
+            while (window_end - cluster.max_end < flank_length && continues(window_end)) {
+                ++window_end;
+            }
 
             if (!emitted.insert({ window_start, window_end }).second)
                 continue;
 
             std::vector<Row> trace;
-            bool contiguous = true;
+            trace.reserve(window_end - window_start + 1);
             for (uint64_t c = window_start; c <= window_end; ++c) {
-                auto it = coords.find(c);
-                if (it == coords.end()) {
-                    contiguous = false;
-                    break;
-                }
-                trace.push_back(it->second);
+                trace.push_back(coords.at(c));
             }
-            if (!contiguous || trace.empty())
-                continue;
 
             uint64_t first_query_start = cluster.min_start;
             for (uint64_t c = window_start; c <= window_end; ++c) {

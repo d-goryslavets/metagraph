@@ -22,9 +22,10 @@ using Extracted = std::vector<std::tuple<std::string, std::string, uint64_t, uin
 
 std::unique_ptr<AnnotatedDBG> make_coord_graph(uint64_t k,
                                                const std::vector<std::string> &sequences,
-                                               const std::vector<std::string> &labels) {
+                                               const std::vector<std::string> &labels,
+                                               const std::vector<uint64_t> &coord_starts = {}) {
     return build_anno_graph<DBGSuccinct, annot::RowDiffColumnAnnotator>(
-        k, sequences, labels, DeBruijnGraph::BASIC, true);
+        k, sequences, labels, DeBruijnGraph::BASIC, true, coord_starts);
 }
 
 Extracted sorted(Extracted result) {
@@ -117,6 +118,35 @@ TEST(ReadExtraction, MaxQueryDistance) {
     EXPECT_EQ(source, std::get<0>(far_enough[0]));
     EXPECT_EQ("A", std::get<1>(far_enough[0]));
     EXPECT_EQ(8u, std::get<3>(far_enough[0]));
+}
+
+TEST(ReadExtraction, MultipleReadsPerLabel) {
+    const uint64_t k = 4;
+    // two reads containing the query and one without it, all with the same label
+    const std::vector<std::string> sequences {
+        "ATGCGGATTACAATG", "CCTGATTACAGCTTC", "GGTCAAGGC"
+    };
+    auto anno_graph = make_coord_graph(k, sequences, { "A", "A", "A" }, { 0, 12, 24 });
+
+    Extracted ref {
+        { sequences[0], "A", 0, 5 },
+        { sequences[1], "A", 0, 3 },
+    };
+    EXPECT_EQ(sorted(ref), sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1)));
+
+    // the flanks are cropped at the ends of each read
+    EXPECT_EQ(sorted({ { "CGGATTACAAT", "A", 0, 2 }, { "CTGATTACAGC", "A", 0, 2 } }),
+              sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1, /*flank_length=*/2)));
+    EXPECT_EQ(sorted({ { "TGCGGATTACAATG", "A", 0, 4 }, { "CCTGATTACAGCTT", "A", 0, 3 } }),
+              sorted(anno_graph->get_overlapping_reads("GATTACA", 20, 1, /*flank_length=*/4)));
+
+    // queries must match in the same read
+    const std::vector<std::string_view> same { "GCGG", "CAAT" };
+    auto joint = anno_graph->get_overlapping_reads(same, 20, 1);
+    ASSERT_EQ(1u, joint.size());
+    EXPECT_EQ(sequences[0], std::get<0>(joint[0]));
+    const std::vector<std::string_view> different { "GCGG", "CTTC" };
+    EXPECT_TRUE(anno_graph->get_overlapping_reads(different, 20, 1).empty());
 }
 
 TEST(ReadExtraction, MissingQuery) {
