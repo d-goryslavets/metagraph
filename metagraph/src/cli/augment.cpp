@@ -73,7 +73,7 @@ int augment_graph(Config *config) {
 
     if (config->forward_and_reverse
             && graph->get_mode() == graph::DeBruijnGraph::PRIMARY) {
-        logger->error("Can't insert both strands into a primary graph.");
+        logger->error("Cannot insert both strands into a primary graph. Remove --fwd-and-reverse.");
         exit(1);
     }
 
@@ -109,9 +109,9 @@ int augment_graph(Config *config) {
         for (const auto &file : files) {
             parse_sequences_and_log(file, *config, graph->get_k(),
                 [&graph,&node_weights](std::string_view seq, uint32_t count) {
-                    graph->map_to_nodes_sequentially(seq,
-                        [&](auto node) { node_weights->add_weight(node, count); }
-                    );
+                    for (auto node : graph->node_range(seq, true)) {
+                        node_weights->add_weight(node, count);
+                    }
                 }
             );
         }
@@ -138,8 +138,6 @@ int augment_graph(Config *config) {
     auto annotation = initialize_annotation(config->infbase_annotators.at(0), *config);
 
     if (!annotation->load(config->infbase_annotators.at(0))) {
-        logger->error("Cannot load graph annotation from '{}'",
-                      config->infbase_annotators.at(0));
         exit(1);
     } else {
         logger->trace("Annotation was loaded in {} sec", timer.elapsed());

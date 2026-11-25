@@ -66,7 +66,7 @@ int build_graph(Config *config) {
     }
 
     if (!config->outfbase.size()) {
-        logger->error("No output file provided");
+        logger->error("No output file provided. Set the output basename with -o.");
         exit(1);
     }
 
@@ -91,7 +91,7 @@ int build_graph(Config *config) {
 
     if (config->complete) {
         if (config->graph_type != Config::GraphType::BITMAP) {
-            logger->error("Only bitmap-graph can be built in complete mode");
+            logger->error("--complete requires --graph bitmap");
             exit(1);
         }
 
@@ -99,7 +99,7 @@ int build_graph(Config *config) {
 
     } else if (config->graph_type == Config::GraphType::SUCCINCT && !config->dynamic) {
         if (config->k < 2) {
-            logger->error("For succinct graphs, k must be at least 2");
+            logger->error("Succinct graphs require --kmer-length of at least 2");
             exit(1);
         }
         auto boss_graph = std::make_unique<boss::BOSS>(config->k - 1);
@@ -164,10 +164,10 @@ int build_graph(Config *config) {
                     utils::make_suffix(config->outfbase, DBGSuccinct::kExtension));
         }
 
-        if (config->inplace) {
+        if (!config->in_ram) {
             if (config->mark_dummy_kmers) {
-                logger->warn("Graph is being constructed in-place, dummy k-mers will"
-                             " not be marked. Run `metagraph transform --clear-dummy` manually after construction.");
+                logger->error("--mask-dummy requires --in-ram (dummy marking needs the graph in RAM)");
+                exit(1);
             }
             DBGSuccinct::serialize(std::move(graph_data), config->outfbase,
                                    config->graph_mode, config->state);
@@ -248,9 +248,10 @@ int build_graph(Config *config) {
         }
 
     } else if (config->graph_type == Config::GraphType::SSHASH && !config->dynamic) {
-        graph.reset(new DBGSSHash(files.at(0), config->k, config->graph_mode, config->num_chars));
+        graph.reset(new DBGSSHash(files.at(0), config->k, config->graph_mode, config->num_chars,
+                                  config->memory_available));
         if (files.size() > 1) {
-            logger->error("DBGSSHash does not support multiple input files.");
+            logger->error("--graph sshash requires a single input file. Combine the sequences into one file.");
             exit(1);
         }
 
@@ -285,13 +286,11 @@ int build_graph(Config *config) {
                 break;
 
             case Config::GraphType::BITMAP:
-                logger->error("Bitmap-graph construction"
-                              " in dynamic regime is not supported");
+                logger->error("--graph bitmap does not support --dynamic. Remove --dynamic.");
                 exit(1);
 
             case Config::GraphType::SSHASH:
-                logger->error("SSHash-graph construction"
-                              " in dynamic regime is not supported");
+                logger->error("--graph sshash does not support --dynamic. Remove --dynamic.");
                 exit(1);
 
             case Config::GraphType::INVALID:
@@ -318,9 +317,9 @@ int build_graph(Config *config) {
             for (const auto &file : files) {
                 parse_sequences_and_log(file, *config, graph->get_k(),
                     [&graph,&node_weights](std::string_view seq, auto count) {
-                        graph->map_to_nodes_sequentially(seq,
-                            [&](auto node) { node_weights->add_weight(node, count); }
-                        );
+                        for (auto node : graph->node_range(seq, true)) {
+                            node_weights->add_weight(node, count);
+                        }
                     }
                 );
             }

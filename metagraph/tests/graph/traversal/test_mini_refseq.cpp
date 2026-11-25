@@ -1,0 +1,429 @@
+#include "gtest/gtest.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+
+#include "tests/graph/traversal/walker_test_helpers.hpp"
+#include "tests/graph/traversal/test_trie_reference.hpp"
+#include "tests/annotation/dense_search_values.hpp"
+
+#include "graph/traversal/resolve.hpp"
+#include "seq_io/sequence_io.hpp"
+#include "graph/traversal/walker.hpp"
+#include "graph/annotated_dbg.hpp"
+#include "graph/representation/succinct/dbg_succinct.hpp"
+#include "annotation/coord_to_header.hpp"
+#include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
+#include "cli/traverse.hpp"
+
+
+/**
+ * End-to-end tests against a real index in the format of the public `refseq33m` index:
+ * basic-mode DBGSuccinct at k=31 (dummy k-mers not masked), RowDiff<BRWT> annotation with
+ * k-mer coordinates, columns = NCBI taxids, and a CoordToHeader (.seqs) sidecar, so that
+ * labels are accession headers.
+ *
+ * The fixture is the published copy of the mini index (42 blaNDM-carrying RefSeq records,
+ * ~9.3 Mbp; pre-release test-data-mini-refseq-v1 of this repository), fetched by
+ * scripts/traversal/fetch_mini_refseq.sh into metagraph/build/mini_refseq. The tests skip
+ * when it is absent, so they never block a normal unit-test run:
+ *
+ *     cd metagraph/build
+ *     ../scripts/traversal/fetch_mini_refseq.sh
+ *     ./unit_tests --gtest_filter='MiniRefSeq*'
+ */
+
+namespace {
+
+using namespace mtg;
+using namespace mtg::graph;
+using namespace mtg::graph::traversal;
+using namespace mtg::test;
+
+const std::string kIndexDir = "mini_refseq";
+const std::string kGraph = kIndexDir + "/graph_k31.dbg";
+const std::string kAnnoBase = kIndexDir + "/annotation.relaxed.relabeled";
+const std::string kQueryFasta = kIndexDir + "/sanity/ndm1.fa";
+
+bool index_available() {
+    return std::filesystem::exists(kGraph)
+        && std::filesystem::exists(kAnnoBase + annot::RowDiffBRWTCoordAnnotator::kExtension)
+        && std::filesystem::exists(kAnnoBase + annot::CoordToHeader::kExtension)
+        && std::filesystem::exists(kQueryFasta);
+}
+
+// the records of the FASTA files of |dir|, in file order: (header up to the first blank, sequence)
+std::vector<std::pair<std::string, std::string>> read_records(const std::string &dir) {
+    std::vector<std::filesystem::path> files;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    std::vector<std::pair<std::string, std::string>> records;
+    for (const auto &path : files) {
+        seq_io::read_fasta_file_critical(path, [&](seq_io::kseq_t *read) {
+            records.emplace_back(read->name.s, read->seq.s);
+        });
+    }
+    return records;
+}
+
+std::string read_query() {
+    std::string seq;
+    seq_io::read_fasta_file_critical(kQueryFasta, [&](seq_io::kseq_t *read) { seq += read->seq.s; });
+    return seq;
+}
+
+class MiniRefSeq : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        if (!index_available()) {
+            // CI fetches the index and sets METAGRAPH_REQUIRE_MINI_REFSEQ, so a missing index
+            // fails there instead of skipping every test
+            if (std::getenv("METAGRAPH_REQUIRE_MINI_REFSEQ")) {
+                FAIL() << "mini_refseq index not found in " << std::filesystem::current_path()
+                       << "/" << kIndexDir;
+            }
+            GTEST_SKIP() << "mini_refseq index not found in " << std::filesystem::current_path()
+                         << "/" << kIndexDir << " (fetch it with scripts/traversal/fetch_mini_refseq.sh)";
+        }
+        auto graph = std::make_shared<DBGSuccinct>(2);
+        ASSERT_TRUE(graph->load(kGraph));
+
+        auto annotation = std::make_unique<annot::RowDiffBRWTCoordAnnotator>();
+        ASSERT_TRUE(annotation->load(kAnnoBase + annot::RowDiffBRWTCoordAnnotator::kExtension));
+        using Matrix = annot::RowDiffBRWTCoordAnnotator::binary_matrix_type;
+        const_cast<Matrix&>(annotation->get_matrix()).set_graph(graph.get());
+
+        auto cth = std::make_unique<annot::CoordToHeader>();
+        ASSERT_TRUE(cth->load(kAnnoBase));
+
+        anno_graph_ = std::make_unique<AnnotatedDBG>(std::move(graph), std::move(annotation),
+                                                     false, std::move(cth));
+        ASSERT_TRUE(anno_graph_->check_compatibility());
+        oracle_ = std::make_unique<LabelOracle>(*anno_graph_);
+        query_ = read_query();
+        ASSERT_FALSE(query_.empty());
+    }
+
+    // the records with a k-mer of |query|, as /search with signatures reports them:
+    // (accession, k-mers of the query in the record, presence mask over the query's k-mers)
+    std::vector<std::tuple<std::string, size_t, sdsl::bit_vector>>
+    header_signatures(const std::string &query) const {
+        size_t total = 0;
+        auto signatures = dense(anno_graph_->get_top_label_signatures(query, 1000, 0.0, 0.0, &total, true));
+        EXPECT_EQ(total, signatures.size());
+        return signatures;
+    }
+
+    // the whole blaNDM gene as a seed, with the 19 accessions on all its k-mers as labels
+    Seed blandm_seed() const {
+        Seed seed;
+        seed.sequence = query_;
+        for (const auto &[name, count, mask] : header_signatures(query_)) {
+            if (count == mask.size())
+                seed.labels.push_back(name);
+        }
+        EXPECT_FALSE(seed.labels.empty());
+        return seed;
+    }
+
+    std::unique_ptr<AnnotatedDBG> anno_graph_;
+    std::unique_ptr<LabelOracle> oracle_;
+    std::string query_;
+};
+
+
+TEST_F(MiniRefSeq, IndexShape) {
+    EXPECT_EQ(Regime::BASIC, oracle_->regime());
+    EXPECT_EQ(31u, oracle_->get_k());
+    EXPECT_EQ(9u, oracle_->num_columns());          // one column per taxid
+    EXPECT_TRUE(oracle_->has_coordinates());
+    ASSERT_NE(nullptr, oracle_->coord_to_header());
+    uint64_t sequences = 0;
+    for (Column c = 0; c < oracle_->coord_to_header()->num_columns(); ++c) {
+        sequences += oracle_->coord_to_header()->num_sequences(c);
+    }
+    EXPECT_EQ(42u, sequences);                       // 42 indexed accessions
+
+    EXPECT_EQ(LabelKind::COLUMN, oracle_->resolve_label("573").kind);   // Klebsiella pneumoniae
+    auto accession = oracle_->resolve_label("NZ_CM008882.1");
+    EXPECT_EQ(LabelKind::HEADER, accession.kind);
+    EXPECT_EQ("NZ_CM008882.1", oracle_->header_name(accession.column, accession.seq_id));
+    EXPECT_THROW(oracle_->resolve_label("NZ_DOES_NOT_EXIST.1"), std::invalid_argument);
+}
+
+// the profiles of the gene's carriers, named, are their signatures of /search
+TEST_F(MiniRefSeq, NamedCarriersGiveTheSignatureRuns) {
+    const auto signatures = header_signatures(query_);
+    // 25 accessions carry at least one k-mer; 19 carry the whole gene
+    EXPECT_EQ(25u, signatures.size());
+    std::vector<std::string> names;
+    size_t full = 0;
+    for (const auto &[name, count, mask] : signatures) {
+        EXPECT_EQ(813u - 31 + 1, mask.size());       // 783 k-mers
+        full += count == 783;
+        names.push_back(name);
+    }
+    EXPECT_EQ(19u, full);
+
+    auto profile = resolve_support(*oracle_, query_, names);
+    EXPECT_EQ(31u, profile.k);
+    EXPECT_EQ(783u, profile.num_kmers);
+    ASSERT_EQ(1u, profile.graph_runs.size());
+    EXPECT_EQ((KmerInterval{ 0, 783 }), profile.graph_runs[0]);
+    ASSERT_EQ(signatures.size(), profile.labels.size());
+    for (size_t i = 0; i < signatures.size(); ++i) {
+        const auto &[name, count, mask] = signatures[i];
+        EXPECT_EQ(LabelKind::HEADER, profile.labels[i].label.kind);
+        EXPECT_EQ(count, profile.labels[i].kmers_supported) << name;
+        EXPECT_EQ(runs_of(mask.size(), [&](uint64_t j) { return mask[j]; }),
+                  profile.labels[i].runs) << name;
+    }
+}
+
+// the hits of header labels are the coordinates in their sequences, mapped one by one
+TEST_F(MiniRefSeq, HeaderHitsFilterRequestedRanges) {
+    const auto signatures = header_signatures(query_);
+    ASSERT_GE(signatures.size(), 12u);
+    std::vector<LabelRef> refs;
+    for (size_t i = 0; i < 12; ++i) {
+        refs.push_back(oracle_->resolve_label(std::get<0>(signatures[i])));
+    }
+    std::vector<node_index> keys;
+    std::vector<Row> rows;
+    for (node_index key : map_to_nodes(oracle_->graph(), query_)) {
+        keys.push_back(key);
+        rows.push_back(AnnotatedDBG::graph_to_anno_index(key));
+    }
+    const auto tuples = oracle_->get_row_tuples(rows);
+    std::vector<LabelQuery::NodeHits> expected(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        std::set<LabelId> labels;
+        for (const auto &[c, coords] : tuples[i]) {
+            for (uint64_t coord : coords) {
+                const uint64_t seq_id = oracle_->map_coord(c, coord).first;
+                for (LabelId l = 0; l < refs.size(); ++l) {
+                    if (refs[l].column == c && refs[l].seq_id == seq_id)
+                        labels.insert(l);
+                }
+            }
+        }
+        expected[i].assign(labels.begin(), labels.end());
+    }
+    EXPECT_EQ(expected, LabelQuery(*oracle_, refs).fetch(keys));
+}
+
+TEST_F(MiniRefSeq, PartialCarrierRunsMatchPresenceMask) {
+    // x231o31x167o31x323 on refseq33m
+    auto profile = resolve_support(*oracle_, query_, { "NZ_MOIC01000010.1" });
+    ASSERT_EQ(1u, profile.labels.size());
+    EXPECT_EQ((std::vector<KmerInterval>{ { 0, 231 }, { 262, 429 }, { 460, 783 } }),
+              profile.labels[0].runs);
+    EXPECT_EQ(721u, profile.labels[0].kmers_supported);
+
+    auto column_profile = resolve_support(*oracle_, query_, { "562" });   // Escherichia coli
+    ASSERT_EQ(1u, column_profile.labels.size());
+    EXPECT_EQ(LabelKind::COLUMN, column_profile.labels[0].label.kind);
+    EXPECT_GE(column_profile.labels[0].kmers_supported, 721u);
+}
+
+// a basic graph: the reverse complement of the gene hits other records
+TEST_F(MiniRefSeq, ForwardStrandOnly) {
+    std::string rc = query_;
+    ::reverse_complement(rc);
+    auto forward = header_signatures(query_);
+    auto reverse = header_signatures(rc);
+    EXPECT_EQ(25u, forward.size());
+    EXPECT_EQ(17u, reverse.size());
+    std::set<std::string> fw, rv;
+    for (const auto &l : forward) {
+        fw.insert(std::get<0>(l));
+    }
+    for (const auto &l : reverse) {
+        rv.insert(std::get<0>(l));
+    }
+    std::vector<std::string> both;
+    std::set_intersection(fw.begin(), fw.end(), rv.begin(), rv.end(), std::back_inserter(both));
+    EXPECT_EQ(3u, both.size());
+}
+
+// the labels derived from the gene are its 19 carriers: the labels on all its k-mers
+TEST_F(MiniRefSeq, DeriveCarriersFromSeed) {
+    Seed seed;
+    seed.sequence = query_;
+    Strategy strategy;
+    strategy.max_extension_bp = 3000;
+    auto derived = traverse_seed(*oracle_, seed, strategy);
+    EXPECT_TRUE(derived.labels_from_seed);
+    EXPECT_EQ(19u, derived.label_dict.size());
+    EXPECT_EQ(19u, derived.labels_supporting_total);
+    std::vector<std::string> names;
+    for (size_t i = 0; i < derived.label_dict.size(); ++i) {
+        const LabelRef &ref = derived.label_dict[i];
+        EXPECT_EQ(LabelKind::HEADER, ref.kind);
+        if (i) {
+            const LabelRef &prev = derived.label_dict[i - 1];
+            EXPECT_LT(std::make_pair(prev.column, prev.seq_id), std::make_pair(ref.column, ref.seq_id));
+        }
+        names.push_back(ref.name);
+    }
+    const Seed whole = blandm_seed();
+    EXPECT_EQ(std::set<std::string>(whole.labels.begin(), whole.labels.end()),
+              std::set<std::string>(names.begin(), names.end()));
+
+    Seed named = seed;
+    named.labels = names;
+    auto explicitly = traverse_seed(*oracle_, named, strategy);
+    EXPECT_FALSE(explicitly.labels_from_seed);
+    for (size_t a : { kLeft, kRight }) {
+        EXPECT_EQ(derived.arms[a].steps, explicitly.arms[a].steps);
+        EXPECT_EQ(derived.arms[a].paths.size(), explicitly.arms[a].paths.size());
+    }
+
+    strategy.max_seed_labels = 5;
+    auto capped = traverse_seed(*oracle_, seed, strategy);
+    EXPECT_EQ(5u, capped.label_dict.size());
+    EXPECT_EQ(19u, capped.labels_supporting_total);
+    EXPECT_EQ(14u, capped.labels_dropped);
+}
+
+// every label end of a walk from the gene: the seed with its flank occurs in that record
+TEST_F(MiniRefSeq, ExtendBlaNDMAndValidateAgainstSourceRecords) {
+    std::map<std::string, std::string> records;
+    for (auto &[name, seq] : read_records(kIndexDir + "/fasta")) {
+        records[name] = std::move(seq);
+    }
+    ASSERT_EQ(42u, records.size());
+
+    const Seed seed = blandm_seed();
+    Strategy strategy;
+    strategy.max_extension_bp = 3000;
+    strategy.max_label_branches = 2;
+    auto result = traverse_seed(*oracle_, seed, strategy);
+    EXPECT_EQ(19u, result.label_dict.size());
+
+    size_t checked = 0;
+    for (size_t a : { kLeft, kRight }) {
+        const ArmResult &arm = result.arms[a];
+        EXPECT_EQ(ArmResult::COMPLETE, arm.status) << "arm " << a;
+        ASSERT_FALSE(arm.paths.empty());
+        for (const auto &path : arm.paths) {
+            const std::string flank = spell_path(arm, path);
+            const std::string full = a == kRight ? seed.sequence + flank : flank + seed.sequence;
+            for (const auto &end : path.end_labels) {
+                const std::string &accession = result.label_dict[end.label].name;
+                ASSERT_TRUE(records.count(accession)) << accession;
+                // a walk of k-mers of the record: contiguous unless the record repeats them
+                if (end.branches == 0) {
+                    EXPECT_NE(std::string::npos, records.at(accession).find(full))
+                        << "arm " << a << " path " << path.id << " (" << full.size() << " bp)"
+                        << " is attributed to " << accession << " but does not occur in it";
+                    checked++;
+                }
+            }
+        }
+    }
+    EXPECT_GE(checked, 19u);
+}
+
+// the walker against the 42 source records: every record's own sequence beside the seed
+// (trie::header_claim in test_trie_reference.hpp)
+TEST_F(MiniRefSeq, WalkerAgainstTheSourceRecords) {
+    std::vector<std::string> seqs, labels;
+    for (auto &[name, seq] : read_records(kIndexDir + "/fasta")) {
+        labels.push_back(name);
+        seqs.push_back(std::move(seq));
+    }
+    ASSERT_EQ(42u, seqs.size());
+    trie::StringIndex ix(31, DeBruijnGraph::BASIC, seqs, labels);
+
+    std::vector<std::pair<std::string, uint64_t>> cases { { blandm_seed().sequence, 1000 } };
+    for (size_t i : { 0u, 17u, 33u }) {
+        ASSERT_GT(seqs[i].size(), 1200u) << labels[i];
+        cases.emplace_back(seqs[i].substr(1000, 150), 300);
+    }
+    for (const auto &[seed_seq, radius] : cases) {
+        const std::set<std::string> carriers = ix.carriers(seed_seq);
+        ASSERT_FALSE(carriers.empty());
+        Seed seed;
+        seed.sequence = seed_seq;
+        Strategy st;
+        st.max_label_branches = Strategy::kUnlimited;
+        st.max_splits_per_path = Strategy::kUnlimited;
+        st.max_extension_bp = radius;
+        st.max_live_paths = 1'000'000;
+        st.max_paths = 1'000'000;
+        const SeedResult res = traverse_seed(*oracle_, seed, st);
+        std::set<std::string> names;
+        for (const LabelRef &l : res.label_dict) {
+            names.insert(l.name);
+        }
+        EXPECT_EQ(carriers, names);
+        for (Arm arm : { Arm::LEFT, Arm::RIGHT }) {
+            const ArmResult &a = res.arms[static_cast<size_t>(arm)];
+            EXPECT_EQ(ArmResult::COMPLETE, a.status);
+            trie::RefClaims got;
+            for (const Segment &seg : a.segments) {
+                for (const LabelEnd &e : seg.label_ends) {
+                    // the outward walk of the segment's chain up to the label end
+                    std::vector<size_t> chain;
+                    for (size_t s = seg.id; ; s = a.segments[s].parents[0]) {
+                        chain.push_back(s);
+                        if (a.segments[s].parents.empty())
+                            break;
+                    }
+                    std::string walk;
+                    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                        std::string piece = a.segments[*it].sequence;
+                        if (arm == Arm::LEFT)
+                            std::reverse(piece.begin(), piece.end());
+                        walk += piece;
+                    }
+                    got[{ walk.substr(0, e.at_bp), res.label_dict[e.label].name }] = e.reason;
+                }
+            }
+            // a record is followed along its coordinates: its own sequence beside the seed
+            trie::RefClaims expected;
+            for (size_t r = 0; r < seqs.size(); ++r) {
+                if (carriers.count(labels[r]))
+                    trie::header_claim(ix, labels[r], seqs[r], seed_seq, arm, radius, &expected);
+            }
+            EXPECT_EQ(carriers.size(), expected.size());
+            EXPECT_EQ(expected, got) << "arm " << to_string(arm) << " radius " << radius;
+        }
+    }
+}
+
+// the request layer on the real index: a /traverse of the gene with the labels on all its
+// k-mers
+TEST_F(MiniRefSeq, TraverseRequest) {
+    cli::TraverseLimits limits;
+    Json::Value labels(Json::arrayValue);
+    for (const std::string &label : blandm_seed().labels) {
+        labels.append(label);
+    }
+    EXPECT_EQ(19u, labels.size());
+
+    Json::Value traverse;
+    traverse["seeds"][0]["sequence"] = query_;
+    traverse["seeds"][0]["labels"] = labels;
+    traverse["strategy"]["bounds"]["max_extension_bp"] = 1000;
+    const Json::Value out = cli::process_traverse_request(traverse, *anno_graph_, limits);
+    const Json::Value &result = out["results"][0];
+    EXPECT_EQ(19u, result["label_dict"].size());
+    for (const char *arm : { "left", "right" }) {
+        EXPECT_EQ("complete", result["arms"][arm]["status"].asString()) << arm;
+        EXPECT_GE(result["arms"][arm]["paths"].size(), 1u) << arm;
+    }
+    // too many seeds for the server's limit
+    limits.max_seeds = 0;
+    EXPECT_THROW(cli::process_traverse_request(traverse, *anno_graph_, limits), cli::InvalidRequest);
+}
+
+} // namespace

@@ -15,6 +15,8 @@
 #include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
 #include "annotation/coord_to_header.hpp"
 #include "config/config.hpp"
+#include "common/utils/file_utils.hpp"
+#include "common/utils/string_utils.hpp"
 #include "load/load_graph.hpp"
 #include "load/load_annotation.hpp"
 
@@ -208,7 +210,6 @@ void print_annotation_stats(const std::string &fname, const Config &config) {
     auto &annotation = *anno_p;
 
     if (!annotation.load(fname)) {
-        logger->error("Cannot load annotations from file '{}'", fname);
         exit(1);
     }
 
@@ -315,7 +316,7 @@ void print_annotation_stats(const std::string &fname, const Config &config) {
 
         for (double q : config.count_quantiles) {
             if (q < 0. or q > 1.) {
-                logger->error("Count quantiles must be in interval [0, 1], got {}", q);
+                logger->error("--count-quantiles values must be in [0, 1]; received {}", q);
                 exit(1);
             }
             std::cout << fmt::format("\tQuantile({})", q);
@@ -373,7 +374,6 @@ void print_coord_to_header_stats(const std::string &fname) {
 
     annot::CoordToHeader coord_to_header;
     if (!coord_to_header.load(fname)) {
-        logger->error("Cannot load CoordToHeader mapping from file '{}'", fname);
         exit(1);
     }
 
@@ -419,12 +419,12 @@ int print_stats(Config *config) {
     const auto &files = config->fnames;
 
     for (const auto &file : files) {
-        if (utils::ends_with(file, ".annodbg")) {
+        if (file.ends_with(".annodbg")) {
             print_annotation_stats(file, *config);
             continue;
         }
 
-        if (utils::ends_with(file, annot::CoordToHeader::kExtension)) {
+        if (file.ends_with(annot::CoordToHeader::kExtension)) {
             print_coord_to_header_stats(file);
             continue;
         }

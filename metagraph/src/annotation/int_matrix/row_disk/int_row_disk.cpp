@@ -10,7 +10,7 @@ namespace matrix {
 using mtg::common::logger;
 
 std::vector<BinaryMatrix::SetBitPositions>
-IntRowDisk::get_rows(const std::vector<Row> &row_ids) const {
+IntRowDisk::get_rows(std::span<const Row> row_ids) const {
     View view = get_view();
     std::vector<SetBitPositions> rows(row_ids.size());
     for (size_t i = 0; i < row_ids.size(); ++i) {
@@ -20,7 +20,7 @@ IntRowDisk::get_rows(const std::vector<Row> &row_ids) const {
 }
 
 std::vector<IntRowDisk::RowValues>
-IntRowDisk::get_row_values(const std::vector<Row> &rows, size_t num_threads) const {
+IntRowDisk::get_row_values(std::span<const Row> rows, size_t num_threads) const {
     return get_row_data_parallel<RowValues>(rows, num_threads,
                 [&](const auto &rows) { return get_view().get_row_values(rows); });
 }
@@ -83,7 +83,7 @@ IntMatrix::RowValues IntRowDisk::View::get_row_values(Row row) const {
 
 
 std::vector<IntMatrix::RowValues>
-IntRowDisk::View::get_row_values(const std::vector<Row> &row_ids) const {
+IntRowDisk::View::get_row_values(std::span<const Row> row_ids) const {
     std::vector<RowValues> rows_with_values(row_ids.size());
 
     for (size_t i = 0; i < row_ids.size(); ++i) {
@@ -94,8 +94,6 @@ IntRowDisk::View::get_row_values(const std::vector<Row> &row_ids) const {
 }
 
 bool IntRowDisk::load(std::istream &f) {
-    auto _f = dynamic_cast<sdsl::mmap_ifstream *>(&f);
-    assert(_f);
     try {
         num_columns_ = load_number(f);
         auto boundary_start = load_number(f);
@@ -104,14 +102,14 @@ bool IntRowDisk::load(std::istream &f) {
         bits_for_col_id_ = load_number(f);
         bits_for_value_ = load_number(f);
 
-        buffer_params_.filename = _f->get_filename();
+        buffer_params_.filename = utils::get_filename(f);
         buffer_params_.offset = f.tellg();
 
         assert(boundary_start >= buffer_params_.offset);
 
-        f.seekg(boundary_start, std::ios_base::beg);
-
-        boundary_.load(f);
+        // boundary_ is too large to load into RAM, always mmap it.
+        utils::load_mmap_random(buffer_params_.filename, boundary_start,
+                                [&](std::istream &in) { boundary_.load(in); });
 
         num_rows_ = boundary_.num_set_bits();
 

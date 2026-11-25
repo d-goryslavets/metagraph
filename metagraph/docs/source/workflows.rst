@@ -2,42 +2,52 @@
 Snakemake workflows
 ===================
 
-Since each indexing workflow in `MetaGraph <https://metagraph.ethz.ch>`_ comprises
-several steps, we provide automated pipelines to make the process easier and more straightforward
-for the most common scenarios.
+Use ``metagraph-workflows`` to build and annotate an index with a single command.
+The wrapper runs the graph construction, annotation, and compression stages through Snakemake.
 
 
 Installation
 ------------
 
-
-Set up a conda environment and install the necessary packages using:
+Install the CLI with Conda and the current workflow wrapper from a shallow
+checkout. The same checkout supplies the example data; no C++ build or submodule
+initialization is needed:
 
 .. code-block:: bash
 
-   conda create -n metagraph-workflows python=3.8
-   conda activate metagraph-workflows
-   conda install -c bioconda -c conda-forge metagraph
-   pip install -U "git+https://github.com/ratschlab/metagraph.git#subdirectory=metagraph/workflows"
+   conda create -n metagraph --override-channels -c conda-forge -c bioconda \
+       --strict-channel-priority python=3.12 pip "metagraph>=0.5.2"
+   conda activate metagraph
+   git clone --depth 1 --branch master https://github.com/ratschlab/metagraph.git
+   cd metagraph
+   python -m pip install ./metagraph/workflows
+
+For custom alphabets or features unavailable in the packaged CLI, build from
+source as described in :ref:`installation` and install the wrapper from that checkout.
 
 
 Creating graphs and annotations
 -------------------------------
 
-Given some raw sequencing data and a few options like the k-mer length, graphs and annotations
-are automatically built::
+A single command runs the full pipeline — graph construction,
+annotation, and all row-diff / BRWT transforms — for a set of samples::
 
-    metagraph-workflows build -k 5 transcript_paths.txt /tmp/mygraph
+    metagraph-workflows build samples.txt -o /tmp/mygraph --primary
+
+``samples.txt`` is a text file listing input paths (one per line); a
+directory of sample files also works. Process substitution is supported
+too, so you can pipe a glob inline::
+
+    metagraph-workflows build <(ls /data/samples/*.fa) -o /tmp/mygraph --primary
 
 
-The same pipeline can be invoked from within a python script:
+The same pipeline can be invoked from a Python script:
 
 .. code-block:: python
 
-    from metagraph_workflows import workflows
+    from metagraph_workflows import cli
 
-    workflows.run_build_workflow('/tmp/mygraph', seqs_file_list_path='transcript_paths.txt', k=5)
-
+    cli.run_workflow('/tmp/mygraph', samples='samples.txt', k=31, build_primary_graph=True)
 
 
 The pipelines are written in the `Snakemake <https://snakemake.readthedocs.io/>`__ workflow management system and can also be directly invoked using the ``snakemake`` command line tool (see below).
@@ -48,31 +58,124 @@ Usage
 
 Typically, the following steps would be performed:
 
-1. Prepare a list of files for indexing.
-2. Construct a MetaGraph index: invoke a workflow using ``metagraph-workflows build``. Important parameters you may consider tuning are:
+1. Prepare a list of input files (or a directory).
+2. Construct a MetaGraph index: invoke ``metagraph-workflows build``.
+   Tell the workflow how much hardware is available and what kind of
+   index you want; the per-stage memory caps, thread packing, and
+   BRWT clustering parameters are derived automatically.
 
-   * k-mer length
-   * basic vs. primary graph mode
-   * source of annotation labels: ``sequence_headers`` or ``sequence_file_names``
+   Choose these parameters for your data and hardware:
+
+   * ``-p N`` and ``--mem-gb GB`` for the hardware budget
+   * ``-k`` for k-mer length (defaults to the selected MetaGraph executable's build default)
+   * ``--primary`` for primary graph mode (recommended for most workloads)
+   * ``--disk-swap-dir DIR`` to enable on-disk spill buffers
+   * ``--anno-source`` (``header`` or ``filename``; default ``filename``)
+   * ``--anno-type FMT`` to choose / add output annotation formats
+   * ``--with-counts`` or ``--with-coords`` for count- / coordinate-aware
+     annotation (mutually exclusive)
+   * ``--graph EXISTING.dbg`` to reuse an already-built graph and run
+     only the annotation + transform stages
 
    An example invocation:
 
    .. code-block:: bash
 
-     metagraph-workflows build -k 31 \
-                               --seqs-dir-path [PATH_TO_FILES] \
-                               --annotation-labels-source sequence_headers \
-                               --build-primary-graph \
-                               [OUTPUT_DIR]
+     metagraph-workflows build samples.txt -o /tmp/mygraph \
+         -k 31 --primary \
+         -p 34 --mem-gb 70 --disk-swap-dir /scratch/swap
 
-   See ``metagraph-workflows build -h`` for more help.
-3. Once a MetaGraph index has been created, it can be queried either by using the command line
-   ``metagraph`` tool or by starting the MetaGraph server directly on a laptop or on another suitable
-   machine and querying it using the python :ref:`API` client.
+3. Query the completed index with :ref:`metagraph query <query_index>`, or start
+   ``metagraph server_query`` and connect through the :ref:`Python client <api>`.
 
+The `end-to-end notebook <https://github.com/ratschlab/metagraph/blob/master/metagraph/workflows/notebooks/workflow_end_to_end_example.ipynb>`_
+walks through indexing and API queries.
 
-There is also a `jupyter notebook <https://github.com/ratschlab/metagraph/blob/master/metagraph/workflows/notebooks/workflow_end_to_end_example.ipynb>`_ showing the whole process: from indexing to api querying  on a simple example.
+Count-aware annotations
+^^^^^^^^^^^^^^^^^^^^^^^
 
+The workflow supports these count-aware annotation formats:
+
+* ``int_brwt``
+* ``row_diff_int_brwt``
+* ``row_diff_int_disk``
+
+To enable counts explicitly, pass ``--with-counts``. If no annotation format is specified,
+the default switches from ``relax.row_diff_brwt`` to ``row_diff_int_brwt``::
+
+    metagraph-workflows build transcript_paths.txt -o [OUTPUT_DIR] \
+        -k 31 --primary --with-counts --count-width 12
+
+You can also select a count-aware format directly via ``--anno-type``; this
+automatically enables count-aware mode::
+
+    metagraph-workflows build transcript_paths.txt -o [OUTPUT_DIR] \
+        -k 31 --primary --anno-type row_diff_int_brwt --count-width 12
+
+Use ``--count-width`` to control the stored numeric range for counts
+(valid range: ``2..32``, default: ``8``).
+
+When reusing an output directory, the workflow keeps count and non-count intermediates in
+separate mode-specific directories to avoid stale artifact reuse.
+
+Coordinate-aware annotations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The workflow supports these coordinate-aware annotation formats:
+
+* ``brwt_coord``
+* ``row_diff_coord``
+* ``row_diff_brwt_coord``
+* ``row_diff_disk_coord``
+
+To enable coordinates explicitly, pass ``--with-coords``. If no annotation format is specified,
+the default switches from ``relax.row_diff_brwt`` to ``row_diff_brwt_coord``::
+
+    metagraph-workflows build transcript_paths.txt -o [OUTPUT_DIR] \
+        -k 31 --with-coords
+
+You can also select a coordinate-aware format directly via ``--anno-type``; this
+automatically enables coordinate-aware mode::
+
+    metagraph-workflows build transcript_paths.txt -o [OUTPUT_DIR] \
+        -k 31 --anno-type row_diff_brwt_coord
+
+Coordinates are typically indexed for reference sequences, where preserving the original sequence context is important.
+For this use case, primary graph mode is usually not recommended.
+
+When coordinate-aware annotation is built with ``--anno-source filename``
+(the default; one column per input file), the workflow additionally builds
+a ``CoordToHeader`` sidecar at ``<graph>.seqs``. This is a second
+``metagraph annotate --index-header-coords`` pass over the input fastas;
+the pass uses the column order recovered from the final annotation via
+``metagraph stats --print-col-names`` so that file labels and coord
+offsets stay aligned even after BRWT clustering reorders columns. The
+sidecar lets ``metagraph query --query-mode coords`` and ``metagraph
+align`` report hits as ``<header>/<N>:<positions>`` instead of file-based
+coordinates. In ``--anno-source header`` mode each sequence already has
+its own column, so no sidecar is needed and the rule is skipped.
+
+The loader always looks at ``<graph>.seqs`` (it strips the full
+annotation extension and appends ``.seqs``), so a single sidecar is
+emitted regardless of how many coord formats are requested. When
+multiple are requested, the sidecar is derived from the first one in
+the list -- pick that format when querying with coords.
+
+Count-aware and coordinate-aware modes are mutually exclusive in this workflow.
+
+Row-diff transform outputs
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The annotate step writes ``columns.<mode>/<basename>.column.annodbg`` for each input sequence
+file. Row-diff stages 0–2 then write under ``rd_cols.<mode>/`` (for example ``rd_cols.binary/``,
+``rd_cols.coords/``, or ``rd_cols.counts.w8/`` depending on configuration):
+
+* **Binary annotation mode** (no ``--with-counts`` / ``--with-coords``): stage 2 emits
+  ``<basename>.row_diff.annodbg`` per column—the ``RowDiffColumnAnnotator`` format.
+* **Count or coordinate mode**: stage 2 emits ``<basename>.column.annodbg`` and, when applicable,
+  ``<basename>.column.annodbg.counts`` and/or ``<basename>.column.annodbg.coords``.
+
+See ``metagraph-workflows build -h`` for more details.
 
 
 Workflow management
@@ -83,6 +186,12 @@ The following snakemake options are exposed in the ``build`` subcommand
 * ``--dryrun``: see what workflow steps would be done
 * ``--force`` (corresponds to ``--forceall`` in snakemake): force run all steps
 
+When building a new graph without ``-k``, a dry run calls the selected
+MetaGraph executable's ``build --help`` to read its default k-mer length.
+Pass ``-k`` explicitly to preview the workflow without that executable.
+Reusing a graph with ``--graph`` does not need this lookup. A dry run does
+not execute the workflow steps or validate the input alphabet.
+
 
 Directly invoking Snakemake workflow
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -92,7 +201,14 @@ directly invoke the snakemake workflow (assuming you checked out the `metagraph 
 
 .. code-block:: bash
 
-    cd metagraph/workflows
-    snakemake --forceall --configfile default.yml \
-        --config k=5 seqs_file_list_path='transcript_paths.txt' output_directory=/tmp/mygraph \
-        annotation_labels_source=sequence_headers --cores 2
+    cat > build.yaml <<'YAML'
+    k: 5
+    seqs_file_list_path: transcript_paths.txt
+    output_directory: /tmp/mygraph
+    annotation_labels_source: header
+    YAML
+    snakemake --snakefile metagraph/workflows/snakemake/Snakefile \
+        --configfile metagraph/workflows/snakemake/default.yml build.yaml --cores 2
+
+The direct Snakemake invocation requires an explicit ``k`` in its configuration.
+Use ``metagraph-workflows build`` to inherit the selected executable's default.

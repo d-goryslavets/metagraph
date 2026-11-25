@@ -1,5 +1,7 @@
 #include "query.hpp"
 
+#include <exception>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -22,6 +24,7 @@
 #include "config/config.hpp"
 #include "load/load_graph.hpp"
 #include "load/load_annotated_graph.hpp"
+#include "graph/alignment/score_kmer_presence_mask.hpp"
 #include "cli/align.hpp"
 
 
@@ -29,7 +32,7 @@ namespace mtg {
 namespace cli {
 
 const bool kPrefilterWithBloom = true;
-const char ALIGNED_SEQ_HEADER_FORMAT[] = "{}:{}:{}:{}";
+constexpr char ALIGNED_SEQ_HEADER_FORMAT[] = "{}:{}:{}:{}";
 
 using namespace mtg::graph;
 using namespace mtg::annot::matrix;
@@ -51,6 +54,42 @@ std::string get_range(const std::tuple<uint64_t, uint64_t, uint64_t> &range) {
     }
 }
 
+using Range = std::tuple<uint64_t, uint64_t, uint64_t>;
+
+// Process the coordinates |coords| of query position |i| in collapse_coord_ranges: extend
+// the open |ranges| they continue, write out those they end and open one for each other
+void collapse_position(size_t i,
+                       const SmallVector<uint64_t> &coords,
+                       std::vector<Range> &ranges,
+                       std::vector<Range> &next_ranges,
+                       std::vector<std::string> &range_strings) {
+    assert(std::is_sorted(coords.begin(), coords.end()));
+
+    size_t j = 0;
+    next_ranges.resize(0);
+
+    for (uint64_t coord : coords) {
+        while (j < ranges.size() && std::get<2>(ranges[j]) + 1 < coord) {
+            // end of range
+            range_strings.push_back(get_range(ranges[j++]));
+        }
+
+        if (j < ranges.size() && std::get<2>(ranges[j]) + 1 == coord) {
+            // extend range
+            next_ranges.push_back(ranges[j++]);
+            std::get<2>(next_ranges.back())++;
+        } else {
+            // start new range
+            next_ranges.emplace_back(i, coord, coord);
+        }
+    }
+    while (j < ranges.size()) {
+        range_strings.push_back(get_range(ranges[j++]));
+    }
+
+    ranges.swap(next_ranges);
+}
+
 /**
  * Given a vector of kmer label matched coordinates, collapse continuous ranges of coordinates
  * to start-end tuples.
@@ -61,47 +100,56 @@ std::string get_range(const std::tuple<uint64_t, uint64_t, uint64_t> &range) {
  */
 std::vector<std::string>
 collapse_coord_ranges(const std::vector<SmallVector<uint64_t>> &tuples) {
-    // Build output
+    return collapse_coord_ranges(graph::PositionCoords(tuples));
+}
+
+std::vector<std::string>
+collapse_coord_ranges(const graph::PositionCoords &coords) {
     std::vector<std::string> range_strings;
+    std::vector<Range> ranges;
+    std::vector<Range> next_ranges;
+    const SmallVector<uint64_t> none;
 
-    // Keep track of the ranges: start position, first coord, last coord
-    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> ranges;
-    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> next_ranges;
+    size_t next = 0;
+    coords.call_positions([&](size_t i, const SmallVector<uint64_t> &position_coords) {
+        // a position without coordinates ends all open ranges (the positions after it
+        // find none open)
+        if (i > next)
+            collapse_position(next, none, ranges, next_ranges, range_strings);
+        collapse_position(i, position_coords, ranges, next_ranges, range_strings);
+        next = i + 1;
+    });
 
-    for (size_t i = 0; i < tuples.size(); ++i) {
-        const auto &coords = tuples[i];
-        assert(std::is_sorted(coords.begin(), coords.end()));
-
-        size_t j = 0;
-        next_ranges.resize(0);
-
-        for (uint64_t coord : coords) {
-            while (j < ranges.size() && std::get<2>(ranges[j]) + 1 < coord) {
-                // end of range
-                range_strings.push_back(get_range(ranges[j++]));
-            }
-
-            if (j < ranges.size() && std::get<2>(ranges[j]) + 1 == coord) {
-                // extend range
-                next_ranges.push_back(ranges[j++]);
-                std::get<2>(next_ranges.back())++;
-            } else {
-                // start new range
-                next_ranges.emplace_back(i, coord, coord);
-            }
-        }
-        while (j < ranges.size()) {
-            range_strings.push_back(get_range(ranges[j++]));
-        }
-
-        ranges.swap(next_ranges);
-    }
-
+    // the positions without coordinates after the last one end the ranges as the end does
     for (const auto &range : ranges) {
         range_strings.push_back(get_range(range));
     }
 
     return range_strings;
+}
+
+// Append the run [first, end) of the count |value| to |out|
+void append_count_run(std::string &out, size_t first, size_t end, size_t value) {
+    if (end == first + 1) {
+        fmt::format_to(std::back_inserter(out), "{}={}", first, value);
+    } else {
+        fmt::format_to(std::back_inserter(out), "{}-{}={}", first, end - 1, value);
+    }
+}
+
+std::vector<std::string> count_run_strings(const graph::CountRuns &counts) {
+    std::vector<std::string> run_strings;
+    counts.call_runs([&](size_t first, size_t end, size_t value) {
+        append_count_run(run_strings.emplace_back(), first, end, value);
+    });
+    return run_strings;
+}
+
+// score_kmer_presence_mask of the mask, from its runs
+int32_t presence_mask_score(size_t k, const graph::PresenceRuns &mask) {
+    return align::score_kmer_presence_mask(k, mask.size(), [&](const auto &callback) {
+        mask.call_runs(callback);
+    });
 }
 
 
@@ -145,7 +193,7 @@ Json::Value get_label_as_json(const std::string &label) {
     std::vector<std::string> label_parts = utils::split_string(label, ";");
 
     // First field is always the sample
-    label_root["sample"] = label_parts[0];
+    label_root[SeqSearchResult::LABEL_SAMPLE_FIELD] = label_parts[0];
 
     // Fill properties if existant
     Json::Value properties = Json::objectValue;
@@ -166,8 +214,8 @@ Json::Value get_label_as_json(const std::string &label) {
 }
 
 
-Json::Value SeqSearchResult::to_json(bool verbose_output,
-                                     const graph::AnnotatedDBG &anno_graph) const {
+
+Json::Value SeqSearchResult::to_json(bool verbose_output, size_t k) const {
     Json::Value root;
 
     // Add seq information
@@ -206,8 +254,11 @@ Json::Value SeqSearchResult::to_json(bool verbose_output,
             Json::Value &label_obj = root["results"].append(get_label_as_json(label));
             // Store the presence mask and score in a separate object
             Json::Value &sig_obj = (label_obj[SIGNATURE_FIELD] = Json::objectValue);
-            sig_obj["presence_mask"] = Json::Value(sdsl::util::to_string(kmer_presence_mask));
-            sig_obj["score"] = Json::Value(anno_graph.score_kmer_presence_mask(kmer_presence_mask));
+            // the full mask only with verbose output (one character per k-mer)
+            sig_obj["presence_mask"] = Json::Value(verbose_output
+                ? sdsl::util::to_string(kmer_presence_mask.to_dense())
+                : encode_presence_mask(kmer_presence_mask));
+            sig_obj["score"] = Json::Value(presence_mask_score(k, kmer_presence_mask));
             // Add kmer_counts calculated using bitmask
             label_obj[KMER_COUNT_FIELD] = static_cast<Json::Int64>(count);
         }
@@ -217,54 +268,52 @@ Json::Value SeqSearchResult::to_json(bool verbose_output,
             assert(abundances.size());
             Json::Value &label_obj = root["results"].append(get_label_as_json(label));
             label_obj[KMER_COUNT_FIELD] = static_cast<Json::Int64>(count);
-            Json::Value &counts_array = (label_obj[KMER_ABUNDANCE_FIELD] = Json::arrayValue);
             if (verbose_output) {
-                for (size_t c : abundances) {
-                    counts_array.append(static_cast<Json::Int64>(c));
-                }
+                label_obj[KMER_ABUNDANCE_FIELD]
+                    = fmt::format("{}", fmt::join(abundances.to_dense(), ":"));
             } else {
-                std::pair<size_t, size_t> last(0, abundances.at(0));
-                for (size_t i = 1; i <= abundances.size(); ++i) {
-                    if (i < abundances.size() && abundances[i] == last.second)
-                        continue; // extend run
-
-                    // end of run
-                    if (last.second) {
-                        if (i == last.first + 1) {
-                            counts_array.append(fmt::format("{}={}", last.first, last.second));
-                        } else {
-                            counts_array.append(fmt::format("{}-{}={}", last.first, i - 1, last.second));
-                        }
-                    }
-
-                    // start new run
-                    if (i < abundances.size()) {
-                        last.first = i;
-                        last.second = abundances[i];
-                    }
-                }
+                label_obj[KMER_ABUNDANCE_FIELD]
+                    = fmt::format("{}", fmt::join(count_run_strings(abundances), ":"));
             }
         }
     } else {
         // Kmer coordinates
-        for (const auto &[label, count, tuples] : std::get<LabelCountCoordsVec>(result_)) {
+        for (const auto &[label, count, tuples, num_kmers_in_target]
+                : std::get<LabelCountCoordsVec>(result_)) {
             Json::Value &label_obj = root["results"].append(get_label_as_json(label));
             label_obj[KMER_COUNT_FIELD] = static_cast<Json::Int64>(count);
-            Json::Value &coord_array = (label_obj[KMER_COORDINATE_FIELD] = Json::arrayValue);
-
-            // Each tuple is represented as a folly::SmallVector<uint64_t> instance
+            if (num_kmers_in_target) {
+                label_obj[KMERS_IN_TARGET_FIELD]
+                    = static_cast<Json::Int64>(num_kmers_in_target);
+            }
             if (verbose_output) {
-                for (const auto &coords : tuples) {
-                    coord_array.append(fmt::format("{}", fmt::join(coords, ",")));
+                std::vector<std::string> segments;
+                segments.reserve(tuples.size());
+                for (const auto &coords : tuples.to_dense()) {
+                    segments.push_back(fmt::format("{}", fmt::join(coords, ",")));
                 }
+                label_obj[KMER_COORDINATE_FIELD]
+                    = fmt::format("{}", fmt::join(segments, ":"));
             } else {
-                for (const auto &range : collapse_coord_ranges(tuples)) {
-                    coord_array.append(range);
-                }
+                label_obj[KMER_COORDINATE_FIELD]
+                    = fmt::format("{}", fmt::join(collapse_coord_ranges(tuples), ":"));
             }
         }
     }
 
+    if (cut_) {
+        Json::Value cut(Json::objectValue);
+        for (const char *tag : {"graph", "pair_id", "index_fp"})
+            cut[tag] = Json::nullValue;
+        cut["matched"] = Json::UInt64(cut_->matched);
+        cut["returned"] = Json::UInt64(cut_->returned);
+        cut["complete"] = cut_->returned == cut_->matched;
+        cut["nth_score"] = cut_->nth_score ? Json::Value(Json::UInt64(*cut_->nth_score)) : Json::nullValue;
+        cut["tied"] = Json::UInt64(cut_->tied);
+        cut["tied_returned"] = Json::UInt64(cut_->tied_returned);
+        root["cuts"] = Json::Value(Json::arrayValue);
+        root["cuts"].append(std::move(cut));
+    }
     return root;
 }
 
@@ -272,7 +321,7 @@ Json::Value SeqSearchResult::to_json(bool verbose_output,
 std::string SeqSearchResult::to_string(const std::string delimiter,
                                        bool suppress_unlabeled,
                                        bool verbose_output,
-                                       const graph::AnnotatedDBG &anno_graph) const {
+                                       size_t k) const {
     // Return the size of the result type vector using std::visit (ducktyping variant)
     // If empty and unlabeled sequences are supressed then return empty string
     if (suppress_unlabeled && !std::visit([] (auto&& vec) { return vec.size(); }, result_))
@@ -306,36 +355,22 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
         for (const auto &[label, count, kmer_presence_mask] : *v) {
             output += fmt::format("\t<{}>:{}:{}:{}", label,
                                   count,
-                                  sdsl::util::to_string(kmer_presence_mask),
-                                  anno_graph.score_kmer_presence_mask(kmer_presence_mask));
+                                  verbose_output
+                                      ? sdsl::util::to_string(kmer_presence_mask.to_dense())
+                                      : encode_presence_mask(kmer_presence_mask),
+                                  presence_mask_score(k, kmer_presence_mask));
         }
     } else if (const auto *v = std::get_if<LabelCountAbundancesVec>(&result_)) {
         // k-mer counts (or quantiles)
         for (const auto &[label, count, abundances] : *v) {
             output += "\t<" + label + ">";
             if (verbose_output) {
-                output += fmt::format(":{}", fmt::join(abundances, ":"));
+                output += fmt::format(":{}", fmt::join(abundances.to_dense(), ":"));
             } else {
-                std::pair<size_t, size_t> last(0, abundances.at(0));
-                for (size_t i = 1; i <= abundances.size(); ++i) {
-                    if (i < abundances.size() && abundances[i] == last.second)
-                        continue; // extend run
-
-                    // end of run
-                    if (last.second) {
-                        if (i == last.first + 1) {
-                            output += fmt::format(":{}={}", last.first, last.second);
-                        } else {
-                            output += fmt::format(":{}-{}={}", last.first, i - 1, last.second);
-                        }
-                    }
-
-                    // start new run
-                    if (i < abundances.size()) {
-                        last.first = i;
-                        last.second = abundances[i];
-                    }
-                }
+                abundances.call_runs([&](size_t first, size_t end, size_t value) {
+                    output += ':';
+                    append_count_run(output, first, end, value);
+                });
             }
         }
     } else if (const auto *v = std::get_if<LabelOverlappingReads>(&result_)) {
@@ -352,11 +387,15 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
 
     } else {
         // Kmer coordinates
-        for (const auto &[label, count, tuples] : std::get<LabelCountCoordsVec>(result_)) {
+        for (const auto &[label, count, tuples, num_kmers_in_target]
+                : std::get<LabelCountCoordsVec>(result_)) {
             output += "\t<" + label + ">";
+            if (num_kmers_in_target) {
+                output += fmt::format("/{}", num_kmers_in_target);
+            }
 
             if (verbose_output) {
-                for (const auto &coords : tuples) {
+                for (const auto &coords : tuples.to_dense()) {
                     output += fmt::format(":{}", fmt::join(coords, ","));
                 }
             } else {
@@ -369,18 +408,19 @@ std::string SeqSearchResult::to_string(const std::string delimiter,
 }
 
 
-SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
-                                             QueryMode query_mode,
-                                             size_t num_top_labels,
-                                             double discovery_fraction,
-                                             double presence_fraction,
-                                             uint64_t traversal_batch_size,
-                                             uint64_t column_batch_size,
-                                             uint64_t flank_length,
-                                             uint64_t max_query_distance,
-                                             const graph::AnnotatedDBG &anno_graph) {
+SeqSearchResult execute_query(QuerySequence&& sequence,
+                              QueryMode query_mode,
+                              size_t num_top_labels,
+                              double discovery_fraction,
+                              double presence_fraction,
+                              uint64_t traversal_batch_size,
+                              uint64_t column_batch_size,
+                              uint64_t flank_length,
+                              uint64_t max_query_distance,
+                              const graph::AnnotatedDBG &anno_graph) {
     // Perform a different action depending on the type (specified by config flags)
     SeqSearchResult::result_type result;
+    graph::SearchCut cut;
 
     switch (query_mode) {
         case SIGNATURE: {
@@ -388,7 +428,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             result = anno_graph.get_top_label_signatures(sequence.sequence,
                                                          num_top_labels,
                                                          discovery_fraction,
-                                                         presence_fraction);
+                                                         presence_fraction, nullptr, true, &cut);
             break;
         }
         case COORDS: {
@@ -396,7 +436,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             result = anno_graph.get_kmer_coordinates(sequence.sequence,
                                                      num_top_labels,
                                                      discovery_fraction,
-                                                     presence_fraction);
+                                                     presence_fraction, &cut);
             break;
         }
         case COUNTS: {
@@ -404,7 +444,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             result = anno_graph.get_kmer_counts(sequence.sequence,
                                                 num_top_labels,
                                                 discovery_fraction,
-                                                presence_fraction);
+                                                presence_fraction, &cut);
             break;
         }
         case MATCHES: {
@@ -413,7 +453,7 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
                                                num_top_labels,
                                                discovery_fraction,
                                                presence_fraction,
-                                               false);
+                                               false, &cut);
             break;
         }
         case COUNTS_SUM: {
@@ -433,16 +473,19 @@ SeqSearchResult QueryExecutor::execute_query(QuerySequence&& sequence,
             break;
         }
         case READS: {
-            // TODO: add config_.label_based option use for --anno-header graphs
-            // TODO: change config_.label_based -> config_.header_based
+            // TODO: add config.label_based option use for --anno-header graphs
+            // TODO: change config.label_based -> config.header_based
             result = anno_graph.get_overlapping_reads(sequence.sequence, traversal_batch_size,
                                                       column_batch_size, flank_length,
                                                       max_query_distance);
+            break;
         }
     }
 
     // Create seq search instance and move sequence into it
-    return SeqSearchResult(std::move(sequence), std::move(result));
+    return SeqSearchResult(std::move(sequence), std::move(result), {},
+                           query_mode == LABELS || query_mode == COUNTS_SUM || query_mode == READS
+                               ? std::nullopt : std::optional<graph::SearchCut>(cut));
 }
 
 void call_suffix_match_sequences(const DBGSuccinct &dbg_succ,
@@ -507,9 +550,9 @@ void call_hull_sequences(const DeBruijnGraph &full_dbg,
     kmer.erase(kmer.begin());
     kmer.push_back('$');
     std::vector<HullPathContext> paths_to_extend;
-    full_dbg.call_outgoing_kmers(node, [&](node_index next_node, char c) {
+    for (auto [next_node, c] : full_dbg.outgoing_kmers(node)) {
         if (c == '$')
-            return;
+            continue;
 
         kmer.back() = c;
         assert(full_dbg.kmer_to_node(kmer) == next_node);
@@ -523,7 +566,7 @@ void call_hull_sequences(const DeBruijnGraph &full_dbg,
         } else {
             callback(kmer, std::vector<node_index>{ next_node });
         }
-    });
+    }
 
     while (paths_to_extend.size()) {
         HullPathContext hull_path = std::move(paths_to_extend.back());
@@ -538,13 +581,13 @@ void call_hull_sequences(const DeBruijnGraph &full_dbg,
 
         bool extend = true;
         while (extend && full_dbg.has_single_outgoing(path.back())) {
-            full_dbg.call_outgoing_kmers(path.back(), [&](auto node, char c) {
+            for (auto [node, c] : full_dbg.outgoing_kmers(path.back())) {
                 if (c == '$')
-                    return;
+                    continue;
 
                 path.push_back(node);
                 seq.push_back(c);
-            });
+            }
             depth++;
             extend = continue_traversal(seq, path.back(), depth, fork_count);
         }
@@ -566,9 +609,9 @@ void call_hull_sequences(const DeBruijnGraph &full_dbg,
         seq.push_back('$');
 
         // schedule further traversals
-        full_dbg.call_outgoing_kmers(node, [&](node_index next_node, char c) {
+        for (auto [next_node, c] : full_dbg.outgoing_kmers(node)) {
             if (c == '$')
-                return;
+                continue;
 
             seq.back() = c;
             assert(full_dbg.kmer_to_node(seq) == next_node);
@@ -582,7 +625,7 @@ void call_hull_sequences(const DeBruijnGraph &full_dbg,
             } else {
                 callback(seq, std::vector<node_index>{ next_node });
             }
-        });
+        }
     }
 }
 
@@ -650,8 +693,8 @@ slice_annotation(const AnnotatedDBG::Annotator &full_annotation,
     auto unique_rows = full_annotation.get_matrix().get_rows_dict(&row_indexes, num_threads);
 
     if (unique_rows.size() >= std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error("There must be less than 2^32 rows in a batch."
-                                 " Reduce the query batch size.");
+        throw std::runtime_error("A query batch must contain fewer than 2^32 - 1 annotation rows."
+                                 " Reduce --batch-size.");
     }
 
     // insert one empty row for representing unmatched rows
@@ -685,7 +728,7 @@ void add_nodes_with_suffix_matches(const DBGSuccinct &full_dbg,
             assert(node == full_dbg.kmer_to_node(kmer));
 
             if (full_dbg.get_mode() == DeBruijnGraph::CANONICAL)
-                full_dbg.map_to_nodes(kmer, [&](node_index cn) { node = cn; });
+                node = *full_dbg.node_range(kmer).begin();
 
             added_nodes.emplace_back(std::move(kmer), node);
         };
@@ -734,12 +777,8 @@ void add_hull_contigs(const DeBruijnGraph &full_dbg,
         auto callback = [&](const std::string &sequence,
                             const std::vector<node_index> &path) {
             added_paths.emplace_back(sequence, path);
-            if (full_dbg.get_mode() == DeBruijnGraph::CANONICAL) {
-                added_paths.back().second.resize(0);
-                full_dbg.map_to_nodes(sequence,
-                    [&](node_index cn) { added_paths.back().second.push_back(cn); }
-                );
-            }
+            if (full_dbg.get_mode() == DeBruijnGraph::CANONICAL)
+                added_paths.back().second = map_to_nodes(full_dbg, sequence);
         };
         auto continue_traversal = [&](std::string_view seq,
                                       node_index last_node,
@@ -778,23 +817,19 @@ void add_hull_contigs(const DeBruijnGraph &full_dbg,
                 // adjacent to it.
                 std::string kmer = contig.substr(j, full_dbg.get_k());
                 // forward expansion from the incoming nodes
-                batch_graph.adjacent_incoming_nodes(batch_graph.kmer_to_node(kmer),
-                    [&](node_index next) {
-                        call_hull_sequences(full_dbg, batch_graph.get_node_sequence(next),
-                                            callback, continue_traversal);
-                    }
-                );
+                for (node_index next : batch_graph.adjacent_incoming_nodes(batch_graph.kmer_to_node(kmer))) {
+                    call_hull_sequences(full_dbg, batch_graph.get_node_sequence(next),
+                                        callback, continue_traversal);
+                }
                 if (batch_graph.get_mode() == DeBruijnGraph::CANONICAL) {
                     // In canonical graphs, (incoming to forward) is equivalent
                     // to (outgoing from rev-comp), so the following code invokes
                     // backward expansion.
                     reverse_complement(kmer);
-                    batch_graph.adjacent_incoming_nodes(batch_graph.kmer_to_node(kmer),
-                        [&](node_index next) {
-                            call_hull_sequences(full_dbg, batch_graph.get_node_sequence(next),
-                                                callback, continue_traversal);
-                        }
-                    );
+                    for (node_index next : batch_graph.adjacent_incoming_nodes(batch_graph.kmer_to_node(kmer))) {
+                        call_hull_sequences(full_dbg, batch_graph.get_node_sequence(next),
+                                            callback, continue_traversal);
+                    }
                 }
                 // TODO: For non-canonical graphs, also expand backwards from
                 //       the outgoing nodes?
@@ -891,12 +926,11 @@ void split_contigs_for_rebalancing(size_t k,
  * 3. Extract annotation for the nodes of the query graph and return.
  */
 std::unique_ptr<AnnotatedDBG>
-construct_query_graph(const AnnotatedDBG &anno_graph,
+construct_query_graph(const DeBruijnGraph &full_dbg,
+                      const AnnotatedDBG::Annotator &full_annotation,
                       StringGenerator call_sequences,
                       size_t num_threads,
                       const Config &config) {
-    const auto &full_dbg = anno_graph.get_graph();
-    const auto &full_annotation = anno_graph.get_annotator();
     const auto *dbg_succ = dynamic_cast<const DBGSuccinct *>(&full_dbg);
 
     assert(full_dbg.get_mode() != DeBruijnGraph::PRIMARY
@@ -962,9 +996,7 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
         static_cast<size_t>(max_hull_depth_per_seq_char * max_input_sequence_length)
     );
 
-    logger->trace("[Query graph construction] Batch graph contains {} k-mers"
-                  " and constructed in {} sec",
-                  graph_init->num_nodes(), timer.elapsed());
+    double construction_time = timer.elapsed();
     timer.reset();
 
     // pull contigs from query graph
@@ -979,7 +1011,9 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
                                full_dbg.get_mode() == DeBruijnGraph::CANONICAL,
                                false);
 
-    logger->trace("[Query graph construction] Contig extraction took {} sec", timer.elapsed());
+    logger->trace("[Query graph construction] Batch graph with {} k-mers constructed in {} "
+                  "sec, contig extraction took {} sec",
+                  graph_init->num_nodes(), construction_time, timer.elapsed());
     timer.reset();
 
     if (num_threads > 1) {
@@ -1000,9 +1034,10 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic, chunk_size)
     for (size_t i = 0; i < contigs.size(); ++i) {
         contigs[i].second.reserve(contigs[i].first.length() - graph_init->get_k() + 1);
-        full_dbg.map_to_nodes(contigs[i].first,
-                              [&](node_index node) { contigs[i].second.push_back(node);
-                                                     num_found_kmers += node != DeBruijnGraph::npos; });
+        for (node_index node : full_dbg.node_range(contigs[i].first)) {
+            contigs[i].second.push_back(node);
+            num_found_kmers += node != DeBruijnGraph::npos;
+        }
         num_kmers += contigs[i].second.size();
     }
     logger->trace("[Query graph construction] Contigs mapped to the full graph [threads: {}, contigs: {}, chunk_size: {}] (found {} / {} k-mers) in {} sec",
@@ -1076,9 +1111,9 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
         std::vector<uint64_t> path(nodes_in_full.size());
         size_t j = 0;
         // nodes in the query graph hull may overlap
-        graph->map_to_nodes(contig, [&](node_index node) {
+        for (node_index node : graph->node_range(contig)) {
             path[j++] = node;
-        });
+        }
         assert(j == nodes_in_full.size());
 
         #pragma omp critical
@@ -1126,8 +1161,11 @@ int query_graph(Config *config) {
 
     assert(config->infbase_annotators.size() == 1);
 
-    std::shared_ptr<DeBruijnGraph> graph = load_critical_dbg(config->infbase);
-    std::unique_ptr<AnnotatedDBG> anno_graph = initialize_annotated_dbg(graph, *config);
+    // Load graph and annotation in parallel.
+    auto loaded = load_graph_with_async_annotation(*config);
+    auto graph = loaded.first.get();
+    auto anno_graph = loaded.second.get();
+    assert(anno_graph);  // guaranteed by the assertion above
 
     std::unique_ptr<align::DBGAlignerConfig> aligner_config;
     if (config->align_sequences) {
@@ -1138,32 +1176,29 @@ int query_graph(Config *config) {
             initialize_aligner_config(*config, *graph)
         ));
     }
+    graph.reset();
 
-    QueryExecutor executor(*config, *anno_graph, std::move(aligner_config));
+    size_t k = anno_graph->get_graph().get_k();
 
     // iterate over input files
     for (const auto &file : files) {
         Timer curr_timer;
 
-        // Callback, which captures the config pointer and a const reference to the anno_graph
-        // instance pointed to by our unique_ptr...
-        auto query_callback = [config, &anno_graph=std::as_const(*anno_graph)](const SeqSearchResult &result) {
+        auto query_callback = [config, k](const SeqSearchResult &result) {
             if (config->output_json) {
                 std::ostringstream ss;
-                ss << result.to_json(config->verbose_output
-                                        || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-                                    anno_graph) << "\n";
+                ss << result.to_json(config->verbose_output, k) << "\n";
                 std::cout << ss.str();
-            } else {
-                // std::cout << result.to_string(config->anno_labels_delimiter,
-                //                             config->suppress_unlabeled,
-                //                             config->verbose_output
-                //                                 || !(config->query_mode == COUNTS || config->query_mode == COORDS),
-                //                             anno_graph) + "\n";
+            } else if (config->query_mode == READS) {
+                // get_overlapping_reads writes the reads to a file as they are extracted
                 std::cout << "Extracted reads are written in file." << "\n";
+            } else {
+                std::cout << result.to_string(config->anno_labels_delimiter,
+                                              config->suppress_unlabeled,
+                                              config->verbose_output, k) + "\n";
             }
         };
-        size_t num_bp = executor.query_fasta(file, query_callback);
+        size_t num_bp = query_fasta(file, query_callback, *config, *anno_graph, aligner_config.get());
         auto time = curr_timer.elapsed();
         logger->trace("File '{}' with {} base pairs was processed in {:.3f} sec, throughput: {:.1f} bp/s",
                       file, num_bp, time, (double)num_bp / time);
@@ -1174,19 +1209,18 @@ int query_graph(Config *config) {
 
 
 /**
- * Align a sequence to the annotated DBG before querying. Modify the sequence in place and return
+ * Align a sequence to the DBG before querying. Modify the sequence in place and return
  * alignment information (score and cigar string).
  *
  * @param seq               pointer to sequence string (which will be modified if alignment found)
- * @param anno_graph        reference to annotated DBG we align to
+ * @param graph             reference to DBG we align to
  * @param aligner_config    alignment config
  *
  * @return Alignment struct instance with score and cigar string
  */
 Alignment align_sequence(std::string *seq,
-                         const AnnotatedDBG &anno_graph,
+                         const DeBruijnGraph &graph,
                          const align::DBGAlignerConfig &aligner_config) {
-    const DeBruijnGraph &graph = anno_graph.get_graph();
     align::DBGAligner aligner(graph, aligner_config);
     const align::DBGAlignerConfig &revised_config = aligner.get_config();
     align::DBGAlignerConfig::score_t max_score = revised_config.match_score(*seq)
@@ -1219,13 +1253,13 @@ SeqSearchResult query_sequence(QuerySequence&& sequence,
     // Align sequence and modify sequence struct to store alignment results
     std::optional<Alignment> alignment;
     if (aligner_config)
-        alignment = align_sequence(&sequence.sequence, anno_graph, *aligner_config);
+        alignment = align_sequence(&sequence.sequence, anno_graph.get_graph(), *aligner_config);
 
     // Get sequence search result by executing query
-    SeqSearchResult result = QueryExecutor::execute_query(std::move(sequence),
+    SeqSearchResult result = execute_query(std::move(sequence),
             config.query_mode,
             config.num_top_labels, config.discovery_fraction,
-            config.presence_fraction, 
+            config.presence_fraction,
             config.traversal_batch_size, config.column_batch_size,
             config.flank_length, config.max_query_distance,
             anno_graph);
@@ -1237,18 +1271,27 @@ SeqSearchResult query_sequence(QuerySequence&& sequence,
 }
 
 
-size_t QueryExecutor::query_fasta(const string &file,
-                                  const std::function<void(const SeqSearchResult &)> &callback) {
+size_t batched_query_fasta(seq_io::FastaParser &fasta_parser,
+                           const std::function<void(const SeqSearchResult &)> &callback,
+                           const Config &config,
+                           const graph::AnnotatedDBG &anno_graph,
+                           const graph::align::DBGAlignerConfig *aligner_config);
+
+size_t query_fasta(const std::string &file,
+                   const std::function<void(const SeqSearchResult &)> &callback,
+                   const Config &config,
+                   const graph::AnnotatedDBG &anno_graph,
+                   const graph::align::DBGAlignerConfig *aligner_config) {
     logger->trace("Parsing sequences from file '{}'", file);
 
-    seq_io::FastaParser fasta_parser(file, config_.forward_and_reverse);
+    seq_io::FastaParser fasta_parser(file, config.forward_and_reverse);
 
     // Only query_coords/count_kmers if using coord/count aware index.
-    if (config_.query_mode == COORDS
+    if (config.query_mode == COORDS
             && !dynamic_cast<const annot::matrix::MultiIntMatrix *>(
-                    &this->anno_graph_.get_annotator().get_matrix())) {
+                    &anno_graph.get_annotator().get_matrix())) {
         logger->error("Annotation does not support k-mer coordinate queries. "
-                      "First transform this annotation to include coordinate data "
+                      "Use an annotation built with --coordinates and transformed to a coordinate representation "
                       "(e.g., {}, {}, {}, {}, {}).",
                       Config::annotype_to_string(Config::ColumnCoord),
                       Config::annotype_to_string(Config::BRWTCoord),
@@ -1258,11 +1301,11 @@ size_t QueryExecutor::query_fasta(const string &file,
         exit(1);
     }
 
-    if ((config_.query_mode == COUNTS || config_.query_mode == COUNTS_SUM)
+    if ((config.query_mode == COUNTS || config.query_mode == COUNTS_SUM)
             && !dynamic_cast<const annot::matrix::IntMatrix *>(
-                    &this->anno_graph_.get_annotator().get_matrix())) {
+                    &anno_graph.get_annotator().get_matrix())) {
         logger->error("Annotation does not support k-mer count queries. "
-                      "First transform this annotation to include count data "
+                      "Use an annotation built with --count-kmers and transformed to a count representation "
                       "(e.g., {}, {}, {}).",
                       Config::annotype_to_string(Config::IntBRWT),
                       Config::annotype_to_string(Config::IntRowDiffDisk),
@@ -1270,20 +1313,21 @@ size_t QueryExecutor::query_fasta(const string &file,
         exit(1);
     }
 
-    if (config_.query_batch_size) {
-        if (config_.query_mode != COORDS && !anno_graph_.get_coord_to_header() && config_.query_mode != READS) {
+    if (config.query_batch_size) {
+        if (config.query_mode != COORDS && config.query_mode != READS
+                && !anno_graph.get_coord_to_header()) {
             // Construct a query graph and query against it
-            return batched_query_fasta(fasta_parser, callback);
+            return batched_query_fasta(fasta_parser, callback, config, anno_graph, aligner_config);
         } else {
             // TODO: Implement batch mode for query_coords queries
-            if (config_.query_mode == COORDS)
-                logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
-            else
+            if (config.query_mode == READS)
                 logger->warn("Querying reads in batch mode is currently not supported. Querying sequentially...");
+            else
+                logger->warn("Querying coordinates in batch mode is currently not supported. Querying sequentially...");
         }
     }
 
-    if (config_.query_mode == READS && config_.joint_query) {
+    if (config.query_mode == READS && config.joint_query) {
         std::vector<QuerySequence> stored;
         size_t num_bp = 0;
         size_t seq_count = 0;
@@ -1298,9 +1342,9 @@ size_t QueryExecutor::query_fasta(const string &file,
         for (const auto &qs : stored)
             views.emplace_back(qs.sequence);
 
-        SeqSearchResult::result_type result = anno_graph_.get_overlapping_reads(
-            views, config_.traversal_batch_size, config_.column_batch_size,
-            config_.flank_length, config_.max_query_distance);
+        SeqSearchResult::result_type result = anno_graph.get_overlapping_reads(
+            views, config.traversal_batch_size, config.column_batch_size,
+            config.flank_length, config.max_query_distance);
 
         QuerySequence first = stored.empty()
             ? QuerySequence { 0, "", "" }
@@ -1318,33 +1362,47 @@ size_t QueryExecutor::query_fasta(const string &file,
     size_t seq_count = 0;
     size_t num_bp = 0;
 
+    // a task that throws on a worker would terminate the process: keep the first error and
+    // rethrow it to the caller, which a server reports per request
+    std::exception_ptr error;
+    std::mutex error_mutex;
     ThreadPool thread_pool(get_num_threads(), 1000);
     for (const seq_io::kseq_t &kseq : fasta_parser) {
         thread_pool.enqueue([&](QuerySequence &sequence) {
-            // Callback with the SeqSearchResult
-            callback(query_sequence(std::move(sequence), anno_graph_,
-                                    config_, aligner_config_.get()));
+            try {
+                // Callback with the SeqSearchResult
+                callback(query_sequence(std::move(sequence), anno_graph,
+                                        config, aligner_config));
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!error)
+                    error = std::current_exception();
+            }
         }, QuerySequence { seq_count++, std::string(kseq.name.s), std::string(kseq.seq.s) });
         num_bp += kseq.seq.l;
     }
     // wait while all threads finish processing the current file
     thread_pool.join();
+    if (error)
+        std::rethrow_exception(error);
 
     return num_bp;
 }
 
-size_t
-QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
-                                   const std::function<void(const SeqSearchResult &)> &callback) {
+size_t batched_query_fasta(seq_io::FastaParser &fasta_parser,
+                           const std::function<void(const SeqSearchResult &)> &callback,
+                           const Config &config,
+                           const graph::AnnotatedDBG &anno_graph,
+                           const graph::align::DBGAlignerConfig *aligner_config) {
     auto it = fasta_parser.begin();
     auto end = fasta_parser.end();
 
-    const uint64_t batch_size = config_.query_batch_size;
+    const uint64_t batch_size = config.query_batch_size;
 
     size_t seq_count = 0;
     size_t num_bp = 0;
 
-    size_t parallel_each = std::max<size_t>(1, config_.parallel_each);
+    size_t parallel_each = std::max<size_t>(1, config.parallel_each);
     size_t threads_per_batch = std::max<size_t>(1, get_num_threads() / parallel_each);
     omp_set_max_active_levels(2);
     #pragma omp parallel num_threads(parallel_each)
@@ -1369,7 +1427,7 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
             Timer batch_timer;
             std::vector<Alignment> alignments_batch;
             // Align sequences ahead of time on full graph if we don't have batch_align
-            if (aligner_config_ && !config_.batch_align) {
+            if (aligner_config && !config.batch_align) {
                 alignments_batch.resize(seq_batch->size());
                 logger->trace("Aligning sequences from batch against the full graph...");
                 batch_timer.reset();
@@ -1378,7 +1436,7 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
                 for (size_t i = 0; i < seq_batch->size(); ++i) {
                     // Set alignment for this seq_batch
                     alignments_batch[i] = align_sequence(&(*seq_batch)[i].sequence,
-                                                         anno_graph_, *aligner_config_);
+                                                         anno_graph.get_graph(), *aligner_config);
                 }
                 logger->trace("Sequences alignment took {} sec", batch_timer.elapsed());
                 batch_timer.reset();
@@ -1386,14 +1444,15 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
 
             // Construct the query graph for this batch
             auto query_graph = construct_query_graph(
-                anno_graph_,
+                anno_graph.get_graph(),
+                anno_graph.get_annotator(),
                 [&seq_batch](auto callback) {
                     for (const auto &seq : *seq_batch) {
                         callback(seq.sequence);
                     }
                 },
                 threads_per_batch,
-                config_
+                config
             );
 
             auto query_graph_construction = batch_timer.elapsed();
@@ -1402,8 +1461,8 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
             #pragma omp parallel for num_threads(threads_per_batch) schedule(dynamic)
             for (size_t i = 0; i < seq_batch->size(); ++i) {
                 SeqSearchResult search_result
-                    = query_sequence(std::move((*seq_batch)[i]), *query_graph, config_,
-                                     config_.batch_align ? aligner_config_.get() : NULL);
+                    = query_sequence(std::move((*seq_batch)[i]), *query_graph, config,
+                                     config.batch_align ? aligner_config : NULL);
 
                 if (alignments_batch.size())
                     search_result.get_alignment() = std::move(alignments_batch[i]);

@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <sstream>
 
 #include "test_helpers.hpp"
 
@@ -20,8 +21,7 @@ namespace {
 
 using namespace mtg;
 
-const std::string test_data_dir = "../tests/data";
-const std::string test_dump_basename = test_data_dir + "/bit_vector_dump_test";
+const std::string test_dump_basename = test_dump_dir() + "/bit_vector_dump_test";
 
 
 template <typename Bitmap>
@@ -40,6 +40,27 @@ typedef ::testing::Types<bit_vector_stat,
         BitVectorTypes;
 
 TYPED_TEST_SUITE(BitVectorTest, BitVectorTypes);
+
+TEST(BitVectorDyn, TruncatedHeaderCanBeRetried) {
+    bit_vector_dyn reference{true, false, true, true};
+    std::ostringstream out;
+    reference.serialize(out);
+    const auto valid = out.str();
+
+    // DYNAMIC stores four lengths before the first SPSI node payload.
+    constexpr size_t header_size = 4 * sizeof(uint64_t);
+    for (size_t size = 0; size <= header_size; ++size) {
+        SCOPED_TRACE(size);
+        const auto invalid = size == header_size ? std::string(size, '\0')
+                                                 : valid.substr(0, size);
+        bit_vector_dyn loaded;
+        std::istringstream in(invalid);
+        EXPECT_FALSE(loaded.load(in));
+        std::istringstream retry(valid);
+        ASSERT_TRUE(loaded.load(retry));
+        EXPECT_EQ(reference, loaded);
+    }
+}
 
 
 void test_next_subvector(const bit_vector &vector, uint64_t idx) {
@@ -215,7 +236,7 @@ void test_bit_vector_queries() {
 
     std::initializer_list<bool> init_list = { 0, 1, 0, 1, 1, 1, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     vector.reset(new T(numbers));
     ASSERT_TRUE(vector);
     reference_based_test(*vector, numbers);
@@ -316,7 +337,7 @@ void test_bit_vector_set(bit_vector_dyn *vector, sdsl::bit_vector *numbers) {
 TEST(bit_vector_dyn, set) {
     std::initializer_list<bool> init_list = { 0, 1, 0, 1, 1, 1, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_dyn vector(numbers);
 
     test_bit_vector_set(&vector, &numbers);
@@ -348,7 +369,7 @@ void test_bit_vector_ins_del(bit_vector_dyn *vector,
 TEST(bit_vector_dyn, InsertDelete) {
     std::initializer_list<bool> init_list = { 0, 1, 0, 1, 1, 1, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_dyn vector(numbers);
 
     test_bit_vector_ins_del(&vector, numbers);
@@ -356,7 +377,7 @@ TEST(bit_vector_dyn, InsertDelete) {
 
 
 TEST(bit_vector_dyn, Serialization) {
-    std::vector<std::initializer_list<bool>> init_lists = {
+    const std::vector<std::vector<bool>> init_lists = {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1 },
@@ -364,8 +385,8 @@ TEST(bit_vector_dyn, Serialization) {
         { 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1 },
         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
     };
-    for (auto init_list : init_lists) {
-        sdsl::bit_vector numbers(init_list);
+    for (const auto &init_list : init_lists) {
+        sdsl::bit_vector numbers(init_list.begin(), init_list.end());
         std::unique_ptr<bit_vector> vector { new bit_vector_dyn(numbers) };
         ASSERT_TRUE(vector);
         std::ofstream outstream(test_dump_basename, std::ios::binary);
@@ -381,13 +402,29 @@ TEST(bit_vector_dyn, Serialization) {
     }
 }
 
-template <class bit_vector_type>
-uint64_t space_taken(const bit_vector_type &vec) {
+template <class T>
+uint64_t serialized_size_in_bits(const T &vec) {
     std::ofstream outstream(test_dump_basename, std::ios::binary);
     vec.serialize(outstream);
     outstream.close();
     std::ifstream instream(test_dump_basename, std::ios::binary | std::ifstream::ate);
     return instream.tellg() * 8;
+}
+
+template <class T>
+uint64_t approximate_memory_in_bits(const T &vec) {
+    // Serialized storage approximates the allocated buffers, not the objects.
+    uint64_t object_bytes = sizeof(T);
+    if constexpr (std::is_base_of_v<bit_vector_adaptive, T>) {
+        // Adaptive vectors own a separately allocated concrete vector.
+        switch (vec.representation_tag()) {
+            case bit_vector_adaptive::SD_VECTOR: object_bytes += sizeof(bit_vector_sd); break;
+            case bit_vector_adaptive::RRR_VECTOR: object_bytes += sizeof(bit_vector_rrr<>); break;
+            case bit_vector_adaptive::STAT_VECTOR: object_bytes += sizeof(bit_vector_stat); break;
+            case bit_vector_adaptive::IL4096_VECTOR: object_bytes += sizeof(bit_vector_il<4096>); break;
+        }
+    }
+    return object_bytes * 8 + serialized_size_in_bits(vec);
 }
 
 TYPED_TEST(BitVectorTest, PredictedMemoryFootprint) {
@@ -404,7 +441,7 @@ TYPED_TEST(BitVectorTest, PredictedMemoryFootprint) {
             const double TOLERANCE = size > 1'000'000 ? 0.01 : 0.012;
             for (double density : { .05, .2, .4, .5, .7, .9, .95 }) {
                 sdsl::bit_vector bv = gen.generate_random_column(size, density);
-                uint64_t footprint = space_taken(TypeParam(bv));
+                uint64_t footprint = approximate_memory_in_bits(TypeParam(bv));
                 EXPECT_GE(TypeParam::predict_size(bv.size(), sdsl::util::cnt_one_bits(bv)),
                         footprint * (1 - TOLERANCE)) << "Density: " << density;
                 EXPECT_LE(TypeParam::predict_size(bv.size(), sdsl::util::cnt_one_bits(bv)),
@@ -423,7 +460,7 @@ TEST(select_support_mcl, PredictedMemoryFootprint) {
         for (double density : { .05, .2, .4, .5, .7, .9, .98 }) {
             sdsl::bit_vector bv = gen.generate_random_column(size, density);
 
-            uint64_t footprint = space_taken(sdsl::select_support_mcl<1>(&bv));
+            uint64_t footprint = serialized_size_in_bits(sdsl::select_support_mcl<1>(&bv));
             EXPECT_GE(footprint_select_support_mcl(bv.size(), sdsl::util::cnt_one_bits(bv)),
                       footprint * (1 - TOLERANCE)) << "Size: " << size << "\tDensity: " << density;
             EXPECT_LE(footprint_select_support_mcl(bv.size(), sdsl::util::cnt_one_bits(bv)),
@@ -433,7 +470,7 @@ TEST(select_support_mcl, PredictedMemoryFootprint) {
 }
 
 TYPED_TEST(BitVectorTest, Serialization) {
-    std::vector<std::initializer_list<bool>> init_lists = {
+    const std::vector<std::vector<bool>> init_lists = {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1 },
@@ -441,8 +478,8 @@ TYPED_TEST(BitVectorTest, Serialization) {
         { 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1 },
         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
     };
-    for (auto init_list : init_lists) {
-        sdsl::bit_vector numbers(init_list);
+    for (const auto &init_list : init_lists) {
+        sdsl::bit_vector numbers(init_list.begin(), init_list.end());
         std::unique_ptr<bit_vector> vector { new TypeParam(numbers) };
         ASSERT_TRUE(vector);
         std::ofstream outstream(test_dump_basename, std::ios::binary);
@@ -460,7 +497,7 @@ TYPED_TEST(BitVectorTest, Serialization) {
 
 /* TODO: re-enable this later
 TYPED_TEST(BitVectorTest, LoadWithMMAP) {
-    std::vector<std::initializer_list<bool>> init_lists = {
+    const std::vector<std::vector<bool>> init_lists = {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
         { 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1 },
@@ -468,18 +505,18 @@ TYPED_TEST(BitVectorTest, LoadWithMMAP) {
         { 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1 },
         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
     };
-    for (auto init_list : init_lists) {
+    for (const auto &init_list : init_lists) {
         std::ofstream outstream(test_dump_basename, std::ios::binary);
         std::unique_ptr<bit_vector> vector { new TypeParam(sdsl::bit_vector(100, 0)) };
         vector->serialize(outstream);
-        sdsl::bit_vector numbers(init_list);
+        sdsl::bit_vector numbers(init_list.begin(), init_list.end());
         vector.reset(new TypeParam(numbers));
         vector->serialize(outstream);
         outstream.close();
 
         vector.reset(new TypeParam());
         ASSERT_TRUE(vector);
-        sdsl::mmap_ifstream instream(test_dump_basename, std::ios::binary);
+        sdsl::shared_mapper_ifstream instream(test_dump_basename, std::ios::binary);
         ASSERT_TRUE(vector->load(instream));
         vector.reset(new TypeParam());
         ASSERT_TRUE(vector->load(instream));
@@ -490,7 +527,7 @@ TYPED_TEST(BitVectorTest, LoadWithMMAP) {
 */
 
 TEST(bit_vector_sd, SerializationCatchErrorWhenLoadingSdVector) {
-    std::vector<std::initializer_list<bool>> init_lists = {
+    const std::vector<std::vector<bool>> init_lists = {
         { },
         { 1, },
         { 0, },
@@ -499,8 +536,8 @@ TEST(bit_vector_sd, SerializationCatchErrorWhenLoadingSdVector) {
         { 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1 },
         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
     };
-    for (auto init_list : init_lists) {
-        sdsl::bit_vector bv(init_list);
+    for (const auto &init_list : init_lists) {
+        sdsl::bit_vector bv(init_list.begin(), init_list.end());
         {
             std::ofstream outstream(test_dump_basename, std::ios::binary);
             sdsl::sd_vector<>(bv).serialize(outstream);
@@ -524,7 +561,7 @@ TEST(bit_vector_sd, SerializationCatchErrorWhenLoadingSdVector) {
 TYPED_TEST(BitVectorTest, MoveConstructor) {
     std::initializer_list<bool> init_list = { 0, 1, 0, 1, 1, 1, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     TypeParam first(numbers);
     TypeParam second(std::move(first));
     reference_based_test(second, numbers);
@@ -534,7 +571,7 @@ TYPED_TEST(BitVectorTest, MoveConstructor) {
 TYPED_TEST(BitVectorTest, MoveAssignment) {
     std::initializer_list<bool> init_list = { 0, 1, 0, 1, 1, 1, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     TypeParam first(numbers);
     TypeParam second;
     second = std::move(first);
@@ -544,7 +581,7 @@ TYPED_TEST(BitVectorTest, MoveAssignment) {
 TEST(bit_vector_sd, MoveAssignmentSparse) {
     std::initializer_list<bool> init_list = { 0, 0, 0, 1, 0, 0, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_sd first(numbers);
     ASSERT_FALSE(first.is_inverted());
     bit_vector_sd second;
@@ -555,7 +592,7 @@ TEST(bit_vector_sd, MoveAssignmentSparse) {
 TEST(bit_vector_sd, MoveAssignmentDense) {
     std::initializer_list<bool> init_list = { 1, 1, 0, 1, 0, 0, 1, 0,
                                               1, 1, 0, 1, 1, 1, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_sd first(numbers);
     ASSERT_TRUE(first.is_inverted());
     bit_vector_sd second;
@@ -567,7 +604,7 @@ TEST(bit_vector_sd, InitializeByBitsSparse) {
     std::vector<uint64_t> set_bits = { 3, 6, 9, 14, 15 };
     std::initializer_list<bool> init_list = { 0, 0, 0, 1, 0, 0, 1, 0,
                                               0, 1, 0, 0, 0, 0, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_sd first(numbers);
     ASSERT_FALSE(first.is_inverted());
     bit_vector_sd second(
@@ -584,7 +621,7 @@ TEST(bit_vector_sd, InitializeByBitsDense) {
     std::vector<uint64_t> set_bits = { 0, 1, 3, 6, 8, 9, 11, 12, 13, 14, 15 };
     std::initializer_list<bool> init_list = { 1, 1, 0, 1, 0, 0, 1, 0,
                                               1, 1, 0, 1, 1, 1, 1, 1 };
-    sdsl::bit_vector numbers(init_list);
+    sdsl::bit_vector numbers(init_list.begin(), init_list.end());
     bit_vector_sd first(numbers);
     ASSERT_TRUE(first.is_inverted());
     bit_vector_sd second(
@@ -942,6 +979,184 @@ TYPED_TEST(BitVectorTest, operator_neq) {
             EXPECT_NE(bit_vector, bit_vector_smart(size, value));
         }
     }
+}
+
+
+template <uint16_t BlockSize>
+void check_rrr_storage_roundtrip() {
+    using Owned = sdsl::rrr_vector<BlockSize>;
+    using View = sdsl::rrr_vector<BlockSize, sdsl::packed_vector_view<0>, 32,
+                                  sdsl::packed_vector_view>;
+    for (uint64_t size : {0, 1, 15, 63, 64, 65, 2048, 10003}) {
+        sdsl::bit_vector bits(size, 0);
+        for (uint64_t i = 0; i < size; ++i)
+            bits[i] = i % 101 < 43;
+        Owned owned(bits);
+        View constructed(bits);
+        std::ostringstream expected, actual;
+        owned.serialize(expected);
+        constructed.serialize(actual);
+        ASSERT_EQ(expected.str(), actual.str());
+        auto retained = constructed;
+        constructed = View();
+        typename View::rank_1_type retained_rank(&retained);
+        typename View::select_1_type retained_select(&retained);
+        uint64_t retained_ones = 0;
+        for (uint64_t i = 0; i < size; ++i) {
+            ASSERT_EQ(bits[i], retained[i]);
+            ASSERT_EQ(retained_ones, retained_rank(i));
+            if (bits[i]) {
+                ASSERT_EQ(i, retained_select(++retained_ones));
+            }
+        }
+        ASSERT_EQ(retained_ones, retained_rank(size));
+        for (unsigned offset = 0; offset < 8; ++offset) {
+            const auto filename = test_dump_basename + "_rrr_storage";
+            {
+                std::ofstream out(filename, std::ios::binary);
+                out << std::string(offset, 'x') << expected.str();
+            }
+            View loaded;
+            {
+                sdsl::shared_mapper_ifstream in(filename);
+                in.seekg(offset);
+                loaded.load(static_cast<std::istream &>(in));
+            }
+            auto alias = loaded;
+            View moved(std::move(loaded));
+            typename View::rank_1_type rank(&moved);
+            typename View::select_1_type select(&alias);
+            uint64_t ones = 0;
+            for (uint64_t i = 0; i < size; ++i) {
+                ASSERT_EQ(bits[i], moved[i]);
+                ASSERT_EQ(ones, rank(i));
+                if (bits[i]) {
+                    ASSERT_EQ(i, select(++ones));
+                }
+            }
+            ASSERT_EQ(ones, rank(size));
+            std::stringstream serialized;
+            moved.serialize(serialized);
+            ASSERT_EQ(expected.str(), serialized.str());
+            Owned restored;
+            restored.load(static_cast<std::istream &>(serialized));
+            ASSERT_EQ(owned, restored);
+        }
+    }
+}
+
+TEST(RRRStorage, MappedAndOwnedUseTheSameFormat) {
+    check_rrr_storage_roundtrip<3>();
+    check_rrr_storage_roundtrip<15>();
+    check_rrr_storage_roundtrip<63>();
+    check_rrr_storage_roundtrip<127>();
+    check_rrr_storage_roundtrip<255>();
+}
+
+TEST(SDStorage, MappedOwnedCompatibility) {
+    using View = detail::sd_storage;
+    for (uint64_t size : {0, 1, 63, 64, 65, 8192, 100003}) {
+        for (unsigned pattern = 0; pattern < 4; ++pattern) {
+            std::vector<uint64_t> positions;
+            for (uint64_t i = 0; i < size; ++i) {
+                if (pattern == 1 || (pattern == 2 && i % 17 < 3)
+                    || (pattern == 3 && i % 509 == 0))
+                    positions.push_back(i);
+            }
+            sdsl::sd_vector_builder old_builder(size, positions.size());
+            sdsl::sd_vector_builder new_builder(size, positions.size());
+            for (auto pos : positions) {
+                old_builder.set(pos);
+                new_builder.set(pos);
+            }
+            sdsl::sd_vector<> old(old_builder);
+            View built(new_builder);
+            std::ostringstream expected, actual;
+            old.serialize(expected);
+            built.serialize(actual);
+            ASSERT_EQ(expected.str(), actual.str());
+            auto retained = built;
+            built = View();
+            auto check = [&](const View &value) {
+                typename View::rank_1_type rank(&value);
+                typename View::select_1_type select(&value);
+                for (uint64_t i = 0; i < size; i += std::max<uint64_t>(1, size / 1024)) {
+                    ASSERT_EQ(std::binary_search(positions.begin(), positions.end(), i), value[i]);
+                    ASSERT_EQ(std::lower_bound(positions.begin(), positions.end(), i) - positions.begin(), rank(i));
+                }
+                ASSERT_EQ(positions.size(), rank(size));
+                for (size_t i = 0; i < positions.size(); ++i)
+                    ASSERT_EQ(positions[i], select(i + 1));
+            };
+            check(retained);
+            for (unsigned offset = 0; offset < 8; ++offset) {
+                const auto filename = test_dump_basename + "_sd_storage";
+                {
+                    std::ofstream out(filename, std::ios::binary);
+                    out << std::string(offset, 'x') << expected.str();
+                }
+                View loaded;
+                {
+                    sdsl::shared_mapper_ifstream in(filename);
+                    in.seekg(offset);
+                    loaded.load(static_cast<std::istream &>(in));
+                }
+                auto copy = loaded;
+                loaded = View();
+                check(copy);
+                std::stringstream serialized;
+                copy.serialize(serialized);
+                ASSERT_EQ(expected.str(), serialized.str());
+                sdsl::sd_vector<> restored;
+                restored.load(static_cast<std::istream &>(serialized));
+                ASSERT_EQ(old, restored);
+            }
+        }
+    }
+}
+
+TEST(SDStorage, LongSelectBlocks) {
+    using View = detail::sd_storage;
+    const uint64_t size = 1ULL << 44;
+    sdsl::sd_vector_builder a(size, 500000), b(size, 500000);
+    for (uint64_t i = 0; i < 250000; ++i) { a.set(i); b.set(i); }
+    for (uint64_t i = size - 250000; i < size; ++i) { a.set(i); b.set(i); }
+    sdsl::sd_vector<> expected(a);
+    View actual(b);
+    auto has_long_blocks = [](const auto &support) {
+        std::stringstream stream;
+        support.serialize(stream);
+        uint64_t count;
+        stream.read(reinterpret_cast<char *>(&count), sizeof(count));
+        sdsl::int_vector<> superblocks;
+        sdsl::bit_vector flags;
+        superblocks.load(static_cast<std::istream &>(stream));
+        flags.load(static_cast<std::istream &>(stream));
+        return flags.size() && sdsl::util::cnt_one_bits(flags) < flags.size();
+    };
+    ASSERT_TRUE(has_long_blocks(expected.high_1_select));
+    ASSERT_TRUE(has_long_blocks(expected.high_0_select));
+    const auto filename = test_dump_basename + "_sd_long_blocks";
+    {
+        std::ofstream out(filename, std::ios::binary);
+        expected.serialize(out);
+    }
+    {
+        sdsl::shared_mapper_ifstream in(filename);
+        actual.load(static_cast<std::istream &>(in));
+    }
+    typename View::select_1_type select1(&actual);
+    typename View::select_0_type select0(&actual);
+    sdsl::sd_vector<>::select_1_type old1(&expected);
+    sdsl::sd_vector<>::select_0_type old0(&expected);
+    for (uint64_t i = 1; i <= 500000; i += 127)
+        ASSERT_EQ(old1(i), select1(i));
+    for (uint64_t i = 1; i <= size - 500000; i += (size - 500000) / 4096)
+        ASSERT_EQ(old0(i), select0(i));
+    std::ostringstream old_bytes, new_bytes;
+    expected.serialize(old_bytes);
+    actual.serialize(new_bytes);
+    ASSERT_EQ(old_bytes.str(), new_bytes.str());
 }
 
 } // namespace

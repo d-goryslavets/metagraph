@@ -33,6 +33,7 @@ class Config {
     bool to_adj_list = false;
     bool to_fasta = false;
     bool enumerate_out_sequences = false;
+    bool row_map = false;
     bool to_gfa = false;
     bool output_compacted = false;
     bool unitigs = false;
@@ -48,7 +49,7 @@ class Config {
     bool subsample_rows = false;
     bool batch_align = false;
     bool suppress_unlabeled = false;
-    bool inplace = false;
+    bool in_ram = false;
     bool clear_dummy = false;
     bool count_dummy = false;
     bool greedy_brwt = false;
@@ -63,6 +64,11 @@ class Config {
     bool coordinates = false;
     bool index_header_coords = false;
     bool no_coord_mapping = false;
+    // Opt-in: include the bulky VG-style `path.mapping[]` object in
+    // `metagraph align --json` output. Off by default since nothing in-tree
+    // consumes it and it dominates the JSON size for long alignments.
+    bool align_output_path = false;
+    bool align_map_only = false;
     bool advanced = false;
 
     unsigned int k = 3;
@@ -72,14 +78,12 @@ class Config {
     // In general, the default value is: log_{|Sigma|}(2^24)
     static const size_t kDefaultIndexSuffixLen;
     unsigned int node_suffix_length = kDefaultIndexSuffixLen;
-    unsigned int distance = 0;
     unsigned int parallel_each = 1;
     unsigned int parallel_nodes = -1;  // if not set, redefined by |parallel|
     unsigned int num_bins_per_thread = 1;
     unsigned int parts_total = 1;
     unsigned int part_idx = 0;
     unsigned int suffix_len = 0;
-    unsigned int frequency = 1;
     unsigned int alignment_length = 0;
     double memory_available = 1;
     unsigned int min_count = 1;
@@ -87,10 +91,14 @@ class Config {
     unsigned int min_value = 1;
     unsigned int max_value = std::numeric_limits<unsigned int>::max();
     unsigned int num_top_labels = -1;
-    unsigned int genome_binsize_anno = 1000;
     unsigned int arity_brwt = 2;
     unsigned int relax_arity_brwt = 10;
     unsigned long long RA_ivbuffer_size = 16'384; // in B
+    double server_cache_size = 1.0; // server query cache, in GB (default 1 GB; 0 disables)
+    // server_query: bounds of a /traverse request. Its time budget is clamped to the first,
+    // more seeds than the second are refused
+    double traverse_max_time_ms = 30'000;
+    size_t traverse_max_seeds = 10;
     unsigned int min_tip_size = 1;
     unsigned int min_unitig_median_kmer_abundance = 1;
     int fallback_abundance_cutoff = 1;
@@ -168,6 +176,7 @@ class Config {
     std::string infbase;
     std::string manifest_file;
     std::string rename_instructions_file;
+    std::string remap_graph;
     std::string refpath;
     std::string suffix;
     std::string fasta_header_delimiter;

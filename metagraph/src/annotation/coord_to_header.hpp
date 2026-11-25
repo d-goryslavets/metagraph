@@ -1,7 +1,13 @@
 #ifndef __COORD_TO_HEADER_HPP__
 #define __COORD_TO_HEADER_HPP__
 
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "annotation/int_matrix/base/int_matrix.hpp"
@@ -13,10 +19,27 @@ namespace annot {
 
 /**
  * An index mapping k-mer coordinates in annotation columns to sequence headers.
- * This mapping can be used to transform coordinates and labels in query results to show
- * sequence-based (e.g., "<seq1>:0-0-3\t<seq3>:0-1-5") instead of file-based coordinates
- * (e.g., "<file.fa>:0-0-3:0-23-27"). This allows showing results of querying coordinate
- * annotations as if sequences were annotated by their headers instead of source files.
+ * A column is typically the output of `annotate --anno-filename` (all sequences
+ * in a FASTA file are collapsed into one label, with consecutive global
+ * coordinates). This index remembers, for each column, the FASTA header of
+ * each sequence and how many k-mers it contributed, so downstream tools can
+ * report per-sequence labels instead of whole-file offsets:
+ *
+ *   metagraph query (coords): transforms
+ *       "<file.fa>:0-0-3:0-23-27"   (pos-first[-last], tab-separated labels)
+ *     into
+ *       "<seq1>:0-0-3\t<seq3>:0-1-5"
+ *
+ *   metagraph align (coord-aware): transforms
+ *       "file.fa:4-30"              (label:1-based-inclusive nt range)
+ *     into
+ *       "seq1:4-10;seq3:1-5"        (';'-separated per-sequence ranges)
+ *
+ * Terminology: a "header" is the sequence's label (FASTA header line), and
+ * `seq_id` is the 0-based index of a sequence within its column.
+ *
+ * Built by `annotate --index-header-coords` and stored alongside the column
+ * annotation as a ".seqs" file.
  */
 class CoordToHeader {
   public:
@@ -24,43 +47,108 @@ class CoordToHeader {
     using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
     using RowTuples = mtg::annot::matrix::MultiIntMatrix::RowTuples;
 
-    CoordToHeader() {}
+    // out of line, as the destructor: the header index type is private to the .cpp
+    CoordToHeader();
     // Constructor from sequence names and number of k-mers in them, per annotation column.
     CoordToHeader(std::vector<std::vector<std::string>> &&headers,
                   std::vector<std::vector<uint64_t>> &&num_kmers);
+    ~CoordToHeader();
 
     bool load(const std::string &filename_base);
     void serialize(const std::string &filename_base) const;
 
+    // global_coord -> (seq_id, local_coord)
+    std::pair<size_t, uint64_t> map_single_coord(Column col, uint64_t coord) const;
+
+    // The first and last global coordinates of a sequence. Throws std::out_of_range for a
+    // column or sequence id out of range.
+    std::pair<uint64_t, uint64_t> sequence_coords(Column col, size_t seq_id) const;
+
     /**
-     * Transforms global coordinates to local (sequence-based) coordinates in-place.
-     *
-     * For each coordinate in `rows_tuples`, this function:
-     *   1. Determines which sequence (header) the coordinate belongs to within its column
-     *   2. Converts the global coordinate to a local coordinate within that sequence
-     *   3. Encodes both the local coordinate and header index into a single value
-     *
-     * Encoding scheme: For a coordinate in column `j`, the transformed value is:
-     *   `encoded_coord = local_coord * num_headers[j] + header_id`
-     *
-     * Decoding: To extract the header index and local coordinate from an encoded value:
-     *   `header_id = encoded_coord % num_headers[j]`
-     *   `local_coord = encoded_coord / num_headers[j]`
+     * `map_single_coord` for the coordinates |coords| of an annotation row in column
+     * |col|, which are in ascending order: calls |callback|(seq_id, local_coord) for
+     * each. The next coordinate usually lies in the same sequence or in the one after,
+     * so the sequences are found in the column's sequence starts without a rank and a
+     * select per coordinate. The starts take 8 bytes per sequence. They are built on
+     * the first call for a column and kept. Throws std::out_of_range as
+     * `map_single_coord` does. Thread-safe, except against a concurrent load().
      */
-    void map_to_local_coords(std::vector<RowTuples> *rows_tuples) const;
+    template <class Callback>
+    void map_coords(Column col, const Tuple &coords, const Callback &callback) const {
+        const std::vector<uint64_t> &starts = sequence_starts(col);
+        size_t seq = 0;
+        for (uint64_t coord : coords) {
+            if (coord >= starts.back())
+                throw_coord_out_of_range(col, coord);
+            if (coord < starts[seq] || coord >= starts[seq + 1]) {
+                if (coord >= starts[seq + 1] && seq + 2 < starts.size() && coord < starts[seq + 2]) {
+                    ++seq;
+                } else {
+                    seq = std::upper_bound(starts.begin(), starts.end(), coord) - starts.begin() - 1;
+                }
+            }
+            callback(seq, coord - starts[seq]);
+        }
+    }
 
     uint64_t num_columns() const { return coord_offsets_.size(); }
-    uint64_t num_sequences(Column column) const { return headers_[column].size(); }
-    // Get number of k-mers/coordinates in a specific column
+    size_t num_sequences(Column column) const { return headers_[column].size(); }
+    // Number of k-mers in a sequence.
+    uint64_t num_kmers_in_sequence(Column col, size_t seq_id) const;
+    // Total number of k-mers / coordinates in a column (across all sequences).
     uint64_t num_kmers(Column column) const { return coord_offsets_[column].size(); }
+    // FASTA headers of the sequences in a column, indexed by seq_id.
     const std::vector<std::string>& get_headers(Column column) const { return headers_[column]; }
-    size_t num_headers(Column column) const { return headers_[column].size(); }
+
+    /**
+     * The (column, seq_id) of a FASTA header: its first occurrence in column order (a
+     * header is unique within a column, not within the index), or nothing. The reverse
+     * index is built by index_headers() or on the first lookup, and owned by this object,
+     * so it lives and dies with the headers it indexes. load() drops it. Thread-safe,
+     * except against a concurrent load().
+     */
+    std::optional<std::pair<Column, size_t>> find_header(std::string_view header) const;
+
+    // Whether several records carry |header|, in one column or in several.
+    bool is_repeated_header(std::string_view header) const;
+
+    // Builds the reverse header index now, so that no lookup pays for it.
+    void index_headers() const;
+
+    /**
+     * The records of |headers| whose header repeats an earlier record's, in record order:
+     * |callback|(first, repeat) with the 0-based indices of the first occurrence and of the
+     * repeat, once per repeat, until the callback returns false. One pass with a hash set over
+     * the record indices (no header is copied), so a column of 33M headers is checked in O(n).
+     * `annotate --index-header-coords` refuses a column whose headers are not distinct.
+     */
+    static void find_duplicate_headers(const std::vector<std::string> &headers,
+                                       const std::function<bool(size_t, size_t)> &callback);
 
     static constexpr auto kExtension = ".seqs";
 
   private:
+    struct HeaderIndex;
+    const HeaderIndex& header_index() const;
+    std::vector<std::pair<Column, size_t>> records_of(std::string_view header,
+                                                       size_t limit) const;
+
+    // The first coordinate of each sequence of |col|, then the number of coordinates
+    const std::vector<uint64_t>& sequence_starts(Column col) const;
+    [[noreturn]] void throw_coord_out_of_range(Column col, uint64_t coord) const;
+    void reset_sequence_starts();
+
     std::vector<std::vector<std::string>> headers_;
     std::vector<bit_vector_sd> coord_offsets_;
+
+    // map_coords(): built per column on first use; load() drops them
+    mutable std::unique_ptr<std::once_flag[]> sequence_starts_once_;
+    mutable std::vector<std::vector<uint64_t>> sequence_starts_;
+
+    // find_header(): keys are views into |headers_|, which only load() changes, and load()
+    // drops the index first
+    mutable std::mutex header_index_mutex_;
+    mutable std::unique_ptr<const HeaderIndex> header_index_;
 };
 
 } // namespace annot

@@ -1,11 +1,14 @@
 #include "file_utils.hpp"
 
 #include <cassert>
+#include <cstdio>
 #include <csignal>
 #include <cstdlib>
+#include <cerrno>
 #include <filesystem>
 #include <algorithm>
 #include <system_error>
+#include <string>
 
 #if defined(__unix__) || defined(__unix) || defined(unix) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
@@ -13,7 +16,7 @@
 #include <stdio.h>
 #endif
 
-#include <sdsl/memory_management.hpp>
+#include <sdsl/shared_mapper.hpp>
 
 #include "common/logger.hpp"
 
@@ -22,9 +25,34 @@ namespace utils {
 using mtg::common::logger;
 namespace fs = std::filesystem;
 
-std::filesystem::path SWAP_PATH;
-std::vector<std::string> TMP_DIRS;
-std::mutex TMP_DIRS_MUTEX;
+// Function-local statics instead of namespace-scope globals to sidestep a
+// static-initialization-order hazard: test_dump_dir() in test_helpers.hpp
+// calls create_temp_dir() during a test TU's dynamic init, which push_backs
+// into tmp_dirs. If that push runs before this TU's own dynamic init, the
+// vector's default-member-initializers (_M_start = nullptr, ...) later
+// re-run via the default constructor and silently drop the pushed entry.
+// The mutex (constexpr default ctor) and pid_t were not strictly at risk;
+// they're wrapped here for consistency.
+static std::filesystem::path& swap_path() {
+    static std::filesystem::path instance;
+    return instance;
+}
+static std::vector<std::string>& tmp_dirs() {
+    static std::vector<std::string> instance;
+    return instance;
+}
+static std::mutex& tmp_dirs_mutex() {
+    static std::mutex instance;
+    return instance;
+}
+// The pid of the process that first registered a temp dir. Used to skip
+// cleanup in forked children — e.g. gtest's threadsafe death-test style forks
+// the test process, and the child's atexit would otherwise wipe the parent's
+// temp dirs out from under it.
+static pid_t& tmp_dirs_owner_pid() {
+    static pid_t instance = 0;
+    return instance;
+}
 
 static bool WITH_MMAP = false;
 static bool WITH_MADVISE = false;
@@ -45,14 +73,92 @@ bool with_madvise() {
     return WITH_MADVISE;
 }
 
+namespace {
+
+// `sdsl::shared_mapper_ifstream` that remembers the path it was opened from.
+class named_mapper_ifstream : public sdsl::shared_mapper_ifstream {
+  public:
+    named_mapper_ifstream(const std::string &filename, std::ios_base::openmode mode)
+          : sdsl::shared_mapper_ifstream(filename, mode), filename_(filename) {}
+    const std::string& get_filename() const { return filename_; }
+
+  private:
+    std::string filename_;
+};
+
+} // namespace
+
 std::unique_ptr<std::ifstream> open_ifstream(const std::string &filename, bool mmap_stream) {
     std::unique_ptr<std::ifstream> in;
     if (mmap_stream) {
-        in.reset(new sdsl::mmap_ifstream(filename, std::ios_base::binary));
+        in.reset(new named_mapper_ifstream(filename, std::ios_base::binary));
     } else {
-        in.reset(new std::ifstream(filename, std::ios_base::binary));
+        in.reset(new named_ifstream(filename, std::ios_base::binary));
     }
     return in;
+}
+
+const std::string& get_filename(std::istream &f) {
+    if (auto *mmap_in = dynamic_cast<named_mapper_ifstream *>(&f))
+        return mmap_in->get_filename();
+    if (auto *named_in = dynamic_cast<named_ifstream *>(&f))
+        return named_in->get_filename();
+    throw std::runtime_error(
+            "get_filename: stream was not opened by utils::open_ifstream");
+}
+
+void madvise_random_range(std::istream &f, std::streamoff start, std::streamoff length) {
+    if (!with_madvise())
+        return;
+    auto *mmap_in = dynamic_cast<sdsl::shared_mapper_ifstream *>(&f);
+    if (!mmap_in || !mmap_in->mapper())
+        return;
+    const auto &mapping = *mmap_in->mapper();
+    if (length < 0)
+        length = mapping.size() - start;
+    const std::streamoff pagesize = sysconf(_SC_PAGESIZE);
+    std::streamoff aligned_start = start - start % pagesize;
+    // madvise takes a non-const address but does not write to the mapping.
+    if (madvise(reinterpret_cast<char *>(const_cast<uint64_t *>(mapping.data())) + aligned_start,
+                length + (start - aligned_start),
+                MADV_RANDOM)) {
+        logger->warn("madvise(MADV_RANDOM) failed for range [{}, {})", start, start + length);
+    }
+}
+
+void load_mmap_random(const std::string &filename, std::streamoff offset,
+                      const std::function<void(std::istream &)> &fn) {
+    sdsl::shared_mapper_ifstream in(filename);
+    in.seekg(offset, std::ios_base::beg);
+    fn(in);
+    madvise_random_range(in, offset);
+}
+
+std::string file_read_failure_detail(const fs::path &path) {
+    std::error_code ec;
+    fs::file_status st = fs::status(path, ec);
+    // fs::status sets |ec| for errors it can observe via stat(2): nonexistent
+    // path, or a parent directory that we can't traverse (EACCES bubbles up
+    // as std::errc::permission_denied). It does NOT report the case where
+    // the file itself exists and is stat-able but isn't readable — stat
+    // checks directory-traversal perms, not file-read perms. The access()
+    // call below fills that gap.
+    if (ec) {
+        if (ec == std::errc::permission_denied)
+            return std::string(ec.message())
+                    + " (check read permissions on this path and its parent directories)";
+        return ec.message();
+    }
+    if (!fs::exists(st))
+        return "no such file or directory";
+#if defined(__unix__) || defined(__unix) || defined(unix) || (defined(__APPLE__) && defined(__MACH__))
+    if (::access(path.c_str(), R_OK) != 0) {
+        const char *err = std::strerror(errno);
+        return std::string(err ? err : "access failed")
+                + " (missing read permission on this file)";
+    }
+#endif
+    return "could not read contents (possibly corrupted or incompatible)";
 }
 
 std::ofstream open_new_ofstream(const std::string &filename) {
@@ -64,11 +170,11 @@ std::ofstream open_new_ofstream(const std::string &filename) {
 }
 
 void set_swap_path(std::filesystem::path dir_path) {
-    SWAP_PATH = dir_path;
+    swap_path() = dir_path;
 }
 
 std::filesystem::path get_swap_path() {
-    return SWAP_PATH;
+    return swap_path();
 }
 
 void cleanup_tmp_dir_on_signal(int sig) {
@@ -87,7 +193,18 @@ void cleanup_temp_dir_nolock(const std::filesystem::path &tmp_dir) {
 }
 
 void cleanup_tmp_dir_on_exit() {
-    std::for_each(TMP_DIRS.begin(), TMP_DIRS.end(), cleanup_temp_dir_nolock);
+    if (getpid() != tmp_dirs_owner_pid())
+        return;
+    auto &dirs = tmp_dirs();
+    // Static initialization can register this handler before the logger is
+    // constructed, so the logger may already be destroyed at process exit.
+    for (const auto &dir : dirs) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (ec)
+            std::fprintf(stderr, "Failed to clean up temporary directory %s: %s\n",
+                         dir.c_str(), ec.message().c_str());
+    }
 }
 
 std::filesystem::path create_temp_dir(std::filesystem::path path,
@@ -101,9 +218,11 @@ std::filesystem::path create_temp_dir(std::filesystem::path path,
         exit(1);
     }
 
-    std::lock_guard<std::mutex> lock(TMP_DIRS_MUTEX);
+    std::lock_guard<std::mutex> lock(tmp_dirs_mutex());
 
-    if (TMP_DIRS.empty()) {
+    auto &dirs = tmp_dirs();
+    if (dirs.empty()) {
+        tmp_dirs_owner_pid() = getpid();
         if (std::signal(SIGINT, cleanup_tmp_dir_on_signal) == SIG_ERR)
             logger->error("Couldn't reset the signal handler for SIGINT");
         if (std::signal(SIGTERM, cleanup_tmp_dir_on_signal) == SIG_ERR)
@@ -114,17 +233,18 @@ std::filesystem::path create_temp_dir(std::filesystem::path path,
 
     logger->trace("Registered temporary directory {}", tmp_dir_str);
 
-    TMP_DIRS.push_back(tmp_dir_str);
+    dirs.push_back(tmp_dir_str);
 
     return tmp_dir_str;
 }
 
 void remove_temp_dir(std::filesystem::path dir_name) {
     {
-        std::lock_guard<std::mutex> lock(TMP_DIRS_MUTEX);
-        auto it = std::find(TMP_DIRS.begin(), TMP_DIRS.end(), dir_name);
-        assert(it != TMP_DIRS.end());
-        TMP_DIRS.erase(it);
+        std::lock_guard<std::mutex> lock(tmp_dirs_mutex());
+        auto &dirs = tmp_dirs();
+        auto it = std::find(dirs.begin(), dirs.end(), dir_name);
+        assert(it != dirs.end());
+        dirs.erase(it);
     }
     cleanup_temp_dir_nolock(dir_name);
 }

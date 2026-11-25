@@ -5,6 +5,8 @@ import time
 import unittest
 import subprocess
 import socket
+import re
+from pathlib import Path
 import requests
 
 import pandas as pd
@@ -14,7 +16,7 @@ from concurrent.futures import Future
 from parameterized import parameterized, parameterized_class
 from itertools import product
 
-from base import PROTEIN_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR
+from base import PROTEIN_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, start_server
 
 GRAPH_MODES = ['basic'] if PROTEIN_MODE else ['basic', 'canonical', 'primary']
 
@@ -33,18 +35,7 @@ class TestAPIBase(TestingBase):
 
         cls.host = '127.0.0.1'
         os.environ['NO_PROXY'] = cls.host
-        cls.port = 3456
-        num_retries = 100
-        while num_retries > 0:
-            cls.server_process = cls._start_server(cls, graph_path, annotation_path)
-            try:
-                cls.server_process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                break
-            cls.port += 1
-            num_retries -= 1
-        if num_retries == 0:
-            raise "Couldn't start server"
+        cls.server_process, cls.port = start_server(graph_path, annotation_path, cls.host, 3456)
 
         wait_time_sec = 1
         print("Waiting {} sec for the server (PID {}) to start up".format(
@@ -55,12 +46,42 @@ class TestAPIBase(TestingBase):
     def tearDownClass(cls):
         cls.server_process.kill()
 
-    def _start_server(self, graph, annotation):
-        construct_command = f'{METAGRAPH} server_query -i {graph} -a {annotation} \
-                                            --port {self.port} --address {self.host} -p 2'
 
-        return subprocess.Popen(shlex.split(construct_command),
-                                shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+class TestAPIInitializing(TestingBase):
+    def test_client_ready_during_initialization(self):
+        # A FIFO keeps the graph loader blocked while the real HTTP server runs.
+        graph_path = self.tempdir.name + '/loading.dbg'
+        os.mkfifo(graph_path)
+        os.mkfifo(self.tempdir.name + '/annotation.column.annodbg')
+        log_path = Path(self.tempdir.name) / 'server.log'
+        with log_path.open('w') as log:
+            process = subprocess.Popen(
+                [METAGRAPH, 'server_query', '-i', graph_path, '-a',
+                 self.tempdir.name + '/annotation.column.annodbg',
+                 '--port', '0', '--address', '127.0.0.1', '-p', '1'],
+                stdout=log, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 10
+                while True:
+                    output = log_path.read_text()
+                    match = re.search(r'Listening on port (\d+)', output)
+                    if match:
+                        port = int(match.group(1))
+                        break
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail('Server did not start while the loaders were blocked:\n' + output)
+                    time.sleep(0.05)
+                with requests.Session() as session:
+                    session.trust_env = False
+                    response = session.get(f'http://127.0.0.1:{port}/stats', timeout=1)
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(response.headers['Retry-After'], '60')
+                    from unittest.mock import patch
+                    with patch('metagraph.client.requests.get', side_effect=session.get):
+                        self.assertFalse(GraphClientJson('127.0.0.1', port).ready())
+            finally:
+                process.kill()
+                process.wait(timeout=5)
 
 
 # No canonical mode for Protein alphabets
@@ -75,12 +96,34 @@ class TestAPIRaw(TestAPIBase):
                                     url=f'http://{self.host}:{self.port}/{cmd}',
                                     data=payload)
 
+    def test_api_cache_does_not_bypass_missing_fasta(self):
+        warm = self.raw_post_request('search', json.dumps({'FASTA': ''}))
+        self.assertEqual(warm.status_code, 200)
+        response = self.raw_post_request('search', '{}')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Missing or null 'FASTA' field", response.json()['error'])
+
+    def test_api_cache_does_not_bypass_graph_filter_validation(self):
+        warm = self.raw_post_request('search', json.dumps({'FASTA': ''}))
+        self.assertEqual(warm.status_code, 200)
+        response = self.raw_post_request('search', json.dumps({'FASTA': '', 'graphs': []}))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('does not support graph filtering', response.json()['error'])
+
+    def test_api_raw_unknown_field(self):
+        fasta = ">query\nAATAAAGGTGTGAGATAACCCCAGCGGTGCCAGGATCCGTGCA"
+        for cmd in ['search', 'align']:
+            self.assertEqual(200, self.raw_post_request(cmd, json.dumps({'FASTA': fasta})).status_code)
+            ret = self.raw_post_request(cmd, json.dumps({'FASTA': fasta, 'discovery_fracton': 0.1}))
+            self.assertEqual(ret.status_code, 400)
+            self.assertIn("Unknown field 'discovery_fracton'", ret.json()['error'])
+
     def test_api_raw_incomplete_json(self):
         ret = self.raw_post_request('search',
             '{"FASTA": ">query\\nAATAAAGGTGTGAGATAACCCCAGCGGTGCCAGGATCCGTGCA", "discovery_fraction": 0.1,')
 
         self.assertEqual(ret.status_code, 400)
-        self.assertIn("Bad json received:", ret.json()['error'])
+        self.assertIn("Invalid JSON:", ret.json()['error'])
 
     def test_api_raw_invalid_params(self):
         payload = json.dumps({
@@ -105,7 +148,20 @@ class TestAPIRaw(TestAPIBase):
         ret = self.raw_post_request('search', payload)
 
         self.assertEqual(ret.status_code, 400)
-        self.assertIn("No input sequences received from client", ret.json()['error'])
+        self.assertIn("Missing or null 'FASTA' field", ret.json()['error'])
+
+    @parameterized.expand([
+        ('negative', -1), ('minimum_int', -2147483648), ('zero', 0),
+        ('null', None), ('boolean', True), ('fraction', 1.5),
+        ('string', '2'), ('too_large', 2147483648),
+    ])
+    def test_api_raw_invalid_alignment_count(self, name, count):
+        response = self.raw_post_request('align', json.dumps({
+            'FASTA': '', 'max_alternative_alignments': count,
+        }))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("'max_alternative_alignments' must be a positive integer",
+                      response.json()['error'])
 
     def test_api_raw_invalid_discovery_fraction(self):
         payload = json.dumps({
@@ -449,6 +505,13 @@ class TestAPIClientMultiple(TestingBase):
     def tearDownClass(cls):
         cls.server_process.kill()
 
+    def test_api_cache_does_not_bypass_in_ram_validation(self):
+        url = f'http://{self.host}:{self.port}/search'
+        payload = {'FASTA': '', 'graphs': ['G1']}
+        self.assertEqual(requests.post(url, json=payload, timeout=30).status_code, 200)
+        payload['in_ram'] = []
+        self.assertEqual(requests.post(url, json=payload, timeout=30).status_code, 400)
+
     def test_api_query_df_multiple_1(self):
         ret = self.graph_client.search(self.sample_query, parallel=False,
                                        discovery_threshold=0.01, graphs=['G1'])
@@ -660,6 +723,7 @@ class TestAPIClientWithCoordinates(TestAPIBase):
         self.assertEqual(df.shape, (self.sample_query_expected_rows, 4))
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches)
         self.assertEqual(df['kmer_abundances'].size, self.sample_query_expected_rows)
+        self.assertTrue(df['kmer_abundances'].map(lambda x: isinstance(x, str)).all())
 
     def test_api_simple_query_coords_df(self):
         ret = self.graph_client.search(self.sample_query, discovery_fraction=0.01,
@@ -669,6 +733,7 @@ class TestAPIClientWithCoordinates(TestAPIBase):
         self.assertEqual(df.shape, (self.sample_query_expected_rows, 4))
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches)
         self.assertEqual(df['kmer_coords'].size, self.sample_query_expected_rows)
+        self.assertTrue(df['kmer_coords'].map(lambda x: isinstance(x, str)).all())
 
 
 # No canonical mode for Protein alphabets
@@ -718,6 +783,7 @@ class TestAPIClientWithCounts(TestAPIBase):
         self.assertEqual(df.shape, (self.sample_query_expected_rows, 4))
         self.assertEqual(df['kmer_count'].sum(), self.expected_matches)
         self.assertEqual(df['kmer_abundances'].size, self.sample_query_expected_rows)
+        self.assertTrue(df['kmer_abundances'].map(lambda x: isinstance(x, str)).all())
 
     @unittest.expectedFailure
     def test_api_search_no_coordinate_support(self):
@@ -805,3 +871,79 @@ class TestAPIClientParallel(TestAPIBase):
 
         for graph in self.graph_names:
             self.assertIsInstance(dfs[graph], ValueError)
+
+
+class TestAPIServerLoadErrors(TestingBase):
+    """Verify the server prints the offending file path when it fails to load
+    a graph or annotation. Regression guard against a prior bug where the
+    multi-graph regime logged a generic 'Cannot load graph ...' with only
+    the graph path, making it impossible to tell which annotation was bad."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.graph_path = cls.tempdir.name + '/graph.dbg'
+        cls.anno_base = cls.tempdir.name + '/annotation'
+        cls.anno_path = cls.anno_base + '.column.annodbg'
+        cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa', cls.graph_path,
+                         6, 'succinct')
+        cls._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
+                            cls.graph_path, cls.anno_base, 'column')
+
+    @staticmethod
+    def _pick_free_port():
+        """Ask the OS for a free TCP port. There's a tiny race between close()
+        and the server's bind(), but irrelevant here: these tests expect the
+        server to exit during graph/annotation load, before it ever binds."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    def _run_server_expecting_failure(self, argv_tail):
+        """Launch `metagraph server_query <argv_tail>` and return (exit_code, stderr_text)."""
+        cmd = (f'{METAGRAPH} server_query {argv_tail}'
+               f' --port {self._pick_free_port()} --address 127.0.0.1 -p 2')
+        proc = subprocess.Popen(shlex.split(cmd), shell=False,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr = proc.communicate()
+            self.fail(f"Server did not exit within 30s on load failure.\n"
+                      f"stderr so far:\n{stderr.decode(errors='replace')}")
+        return proc.returncode, stderr.decode(errors='replace')
+
+    def _assert_error_line_contains_path(self, stderr, path):
+        """The offending path must appear on a line tagged '[error]', not just
+        somewhere in the log."""
+        error_lines = [l for l in stderr.splitlines() if '[error]' in l]
+        self.assertTrue(
+            any(path in l for l in error_lines),
+            msg=(f"no [error] line mentions path '{path}'.\n"
+                 f"[error] lines:\n" + '\n'.join(error_lines) + '\n'
+                 f"full stderr:\n{stderr}"))
+
+    def test_single_missing_annotation_mentions_annotation_path(self):
+        missing = self.tempdir.name + '/does_not_exist.column.annodbg'
+        rc, stderr = self._run_server_expecting_failure(
+            f'-i {self.graph_path} -a {missing}')
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, missing)
+
+    def test_single_missing_graph_mentions_graph_path(self):
+        missing = self.tempdir.name + '/does_not_exist.dbg'
+        rc, stderr = self._run_server_expecting_failure(
+            f'-i {missing} -a {self.anno_path}')
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, missing)
+
+    def test_multigraph_missing_annotation_mentions_annotation_path(self):
+        missing = self.tempdir.name + '/does_not_exist.column.annodbg'
+        graphs_file = self.tempdir.name + '/graphs_err.txt'
+        with open(graphs_file, 'w') as f:
+            f.write(f'GOOD,{self.graph_path},{self.anno_path}\n')
+            f.write(f'BAD,{self.graph_path},{missing}\n')
+        rc, stderr = self._run_server_expecting_failure(graphs_file)
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, missing)

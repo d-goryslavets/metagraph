@@ -13,8 +13,6 @@ using namespace mtg::graph;
 
 using mtg::graph::boss::BOSS;
 
-const std::string filename = "./benchmark_graph.dbg";
-
 constexpr uint64_t NUM_DISTINCT_INDEXES = 1 << 21;
 constexpr uint64_t PATH_SIZE = 10'000;
 
@@ -54,10 +52,10 @@ std::vector<uint64_t> random_traversal_numbers(const DeBruijnGraph &graph,
         numbers.push_back(dis(gen));
         for (size_t j = 1; j < path_size && numbers.size() < size; ++j) {
             bool found = false;
-            graph.adjacent_outgoing_nodes(numbers.back(), [&](auto next) {
+            for (auto next : graph.adjacent_outgoing_nodes(numbers.back())) {
                 found = true;
                 numbers.push_back(next);
-            });
+            }
             if (!found)
                 break;
         }
@@ -99,6 +97,21 @@ DEFINE_BOSS_BENCHMARK(succ_last,           succ_last,           get_last, size);
 DEFINE_BOSS_BENCHMARK(bwd,                 bwd,                 get_W,    size);
 
 
+// Include mask allocation in the measured operation.
+static void BM_BOSS_mark_sink_dummy_edges(benchmark::State &state) {
+    auto graph = load_graph(state);
+    const BOSS &boss = graph->get_boss();
+
+    for (auto _ : state) {
+        sdsl::bit_vector mask(boss.num_edges() + 1, false);
+        uint64_t count = boss.mark_sink_dummy_edges(&mask);
+        benchmark::DoNotOptimize(count);
+        benchmark::ClobberMemory();
+    }
+}
+BENCHMARK(BM_BOSS_mark_sink_dummy_edges) -> Unit(benchmark::kMicrosecond);
+
+
 #define DEFINE_BOSS_PATH_BENCHMARK(NAME, OPERATION, BWD_CACHE, RC_INDEX) \
 static void BM_BOSS_##NAME(benchmark::State& state) { \
     auto base_graph = load_graph(state); \
@@ -119,18 +132,18 @@ static void BM_BOSS_##NAME(benchmark::State& state) { \
     size_t i = 0; \
     for (auto _ : state) { \
         DeBruijnGraph::node_index node = indexes[i++ % size]; \
-        graph->OPERATION(node, [](auto node, char c) { \
-            benchmark::DoNotOptimize(node); \
+        for (auto [next, c] : graph->OPERATION(node)) { \
+            benchmark::DoNotOptimize(next); \
             benchmark::DoNotOptimize(c); \
-        }); \
+        } \
     } \
 } \
 BENCHMARK(BM_BOSS_##NAME) -> Unit(benchmark::kMicrosecond); \
 
-DEFINE_BOSS_PATH_BENCHMARK(call_outgoing_kmers_path, call_outgoing_kmers, false, false);
-DEFINE_BOSS_PATH_BENCHMARK(call_outgoing_kmers_bwdcache_path, call_outgoing_kmers, true, false);
-DEFINE_BOSS_PATH_BENCHMARK(call_outgoing_kmers_rcindex_path, call_outgoing_kmers, false, true);
-DEFINE_BOSS_PATH_BENCHMARK(call_outgoing_kmers_bwdcache_rcindex_path, call_outgoing_kmers, true, true);
+DEFINE_BOSS_PATH_BENCHMARK(outgoing_kmers_path, outgoing_kmers, false, false);
+DEFINE_BOSS_PATH_BENCHMARK(outgoing_kmers_bwdcache_path, outgoing_kmers, true, false);
+DEFINE_BOSS_PATH_BENCHMARK(outgoing_kmers_rcindex_path, outgoing_kmers, false, true);
+DEFINE_BOSS_PATH_BENCHMARK(outgoing_kmers_bwdcache_rcindex_path, outgoing_kmers, true, true);
 
 
 static void BM_BOSS_get_W_and_fwd(benchmark::State &state) {

@@ -28,11 +28,11 @@ node_index row_diff_successor(const graph::DeBruijnGraph &graph,
     } else {
         assert(rd_succ.size());
         node_index succ = graph::DeBruijnGraph::npos;
-        graph.adjacent_outgoing_nodes(node, [&](node_index adjacent_node) {
+        for (node_index adjacent_node : graph.adjacent_outgoing_nodes(node)) {
             if (rd_succ[adjacent_node]) {
                 succ = adjacent_node;
             }
-        });
+        }
         assert(graph.in_graph(succ) && "a row diff successor must exist");
         return succ;
     }
@@ -42,36 +42,38 @@ node_index row_diff_successor(const graph::DeBruijnGraph &graph,
 namespace matrix {
 
 void IRowDiff::load_anchor(const std::string &filename) {
-    if (!std::filesystem::exists(filename)) {
-        common::logger->error("Can't read anchor file: {}", filename);
-        std::exit(1);
-    }
     std::unique_ptr<std::ifstream> f = utils::open_ifstream(filename);
     if (!f->good()) {
-        common::logger->error("Could not open anchor file {}", filename);
+        logger->error("Cannot open anchor file '{}': {}", filename,
+                      utils::file_read_failure_detail(filename));
         std::exit(1);
     }
-    anchor_.load(*f);
+    if (!anchor_.load(*f)) {
+        logger->error("Cannot load anchor from '{}': {}", filename,
+                      utils::file_read_failure_detail(filename));
+        std::exit(1);
+    }
 }
 
 void IRowDiff::load_fork_succ(const std::string &filename) {
-    if (!std::filesystem::exists(filename)) {
-        common::logger->error("Can't read fork successor file: {}", filename);
-        std::exit(1);
-    }
     std::unique_ptr<std::ifstream> f = utils::open_ifstream(filename);
     if (!f->good()) {
-        common::logger->error("Could not open fork successor file {}", filename);
+        logger->error("Cannot open fork successor file '{}': {}", filename,
+                      utils::file_read_failure_detail(filename));
         std::exit(1);
     }
-    fork_succ_.load(*f);
+    if (!fork_succ_.load(*f)) {
+        logger->error("Cannot load fork successor bitmap from '{}': {}", filename,
+                      utils::file_read_failure_detail(filename));
+        std::exit(1);
+    }
 }
 
 std::tuple<std::vector<BinaryMatrix::Row>,
            std::vector<std::vector<size_t>>,
            std::vector<size_t>,
            std::vector<std::vector<size_t>>>
-IRowDiff::get_rd_ids(const std::vector<BinaryMatrix::Row> &row_ids, size_t num_threads) const {
+IRowDiff::get_rd_ids(std::span<const BinaryMatrix::Row> row_ids, size_t num_threads) const {
     assert(graph_ && "graph must be loaded");
     assert(!fork_succ_.size() || fork_succ_.size() == graph_->max_index() + 1);
     num_threads = std::max<size_t>(1, num_threads);

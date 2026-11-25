@@ -30,6 +30,8 @@ size_t LabelEncoder<Label>::encode(const Label &label) const {
 
 template<>
 void LabelEncoder<std::string>::serialize(std::ostream &outstream) const {
+    // TODO: the next format version should store only the labels. load() rebuilds
+    // the hash buckets from them, because std::hash differs between standard libraries.
     outstream.write("LE-v2.0", 7);
     Serializer serializer(outstream);
     data().serialize(serializer);
@@ -54,7 +56,11 @@ bool LabelEncoder<std::string>::load(std::istream &instream) {
         std::string version(7, '\0');
         if (instream.read(version.data(), 7) && version == "LE-v2.0") {
             Deserializer deserializer(instream);
-            encode_label_ = VectorSet<std::string>::deserialize(deserializer, true);
+            // Read the saved buckets to consume the entire record, then rebuild them:
+            // std::hash values can differ between the writer's and reader's toolchains.
+            auto labels = to_vector(VectorSet<std::string>::deserialize(deserializer, true));
+            encode_label_ = VectorSet<std::string>(std::make_move_iterator(labels.begin()),
+                                                   std::make_move_iterator(labels.end()));
             return instream.good();
         }
         // backward compatibility
@@ -141,7 +147,7 @@ typename MultiLabelAnnotation<LabelType>::VLabels
 MultiLabelAnnotation<LabelType>::get_labels(Index i) const {
     assert(i < this->num_objects());
 
-    auto label_codes = get_matrix().get_rows({ i })[0];
+    auto label_codes = get_matrix().get_rows({ &i, 1 })[0];
 
     VLabels labels(label_codes.size());
 

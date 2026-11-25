@@ -1,11 +1,14 @@
 #include "annotated_dbg.hpp"
 
-#include <array>
+#include <algorithm>
 #include <cstdlib>
 #include <fstream> // for batched read extaction DEBUG
+#include <limits>
+#include <span>
 #include <unordered_set>
 
-#include <tsl/hopscotch_set.h>
+#include <fmt/format.h>
+
 #include <tsl/hopscotch_map.h>
 
 #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
@@ -16,14 +19,13 @@
 #include "graph/representation/canonical_dbg.hpp"
 #include "annotation/coord_to_header.hpp"
 #include "common/algorithms.hpp"
-#include "common/aligned_vector.hpp"
 #include "common/utils/template_utils.hpp"
-#include "common/vectors/vector_algorithm.hpp"
 #include "common/vector_map.hpp"
 #include "common/logger.hpp"
 #include "annotation/int_matrix/row_diff/tuple_row_diff.hpp"
 #include "annotation/int_matrix/rank_extended/tuple_csc_matrix.hpp"
 #include "graph/alignment/alignment.hpp"
+
 
 namespace mtg {
 namespace graph {
@@ -36,7 +38,6 @@ using mtg::annot::matrix::CSRMatrix;
 using mtg::annot::matrix::RowMajor;
 using mtg::annot::matrix::UniqueRowBinmat;
 using Column = mtg::annot::matrix::BinaryMatrix::Column;
-using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
 
 using mtg::annot::matrix::TupleRowDiff;
 using mtg::annot::matrix::ITupleRowDiff;
@@ -74,10 +75,10 @@ void AnnotatedSequenceGraph
     std::vector<row_index> indices;
     indices.reserve(sequence.size());
 
-    graph_->map_to_nodes(sequence, [&](node_index i) {
+    for (node_index i : graph_->node_range(sequence)) {
         if (i > 0)
             indices.push_back(graph_to_anno_index(i));
-    });
+    }
 
     if (!indices.size())
         return;
@@ -107,10 +108,10 @@ void AnnotatedSequenceGraph
         if (!indices.capacity())
             indices.reserve(data[t].first.size());
 
-        graph_->map_to_nodes(data[t].first, [&](node_index i) {
+        for (node_index i : graph_->node_range(data[t].first)) {
             if (i > 0)
                 indices.push_back(graph_to_anno_index(i));
-        });
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -144,13 +145,13 @@ void AnnotatedDBG::add_kmer_counts(std::string_view sequence,
     indices.reserve(sequence.size() - dbg_.get_k() + 1);
     size_t end = 0;
 
-    graph_->map_to_nodes(sequence, [&](node_index i) {
+    for (node_index i : graph_->node_range(sequence)) {
         // only insert indexes for matched k-mers and shift counts accordingly
         if (i > 0) {
             indices.push_back(graph_to_anno_index(i));
             kmer_counts[indices.size() - 1] = kmer_counts[end++];
         }
-    });
+    }
 
     kmer_counts.resize(end);
 
@@ -227,13 +228,13 @@ void AnnotatedDBG::annotate_kmer_coords(
             coords[last].reserve(sequence.size() - dbg_.get_k() + 1);
         }
 
-        graph_->map_to_nodes(sequence, [&](node_index i) {
+        for (node_index i : graph_->node_range(sequence)) {
             if (i > 0) {
                 ids[last].push_back(graph_to_anno_index(i));
                 coords[last].emplace_back(graph_to_anno_index(i), coord);
             }
             coord++;
-        });
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -267,13 +268,12 @@ std::vector<Label> AnnotatedDBG::get_labels(std::string_view sequence,
         return {};
 
     if (coord_to_header_) {
-        auto kmer_coord_res = get_kmer_coordinates(sequence, std::numeric_limits<size_t>::max(),
-                                                   discovery_fraction, presence_fraction);
+        auto counts = get_top_labels(sequence, std::numeric_limits<size_t>::max(),
+                                     discovery_fraction, presence_fraction);
         std::vector<Label> result;
-        result.reserve(kmer_coord_res.size());
-        for (auto &[label, count, coords] : kmer_coord_res) {
+        result.reserve(counts.size());
+        for (auto &[label, count] : counts)
             result.emplace_back(std::move(label));
-        }
         return result;
     }
 
@@ -284,12 +284,12 @@ std::vector<Label> AnnotatedDBG::get_labels(std::string_view sequence,
 
     size_t num_present_kmers = 0;
 
-    graph_->map_to_nodes(sequence, [&](node_index i) {
+    for (node_index i : graph_->node_range(sequence)) {
         if (i > 0) {
             index_counts[graph_to_anno_index(i)]++;
             num_present_kmers++;
         }
-    });
+    }
 
     size_t min_count = get_min_count(discovery_fraction, presence_fraction,
                                      num_kmers, num_present_kmers);
@@ -319,30 +319,12 @@ AnnotatedSequenceGraph::get_labels(node_index index) const {
     return annotator_->get_labels(graph_to_anno_index(index));
 }
 
-// Container `code_counts` must have pairs (index, count)
-template <class Container>
-void top_n_sorted(Container& code_counts, size_t num_top_labels) {
-    assert(num_top_labels <= code_counts.size());
-    auto comp = [](const auto &x, const auto &y) {
-        return std::make_pair(y.second, x.first)
-              < std::make_pair(x.second, y.first);
-    };
-    std::nth_element(code_counts.begin(),
-                     code_counts.begin() + num_top_labels,
-                     code_counts.end(),
-                     comp);
-    // leave only the first |num_top_labels| top labels
-    code_counts.resize(num_top_labels);
-    // sort the top labels by counts
-    std::sort(code_counts.begin(), code_counts.end(), comp);
-}
 
 template <class Container>
 std::vector<StringCountPair> filter_and_decode(Container&& code_counts,
                                                const annot::LabelEncoder<> &label_encoder,
-                                               size_t num_top_labels) {
-    if (code_counts.size() > num_top_labels)
-        top_n_sorted(code_counts, num_top_labels);
+                                               size_t num_top_labels, SearchCut *cut = nullptr) {
+    top_n_sorted(code_counts, num_top_labels, cut);
 
     // TODO: remove this step? (return (code, count) pairs and defer label decoding to the caller)
     std::vector<StringCountPair> label_counts;
@@ -359,7 +341,9 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
                              size_t num_top_labels,
                              double discovery_fraction,
                              double presence_fraction,
-                             bool with_kmer_counts) const {
+                             bool with_kmer_counts, SearchCut *cut) const {
+    if (cut)
+        *cut = {};
     assert(discovery_fraction >= 0.);
     assert(discovery_fraction <= 1.);
     assert(presence_fraction >= 0.);
@@ -370,19 +354,13 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
         return {};
 
     if (coord_to_header_) {
-        auto kmer_coord_res = get_kmer_coordinates(sequence, num_top_labels,
-                                                   discovery_fraction, presence_fraction);
+        auto counts = get_header_results<size_t>(sequence, num_top_labels,
+                                                discovery_fraction, presence_fraction,
+                                                with_kmer_counts, nullptr, cut);
         std::vector<StringCountPair> result;
-        result.reserve(kmer_coord_res.size());
-        for (auto &[label, count, coords] : kmer_coord_res) {
-            if (with_kmer_counts) {
-                count = 0;
-                for (const auto &tuple : coords) {
-                    count += tuple.size();
-                }
-            }
+        result.reserve(counts.size());
+        for (auto &[label, matches, count] : counts)
             result.emplace_back(std::move(label), count);
-        }
         return result;
     }
 
@@ -393,12 +371,12 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
 
     size_t num_present_kmers = 0;
 
-    graph_->map_to_nodes(sequence, [&](node_index i) {
+    for (node_index i : graph_->node_range(sequence)) {
         if (i > 0) {
             index_counts[graph_to_anno_index(i)]++;
             num_present_kmers++;
         }
-    });
+    }
 
     size_t min_count = get_min_count(discovery_fraction, presence_fraction,
                                      num_kmers, num_present_kmers);
@@ -409,11 +387,11 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
     if (with_kmer_counts) {
         result = filter_and_decode(dynamic_cast<const IntMatrix &>(annotator_->get_matrix())
                                         .sum_row_values(index_counts.values_container(), min_count),
-                                   annotator_->get_label_encoder(), num_top_labels);
+                                   annotator_->get_label_encoder(), num_top_labels, cut);
     } else {
         result = filter_and_decode(annotator_->get_matrix()
                                         .sum_rows(index_counts.values_container(), min_count),
-                                   annotator_->get_label_encoder(), num_top_labels);
+                                   annotator_->get_label_encoder(), num_top_labels, cut);
     }
 
     assert(with_kmer_counts || std::all_of(result.begin(), result.end(),
@@ -423,17 +401,528 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
 }
 
 
+namespace {
+using Header = std::pair<Column, size_t>;
+using HeaderCounts = std::vector<std::pair<Header, size_t>>;
+
+// Annotation rows decoded at a time for the queries by sequence record. A row holds a
+// coordinate for every record with its k-mer, so the rows of a whole query can take far
+// more memory than the result. Row-diff rows share their paths within a block, which a
+// small block loses.
+constexpr size_t kRowBlock = 256;
+
+// Bytes of per-position values that the fold of a query by sequence record holds before
+// it frees those of the records that can no longer be returned. If the records that
+// still can be returned hold more than half of it and are more than the query returns,
+// the fold keeps only the counts, and the rows are read again after the cut for the
+// returned records. Debug builds have no budget, so that the tests check both ways.
+#ifdef NDEBUG
+constexpr size_t kFoldValuesBudget = size_t(16) << 20;
+#else
+constexpr size_t kFoldValuesBudget = 0;
+#endif
+
+// Append the rows of |rows| not seen yet to |distinct|, in the order of their first
+// occurrence, and the index in |distinct| of each row to |index|
+void index_distinct_rows(std::span<const AnnotatedDBG::row_index> rows,
+                         tsl::hopscotch_map<AnnotatedDBG::row_index, uint32_t> &seen,
+                         std::vector<AnnotatedDBG::row_index> &distinct,
+                         std::vector<uint32_t> &index) {
+    for (AnnotatedDBG::row_index row : rows) {
+        auto [it, inserted] = seen.try_emplace(row, distinct.size());
+        if (inserted)
+            distinct.push_back(row);
+        index.push_back(it->second);
+    }
+}
+
+// Call |callback|(i, row of rows[i]) for i in order, decoding |kRowBlock| rows at a time
+// and each distinct row of a block once
+template <class Callback>
+void call_row_tuples(const MultiIntMatrix &matrix, std::span<const AnnotatedDBG::row_index> rows,
+                     const Callback &callback) {
+    std::vector<AnnotatedDBG::row_index> distinct;
+    std::vector<uint32_t> index;
+    tsl::hopscotch_map<AnnotatedDBG::row_index, uint32_t> seen;
+    for (size_t begin = 0; begin < rows.size(); begin += kRowBlock) {
+        const size_t end = std::min(rows.size(), begin + kRowBlock);
+        distinct.clear();
+        index.clear();
+        seen.clear();
+        index_distinct_rows(rows.subspan(begin, end - begin), seen, distinct, index);
+        const auto decoded = matrix.get_row_tuples(distinct);
+        for (size_t i = begin; i < end; ++i) {
+            callback(i, decoded[index[i - begin]]);
+        }
+    }
+}
+
+// The rows of a query, each distinct row once. A k-mer repeated m times (a poly-A
+// query) has one row, which can hold millions of coordinates.
+struct QueryRows {
+    // the rows in the order of their first position
+    std::vector<AnnotatedDBG::row_index> distinct;
+    // the index in |distinct| of the row at each position
+    std::vector<uint32_t> row_of;
+    // of each distinct row: its first query position and its number of positions
+    std::vector<size_t> first_position;
+    std::vector<uint32_t> weight;
+    // the distinct rows of more than one position, and the index in |repeated| of each
+    std::vector<AnnotatedDBG::row_index> repeated;
+    std::vector<uint32_t> repeated_of;
+
+    QueryRows(std::span<const AnnotatedDBG::row_index> rows, std::span<const size_t> positions) {
+        {
+            tsl::hopscotch_map<AnnotatedDBG::row_index, uint32_t> seen;
+            index_distinct_rows(rows, seen, distinct, row_of);
+        }
+        first_position.resize(distinct.size());
+        weight.assign(distinct.size(), 0);
+        for (size_t i = 0; i < row_of.size(); ++i) {
+            if (!weight[row_of[i]]++)
+                first_position[row_of[i]] = positions[i];
+        }
+        repeated_of.resize(distinct.size());
+        for (size_t i = 0; i < distinct.size(); ++i) {
+            if (weight[i] > 1) {
+                repeated_of[i] = repeated.size();
+                repeated.push_back(distinct[i]);
+            }
+        }
+    }
+};
+
+// Call |callback|(j, r, coordinate) for each coordinate of rows[j] in the record
+// counts[r], for j in order
+template <class Callback>
+void call_selected_coords(const MultiIntMatrix &matrix, const annot::CoordToHeader &mapping,
+                          std::span<const AnnotatedDBG::row_index> rows,
+                          const HeaderCounts &counts, const Callback &callback) {
+    if (rows.empty() || counts.empty())
+        return;
+    tsl::hopscotch_map<Header, uint32_t> selected; // index in |counts|
+    selected.reserve(counts.size());
+    for (size_t r = 0; r < counts.size(); ++r) {
+        selected.emplace(counts[r].first, r);
+    }
+    call_row_tuples(matrix, rows, [&](size_t j, const MultiIntMatrix::RowTuples &row) {
+        for (const auto &[col, coords] : row) {
+            if (!mapping.num_sequences(col))
+                continue;
+            mapping.map_coords(col, coords, [&](size_t seq, uint64_t coord) {
+                auto it = selected.find(Header{ col, seq });
+                if (it != selected.end())
+                    callback(j, it->second, coord);
+            });
+        }
+    });
+}
+
+// The values of the records of |counts| at the positions of the repeated rows, whose
+// values the fold does not hold. The value is each coordinate of the record there or,
+// with |count|, their number. A value is held once per row and spread over the
+// positions of the row one record at a time.
+class RepeatedValues {
+  public:
+    RepeatedValues(const MultiIntMatrix &matrix, const annot::CoordToHeader &mapping,
+                   const QueryRows &q, std::span<const size_t> positions,
+                   const HeaderCounts &counts, bool count)
+          : positions_(q.repeated.size()), hits_(counts.size()) {
+        for (size_t i = 0; i < q.row_of.size(); ++i) {
+            const uint32_t d = q.row_of[i];
+            if (q.weight[d] > 1)
+                positions_[q.repeated_of[d]].push_back(positions[i]);
+        }
+        call_selected_coords(matrix, mapping, q.repeated, counts,
+                             [&](size_t j, uint32_t r, uint64_t coord) {
+            if (!count) {
+                hits_[r].emplace_back(j, coord);
+            } else if (hits_[r].size() && hits_[r].back().first == j) {
+                ++hits_[r].back().second;
+            } else {
+                hits_[r].emplace_back(j, 1);
+            }
+        });
+    }
+
+    // The (position, value) pairs of counts[r], to take once, with
+    // room for |num_more| pairs
+    std::vector<std::pair<uint32_t, uint64_t>> take(size_t r, size_t num_more = 0) {
+        const auto hits = std::move(hits_[r]);
+        size_t num_values = num_more;
+        for (const auto &[j, value] : hits) {
+            num_values += positions_[j].size();
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> values;
+        values.reserve(num_values);
+        for (const auto &[j, value] : hits) {
+            for (uint32_t pos : positions_[j]) {
+                values.emplace_back(pos, value);
+            }
+        }
+        return values;
+    }
+
+  private:
+    // the query positions of each repeated row, ascending
+    std::vector<std::vector<uint32_t>> positions_;
+    // (index of the repeated row, value) of each record, by row
+    std::vector<std::vector<std::pair<uint32_t, uint64_t>>> hits_;
+};
+
+/**
+ * The sequence records (headers) that the coordinates of annotation rows fall in, with
+ * the number of rows matching each record and, on request, a value per query position.
+ * Rows are added one by one, so they can be decoded in blocks and dropped. The records
+ * are kept in the order of their first match.
+ */
+class RecordFold {
+  public:
+    enum Values {
+        kNone,
+        kAbundance, // the coordinates of the record over all rows
+        kPresence,  // the positions matching the record
+        kCounts,    // the number of the record's coordinates at each matching position
+        kCoords,    // the record's local coordinates at each matching position
+    };
+
+    // a run of query positions [pos, pos + len) with one value (kPresence, kCounts), or
+    // with the coordinates value, value + 1, ... (kCoords)
+    struct Run {
+        uint32_t pos;
+        uint32_t len;
+        uint64_t value;
+    };
+
+    // |min_count|, |num_top|: the cut that select() will make. |total_weight|: the
+    // weight of all rows to be added. With them, the fold knows the records that can no
+    // longer be returned, whose per-position values it need not hold.
+    RecordFold(const annot::CoordToHeader &mapping, Values values, size_t min_count = 0,
+               size_t num_top = std::numeric_limits<size_t>::max(), size_t total_weight = 0)
+          : mapping_(mapping), values_(values), min_count_(min_count), num_top_(num_top),
+            total_weight_(total_weight) {}
+
+    // Add the row of query position |pos|, counted |weight| times, and without |values|
+    // only counted. With per-position values, the positions must come in ascending
+    // order, each once.
+    void add_row(const MultiIntMatrix::RowTuples &row, size_t pos, size_t weight = 1,
+                 bool values = true) {
+        const Values values_to_add = values ? values_ : kNone;
+        // runs hold 32-bit positions, and the end of a run is one past its last position
+        if (pos >= std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("A sequence queried by sequence record must have fewer "
+                                     "than 2^32 k-mers");
+        }
+        ++row_;
+        for (const auto &entry : row) {
+            const Column column = entry.first;
+            const auto &coords = entry.second;
+            if (column >= mapping_.num_columns()) {
+                throw std::runtime_error(fmt::format("Column {} is out of range: CoordToHeader "
+                                                     "has {} columns", column, mapping_.num_columns()));
+            }
+            // a column without sequence records has no header labels
+            if (!mapping_.num_sequences(column))
+                continue;
+            Slots &slots = slots_[column];
+            mapping_.map_coords(column, coords, [&](size_t seq_id, uint64_t local_coord) {
+                uint32_t &slot = slots.at(seq_id, mapping_.num_sequences(column));
+                if (!slot) {
+                    if (records_.size() == std::numeric_limits<uint32_t>::max())
+                        throw std::runtime_error("A query matches 2^32 or more sequence records");
+                    // a record first met too late to be returned holds no values
+                    records_.push_back({ Header{column, seq_id}, 0, 0, 0, {}, 0, 0, 0,
+                                         !dropped_ && remaining_weight() >= out_below_ });
+                    slot = records_.size();
+                }
+                Record &record = records_[slot - 1];
+                const bool first = record.last_row != row_;
+                if (first) {
+                    record.last_row = row_;
+                    if (!reading_again_)
+                        record.count += weight;
+                }
+                const size_t runs_before = record.runs.size();
+                switch (record.keeps_values ? values_to_add : kNone) {
+                    case kNone:
+                        break;
+                    case kAbundance:
+                        record.abundance += weight;
+                        break;
+                    case kPresence:
+                    case kCounts:
+                        if (first) {
+                            close_last_run(record.runs);
+                            record.runs.push_back({ static_cast<uint32_t>(pos), 1, 1 });
+                        } else if (values_ == kCounts) {
+                            ++record.runs.back().value;
+                        }
+                        break;
+                    case kCoords:
+                        if (first)
+                            open_runs(record, pos);
+                        add_coord(record, pos, local_coord);
+                        break;
+                }
+                // a run is only merged into the one before when one is added
+                num_runs_ += record.runs.size() - runs_before;
+            });
+        }
+        seen_weight_ += weight;
+        if (!reading_again_ && num_runs_ * sizeof(Run) > check_bytes_)
+            limit_values();
+    }
+
+    // After select(): true if the fold kept only the counts. The values of |selected|
+    // are then held by adding the rows again after hold_only(selected).
+    bool dropped(const HeaderCounts &selected) const {
+        // a record that lost its values alone could not be returned
+        assert(dropped_ || std::all_of(selected.begin(), selected.end(), [&](const auto &h) {
+            return record(h.first).keeps_values;
+        }));
+        (void)selected;
+        return dropped_;
+    }
+
+    // Hold the values of the records of |selected| only, for the rows added from now
+    // on: the rows added before, added again. The counts stay.
+    void hold_only(const HeaderCounts &selected) {
+        assert(!num_runs_);
+        for (const auto &[header, count] : selected) {
+            record(header).keeps_values = true;
+        }
+        reading_again_ = true;
+    }
+
+    // The records matched by at least |min_count| rows: all of them in the order of
+    // their first match, or the |num_top| with the most matches, sorted
+    HeaderCounts select(size_t min_count, size_t num_top, size_t *num_passed = nullptr, SearchCut *cut = nullptr) const {
+        HeaderCounts counts;
+        for (const Record &record : records_) {
+            if (record.count >= min_count)
+                counts.emplace_back(record.header, record.count);
+        }
+        if (num_passed)
+            *num_passed = counts.size();
+        top_n_sorted(counts, num_top, cut);
+        return counts;
+    }
+
+    size_t abundance(const Header &header) const { return record(header).abundance; }
+
+    // The runs of a record: in ascending order of position, or (kCoords) in any order
+    std::vector<Run> take_runs(const Header &header) {
+        std::vector<Run> runs = std::move(record(header).runs);
+        if (values_ != kCoords)
+            close_last_run(runs);
+        return runs;
+    }
+
+  private:
+    struct Record {
+        Header header;
+        size_t count;
+        size_t abundance;
+        size_t last_row;
+        std::vector<Run> runs;
+        // kCoords: the runs [open_begin, open_end) can continue at the position being
+        // added, in the order of their next coordinate. Those before |open_next| were
+        // continued or passed.
+        uint32_t open_begin;
+        uint32_t open_next;
+        uint32_t open_end;
+        // false once the record can no longer be returned, or for all records once the
+        // fold keeps only the counts
+        bool keeps_values;
+    };
+
+    // The index + 1 in |records_| of each sequence of a column, 0 for the ones not met:
+    // a hash map until an eighth of the column's sequences are met, an array after that
+    struct Slots {
+        tsl::hopscotch_map<size_t, uint32_t> sparse;
+        std::vector<uint32_t> dense;
+
+        uint32_t& at(size_t seq_id, size_t num_sequences) {
+            if (dense.empty()) {
+                if (sparse.size() * 8 < num_sequences)
+                    return sparse[seq_id];
+                dense.assign(num_sequences, 0);
+                for (const auto &[seq, slot] : sparse) {
+                    dense[seq] = slot;
+                }
+                sparse = {};
+            }
+            return dense[seq_id];
+        }
+        uint32_t get(size_t seq_id) const {
+            if (dense.size())
+                return dense[seq_id];
+            auto it = sparse.find(seq_id);
+            return it == sparse.end() ? 0 : it->second;
+        }
+    };
+
+    Record& record(const Header &header) {
+        return records_[slots_.at(header.first).get(header.second) - 1];
+    }
+    const Record& record(const Header &header) const {
+        return records_[slots_.at(header.first).get(header.second) - 1];
+    }
+
+    // Join the last run with the one before it if it continues it with the same value.
+    // The last run of a record is the position being added, whose value can still grow.
+    static void close_last_run(std::vector<Run> &runs) {
+        if (runs.size() < 2)
+            return;
+        Run &previous = runs[runs.size() - 2];
+        const Run &last = runs.back();
+        if (previous.pos + previous.len == last.pos && previous.value == last.value) {
+            previous.len += last.len;
+            runs.pop_back();
+        }
+    }
+
+    // the coordinate that continues |run| at the position after its last one
+    static uint64_t next_coord(const Run &run) { return run.value + run.len; }
+
+    // Before the first coordinate of |pos|: find the runs that end at the position
+    // before, which the coordinates of |pos| can continue. A record met at several
+    // coordinates per position (a repeat) has one such run per coordinate.
+    static void open_runs(Record &record, size_t pos) {
+        std::vector<Run> &runs = record.runs;
+        const auto open = std::partition(runs.begin() + record.open_begin, runs.end(),
+                                         [&](const Run &run) {
+            return static_cast<size_t>(run.pos) + run.len != pos;
+        });
+        std::sort(open, runs.end(), [](const Run &a, const Run &b) {
+            return next_coord(a) < next_coord(b);
+        });
+        record.open_begin = open - runs.begin();
+        record.open_next = record.open_begin;
+        record.open_end = runs.size();
+    }
+
+    // Continue the open run that |coord| at |pos| follows, or start a run. The
+    // coordinates of a position come in ascending order, as the open runs do.
+    static void add_coord(Record &record, size_t pos, uint64_t coord) {
+        std::vector<Run> &runs = record.runs;
+        while (record.open_next < record.open_end
+                && next_coord(runs[record.open_next]) < coord) {
+            ++record.open_next;
+        }
+        if (record.open_next < record.open_end && next_coord(runs[record.open_next]) == coord) {
+            ++runs[record.open_next++].len;
+        } else {
+            runs.push_back({ static_cast<uint32_t>(pos), 1, coord });
+        }
+    }
+
+    // the weight of the rows still to be added
+    size_t remaining_weight() const {
+        return total_weight_ > seen_weight_ ? total_weight_ - seen_weight_ : 0;
+    }
+
+    void drop_values(Record &record) {
+        num_runs_ -= record.runs.size();
+        // free the buffer: assigning {} would keep its capacity
+        std::vector<Run>().swap(record.runs);
+        record.open_begin = record.open_next = record.open_end = 0;
+        record.keeps_values = false;
+    }
+
+    // Past the budget: free the values of the records that can no longer be returned.
+    // Such a record has fewer matches, even if all rows to come match it, than
+    // |min_count_| or than |num_top_| records have now (counts only grow). The values
+    // of a record seen at scattered positions take a run each, for every record until
+    // the cut. If the records that still can be returned are more than |num_top_| and
+    // hold more than half the budget, keep only the counts: they and the order of the
+    // records don't depend on the values, which are read again after the cut.
+    void limit_values() {
+        size_t out_below = min_count_;
+        if (num_top_ && records_.size() >= num_top_) {
+            std::vector<size_t> counts;
+            counts.reserve(records_.size());
+            for (const Record &record : records_) {
+                counts.push_back(record.count);
+            }
+            std::nth_element(counts.begin(), counts.begin() + (num_top_ - 1), counts.end(),
+                             std::greater<size_t>());
+            out_below = std::max(out_below, counts[num_top_ - 1]);
+        }
+        out_below_ = std::max(out_below_, out_below);
+        const size_t remaining = remaining_weight();
+        size_t num_kept = 0;
+        for (Record &record : records_) {
+            if (record.keeps_values && record.count + remaining < out_below_)
+                drop_values(record);
+            num_kept += record.keeps_values;
+        }
+        const size_t bytes = num_runs_ * sizeof(Run);
+        if (num_kept > num_top_ && bytes > kFoldValuesBudget / 2) {
+            for (Record &record : records_) {
+                drop_values(record);
+            }
+            dropped_ = true;
+        } else {
+            // check again when the values have doubled
+            check_bytes_ = std::max(kFoldValuesBudget, 2 * bytes);
+        }
+    }
+
+    const annot::CoordToHeader &mapping_;
+    const Values values_;
+    const size_t min_count_;
+    const size_t num_top_;
+    const size_t total_weight_;
+    size_t seen_weight_ = 0;
+    // the bytes of runs held, and those past which limit_values() is called
+    size_t num_runs_ = 0;
+    size_t check_bytes_ = kFoldValuesBudget;
+    // a record with fewer matches than this at the end is not returned
+    size_t out_below_ = 0;
+    // the fold kept only the counts
+    bool dropped_ = false;
+    // the rows are added a second time, for the values of the returned records
+    bool reading_again_ = false;
+    size_t row_ = 0;
+    std::vector<Record> records_;
+    tsl::hopscotch_map<Column, Slots> slots_;
+};
+
+// If |fold| kept only the counts, read the rows of one position again to hold the
+// values of the records of |counts|
+void read_again_if_dropped(const MultiIntMatrix &matrix, const QueryRows &q,
+                           const HeaderCounts &counts, RecordFold *fold) {
+    if (counts.empty() || !fold->dropped(counts))
+        return;
+    std::vector<AnnotatedDBG::row_index> rows;
+    std::vector<size_t> positions;
+    for (size_t i = 0; i < q.distinct.size(); ++i) {
+        if (q.weight[i] == 1) {
+            rows.push_back(q.distinct[i]);
+            positions.push_back(q.first_position[i]);
+        }
+    }
+    fold->hold_only(counts);
+    call_row_tuples(matrix, rows, [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+        fold->add_row(row, positions[i]);
+    });
+}
+} // namespace
+
+
 template <class Result, class RowEnumerator>
 Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
                             const annot::LabelEncoder<Label> &label_encoder,
                             size_t min_count,
                             size_t num_top_labels,
                             const std::vector<size_t> &kmer_positions,
-                            size_t num_kmers) {
+                            size_t num_kmers,
+                            size_t *num_passed = nullptr, SearchCut *cut = nullptr) {
     static_assert(utils::is_one_of_v<Result,
-                    std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>,
-                    std::vector<std::tuple<Label, size_t, std::vector<size_t>>>,
-                    std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>>);
+                    std::vector<std::tuple<Label, size_t, PresenceRuns>>,
+                    std::vector<std::tuple<Label, size_t, CountRuns>>,
+                    std::vector<std::tuple<Label, size_t, PositionCoords>>>);
 
     auto call_bits = [&](const auto &callback) {
         enumerate_rows([&](const auto &row) {
@@ -445,12 +934,14 @@ Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
     std::vector<std::pair<Column, size_t>> counts
             = utils::accumulate_counts(call_bits, label_encoder.size(), min_count);
 
-    if (counts.size() > num_top_labels)
-        top_n_sorted(counts, num_top_labels);
+    if (num_passed)
+        *num_passed = counts.size();
+    top_n_sorted(counts, num_top_labels, cut);
 
     if (counts.empty())
         return {};
 
+    // the rows come in the order of their query positions, in which the values are built
     using ValueType = std::tuple_element_t<2, typename Result::value_type>;
     utils::ValueStore<Column, ValueType> value_store(label_encoder.size(), counts.size());
     for (const auto &[j, count] : counts) {
@@ -463,10 +954,12 @@ Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
             auto j = utils::get_first(item);
             ValueType *value_p = value_store.get(j);
             if (value_p) {
-                if constexpr(std::is_same_v<ValueType, sdsl::bit_vector>) {
-                    (*value_p)[kmer_positions[i]] = true;
+                if constexpr(std::is_same_v<ValueType, PresenceRuns>) {
+                    value_p->add(kmer_positions[i]);
+                } else if constexpr(std::is_same_v<ValueType, CountRuns>) {
+                    value_p->add(kmer_positions[i], item.second);
                 } else {
-                    (*value_p)[kmer_positions[i]] = std::move(item.second);
+                    value_p->add(kmer_positions[i], PositionCoords::Coords(item.second));
                 }
             }
         }
@@ -476,7 +969,9 @@ Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
     Result result;
     result.reserve(counts.size());
     for (const auto &[j, count] : counts) {
-        result.emplace_back(label_encoder.decode(j), count, std::move(*value_store.get(j)));
+        ValueType *value = value_store.get(j);
+        value->shrink();
+        result.emplace_back(label_encoder.decode(j), count, std::move(*value));
     }
     return result;
 }
@@ -490,14 +985,134 @@ void map_to_rows(const DeBruijnGraph &graph, std::string_view sequence,
     row_indices->reserve(num_kmers);
     kmer_positions->reserve(num_kmers);
     size_t j = 0;
-    graph.map_to_nodes(sequence, [&](AnnotatedDBG::node_index i) {
+    for (AnnotatedDBG::node_index i : graph.node_range(sequence)) {
         if (i > 0) {
             kmer_positions->push_back(j);
             row_indices->push_back(AnnotatedDBG::graph_to_anno_index(i));
         }
         j++;
-    });
+    }
     assert(j == num_kmers);
+}
+
+template <class Values>
+std::vector<std::tuple<Label, size_t, Values>>
+AnnotatedDBG::get_header_results(std::string_view sequence, size_t num_top_labels,
+                                 double discovery_fraction, double presence_fraction,
+                                 bool with_kmer_counts, size_t *num_passed, SearchCut *cut) const {
+    static_assert(utils::is_one_of_v<Values, size_t, CountRuns, PresenceRuns>);
+    const size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
+    // The rows to decode and the query position of each. Without per-position values,
+    // a repeated k-mer is one row counted once per position.
+    std::vector<row_index> rows;
+    std::vector<size_t> positions;
+    std::vector<size_t> weights;
+    size_t num_present = 0;
+    if constexpr (std::is_same_v<Values, size_t>) {
+        VectorMap<row_index, size_t> counts;
+        counts.reserve(num_kmers);
+        for (node_index node : dbg_.node_range(sequence)) {
+            if (node) {
+                ++counts[graph_to_anno_index(node)];
+                ++num_present;
+            }
+        }
+        rows.reserve(counts.size());
+        weights.reserve(counts.size());
+        for (const auto &[row, count] : counts.values_container()) {
+            rows.push_back(row);
+            weights.push_back(count);
+        }
+    } else {
+        map_to_rows(dbg_, sequence, &rows, &positions);
+        num_present = rows.size();
+    }
+    const size_t min_count = get_min_count(discovery_fraction, presence_fraction,
+                                           num_kmers, num_present);
+    if (num_present < min_count)
+        return {};
+    const auto *matrix = dynamic_cast<const MultiIntMatrix *>(&annotator_->get_matrix());
+    if (!matrix)
+        throw std::runtime_error("k-mer coordinates are not indexed in this annotator");
+    if (annotator_->num_labels() != coord_to_header_->num_columns()) {
+        throw std::runtime_error(fmt::format("Incompatible number of columns in CoordToHeader "
+                                             "and annotation matrix: {} != {}",
+                                             coord_to_header_->num_columns(),
+                                             annotator_->num_labels()));
+    }
+    RecordFold fold(*coord_to_header_,
+                    std::is_same_v<Values, PresenceRuns> ? RecordFold::kPresence
+                        : std::is_same_v<Values, CountRuns> ? RecordFold::kCounts
+                        : with_kmer_counts ? RecordFold::kAbundance : RecordFold::kNone,
+                    min_count, num_top_labels, positions.size());
+    if constexpr (std::is_same_v<Values, size_t>) {
+        call_row_tuples(*matrix, rows, [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+            fold.add_row(row, 0, weights[i]);
+        });
+        const auto counts = fold.select(min_count, num_top_labels, num_passed, cut);
+        std::vector<std::tuple<Label, size_t, Values>> result;
+        result.reserve(counts.size());
+        for (const auto &[h, count] : counts) {
+            result.emplace_back(coord_to_header_->get_headers(h.first)[h.second], count,
+                                with_kmer_counts ? fold.abundance(h) : count);
+        }
+        return result;
+
+    } else {
+        // the positions of the repeated rows are kept as 32-bit, as the runs of the fold
+        if (num_kmers >= std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("A sequence queried by sequence record must have fewer "
+                                     "than 2^32 k-mers");
+        }
+        // As in get_kmer_coordinates, each row is added once, at its first position,
+        // counted for all its positions. A repeated row is only counted here, and its
+        // values are added below for the returned records.
+        const QueryRows q(rows, positions);
+        call_row_tuples(*matrix, q.distinct, [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+            fold.add_row(row, q.first_position[i], q.weight[i], q.weight[i] == 1);
+        });
+        const auto counts = fold.select(min_count, num_top_labels, num_passed, cut);
+
+        read_again_if_dropped(*matrix, q, counts, &fold);
+        // the values of the returned records at the repeated rows
+        RepeatedValues unheld_values(*matrix, *coord_to_header_, q, positions, counts, true);
+
+        std::vector<std::tuple<Label, size_t, Values>> result;
+        result.reserve(counts.size());
+        for (size_t r = 0; r < counts.size(); ++r) {
+            const auto &[h, count] = counts[r];
+            Values values(num_kmers);
+            // merge the runs of the fold and the values it does not hold, both in
+            // ascending order of position
+            auto unheld = unheld_values.take(r);
+            if (!std::is_sorted(unheld.begin(), unheld.end()))
+                std::sort(unheld.begin(), unheld.end());
+            auto next = unheld.begin();
+            const auto end = unheld.end();
+            auto add_unheld_before = [&](size_t pos) {
+                for ( ; next != end && next->first < pos; ++next) {
+                    if constexpr (std::is_same_v<Values, PresenceRuns>) {
+                        values.add(next->first);
+                    } else {
+                        values.add(next->first, next->second);
+                    }
+                }
+            };
+            for (const RecordFold::Run &run : fold.take_runs(h)) {
+                add_unheld_before(run.pos);
+                if constexpr (std::is_same_v<Values, PresenceRuns>) {
+                    values.add_run(run.pos, run.pos + run.len);
+                } else {
+                    values.add_run(run.pos, run.pos + run.len, run.value);
+                }
+            }
+            add_unheld_before(num_kmers);
+            values.shrink();
+            result.emplace_back(coord_to_header_->get_headers(h.first)[h.second], count,
+                                std::move(values));
+        }
+        return result;
+    }
 }
 
 #ifndef NDEBUG
@@ -508,12 +1123,8 @@ bool same_results(const std::vector<std::tuple<Label, size_t, ValueType>> &resul
     assert(top_labels.size() == result.size());
     std::unordered_map<Label, uint64_t> check(top_labels.begin(), top_labels.end());
     for (const auto &[label, count, value] : result) {
-        if constexpr(std::is_same_v<ValueType, sdsl::bit_vector>) {
-            assert(count == sdsl::util::cnt_one_bits(value));
-        } else if constexpr(std::is_same_v<ValueType, std::vector<size_t>>) {
-            assert(count == (size_t)std::count_if(value.begin(), value.end(), [](const auto &v) { return v > 0; }));
-        } else if constexpr(std::is_same_v<ValueType, std::vector<SmallVector<uint64_t>>>) {
-            assert(count == (size_t)std::count_if(value.begin(), value.end(), [](const auto &v) { return v.size() > 0; }));
+        if constexpr(utils::is_one_of_v<ValueType, PresenceRuns, CountRuns, PositionCoords>) {
+            assert(count == value.count());
         } else {
             static_assert(utils::dependent_false<ValueType>::value, "Unsupported value type");
         }
@@ -526,11 +1137,13 @@ bool same_results(const std::vector<std::tuple<Label, size_t, ValueType>> &resul
 }
 #endif // NDEBUG
 
-std::vector<std::tuple<std::string, size_t, std::vector<size_t>>>
+std::vector<std::tuple<std::string, size_t, CountRuns>>
 AnnotatedDBG::get_kmer_counts(std::string_view sequence,
                               size_t num_top_labels,
                               double discovery_fraction,
-                              double presence_fraction) const {
+                              double presence_fraction, SearchCut *cut) const {
+    if (cut)
+        *cut = {};
     assert(discovery_fraction >= 0.);
     assert(discovery_fraction <= 1.);
     assert(presence_fraction >= 0.);
@@ -541,18 +1154,8 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
         return {};
 
     if (coord_to_header_) {
-        auto kmer_coord_res = get_kmer_coordinates(sequence, num_top_labels,
-                                                   discovery_fraction, presence_fraction);
-        std::vector<std::tuple<std::string, size_t, std::vector<size_t>>> result;
-        result.reserve(kmer_coord_res.size());
-        for (auto &[label, count, coords] : kmer_coord_res) {
-            result.emplace_back(std::move(label), count, coords.size());
-            auto &counts = std::get<2>(result.back());
-            for (size_t i = 0; i < coords.size(); ++i) {
-                counts[i] = coords[i].size();
-            }
-        }
-        return result;
+        return get_header_results<CountRuns>(sequence, num_top_labels,
+                                             discovery_fraction, presence_fraction, false, nullptr, cut);
     }
 
     size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
@@ -568,14 +1171,12 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
         return {};
 
     const auto *int_matrix = dynamic_cast<const IntMatrix *>(&annotator_->get_matrix());
-    if (!int_matrix) {
-        logger->error("k-mer counts are not indexed in this annotator");
-        exit(1);
-    }
+    if (!int_matrix)
+        throw std::runtime_error("k-mer counts are not indexed in this annotator");
 
     auto get_results = [&](const auto &enumerate_rows) {
-        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, std::vector<size_t>>>>(
-            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
+        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, CountRuns>>>(
+            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers, nullptr, cut);
         assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
         return results;
     };
@@ -598,11 +1199,13 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
     return get_results(enumerate_row_values);
 }
 
-std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>
+std::vector<std::tuple<Label, size_t, PositionCoords, size_t>>
 AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
                                    size_t num_top_labels,
                                    double discovery_fraction,
-                                   double presence_fraction) const {
+                                   double presence_fraction, SearchCut *cut) const {
+    if (cut)
+        *cut = {};
     assert(discovery_fraction >= 0.);
     assert(discovery_fraction <= 1.);
     assert(presence_fraction >= 0.);
@@ -625,95 +1228,98 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
         return {};
 
     const auto *tuple_matrix = dynamic_cast<const MultiIntMatrix *>(&annotator_->get_matrix());
-    if (!tuple_matrix) {
-        logger->error("k-mer coordinates are not indexed in this annotator");
-        exit(1);
-    }
+    if (!tuple_matrix)
+        throw std::runtime_error("k-mer coordinates are not indexed in this annotator");
 
-    auto rows_tuples = tuple_matrix->get_row_tuples(row_indices);
+    // the rows and positions of a query are indexed as 32-bit
+    if (num_kmers >= std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("A sequence queried for coordinates must have fewer "
+                                 "than 2^32 k-mers");
+    }
+    // each distinct row is decoded once, not once per position
+    const QueryRows q(row_indices, kmer_positions);
 
     if (coord_to_header_) {
         if (annotator_->num_labels() != coord_to_header_->num_columns()) {
-            logger->error("Incompatible number of columns in CoordToHeader and annotation matrix: "
-                          "{} != {}", coord_to_header_->num_columns(), annotator_->num_labels());
-            exit(1);
+            throw std::runtime_error(fmt::format("Incompatible number of columns in CoordToHeader "
+                                                 "and annotation matrix: {} != {}",
+                                                 coord_to_header_->num_columns(),
+                                                 annotator_->num_labels()));
         }
 
-        coord_to_header_->map_to_local_coords(&rows_tuples);
-        // Now each coord in `rows_tuples` is `coord = local_coord * num_headers[j] + header_id`
+        // Split the coordinates across sequences, a block of rows at a time. Each row is
+        // added once, at its first position, counted for all its positions. A row of one
+        // position adds its coordinates. A repeated row is only counted here: its
+        // coordinates at all positions, for all records, would take time and memory in
+        // proportion to both. They are added below for the returned records.
+        RecordFold fold(*coord_to_header_, RecordFold::kCoords, min_count, num_top_labels,
+                        kmer_positions.size());
+        call_row_tuples(*tuple_matrix, q.distinct,
+                        [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+            fold.add_row(row, q.first_position[i], q.weight[i], q.weight[i] == 1);
+        });
+        const auto counts = fold.select(min_count, num_top_labels, nullptr, cut);
 
-        // Before splitting coords across headers, filter them by the number of k-mer matches
-        using Header = std::pair<Column, size_t>; // global header id
-        using Count = size_t;
-        std::vector<std::pair<Header, Count>> counts;
-        {
-            VectorMap<Header, Count> counts_map;
-            tsl::hopscotch_set<Header> matches;
-            for (const auto &row : rows_tuples) {
-                matches.clear();
-                for (auto &[col, coords] : row) {
-                    for (uint64_t coord : coords) {
-                        size_t header = coord % coord_to_header_->num_headers(col);
-                        matches.emplace(col, header);
+        read_again_if_dropped(*tuple_matrix, q, counts, &fold);
+        // (position, coordinate) of each returned record at the repeated rows
+        RepeatedValues unheld_coords(*tuple_matrix, *coord_to_header_, q, kmer_positions,
+                                     counts, false);
+
+        std::vector<std::tuple<std::string, size_t, PositionCoords, size_t>> result;
+        result.reserve(counts.size());
+        for (size_t r = 0; r < counts.size(); ++r) {
+            std::vector<std::pair<uint32_t, uint64_t>> coords_at; // (position, coordinate)
+            const auto &[h, count] = counts[r];
+            const auto &[col, header] = h;
+            {
+                const auto runs = fold.take_runs(h);
+                size_t num_held = 0;
+                for (const RecordFold::Run &run : runs) {
+                    num_held += run.len;
+                }
+                coords_at = unheld_coords.take(r, num_held);
+                for (const RecordFold::Run &run : runs) {
+                    for (uint32_t i = 0; i < run.len; ++i) {
+                        coords_at.emplace_back(run.pos + i, run.value + i);
                     }
                 }
-                for (const Header &h : matches) {
-                    counts_map[h]++;
-                }
             }
-            counts = to_vector(std::move(counts_map));
-        }
-
-        // remove headers with insufficient number of k-mer matches
-        counts.erase(std::remove_if(counts.begin(), counts.end(),
-                                    [&](const auto &pair) { return pair.second < min_count; }),
-                     counts.end());
-
-        // keep only top-n headers
-        if (counts.size() > num_top_labels)
-            top_n_sorted(counts, num_top_labels);
-
-        // split coordinates across headers
-        tsl::hopscotch_map<Header, std::vector<Tuple>> coords_map;
-        coords_map.reserve(counts.size());
-        for (const auto &[h, count] : counts) {
-            coords_map.emplace(h, num_kmers);
-        }
-        for (size_t i = 0; i < rows_tuples.size(); ++i) {
-            for (auto &[col, coords] : rows_tuples[i]) {
-                for (uint64_t coord : coords) {
-                    size_t header = coord % coord_to_header_->num_headers(col);
-                    uint64_t local_coord = coord / coord_to_header_->num_headers(col);
-                    auto it = coords_map.find({col, header});
-                    if (it != coords_map.end())
-                        it.value()[kmer_positions[i]].push_back(local_coord);
-                }
-                coords.clear();
+            std::sort(coords_at.begin(), coords_at.end());
+            PositionCoords coords(num_kmers);
+            for (const auto &[position, coord] : coords_at) {
+                coords.add(position, coord);
             }
-            rows_tuples[i].clear();
-        }
-        rows_tuples.clear();
-
-        std::vector<std::tuple<std::string, Count, std::vector<Tuple>>> result;
-        result.reserve(counts.size());
-        for (const auto &[h, count] : counts) {
-            const auto &[col, header] = h;
-            auto &coords = coords_map[h];
+            coords.shrink();
             result.emplace_back(coord_to_header_->get_headers(col)[header],
-                                count, std::move(coords));
+                                count, std::move(coords),
+                                coord_to_header_->num_kmers_in_sequence(col, header));
         }
 
         return result;
     }
 
+    // the rows are read twice (to count, then to fill the values) and kept
+    const auto rows_tuples = tuple_matrix->get_row_tuples(q.distinct);
+
     auto call_rows_tuples = [&](const auto &callback) {
-        std::for_each(rows_tuples.begin(), rows_tuples.end(), callback);
+        for (uint32_t i : q.row_of) {
+            callback(rows_tuples[i]);
+        }
     };
 
-    auto results = filter_and_aggregate<std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>>(
-        call_rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
+    auto results = filter_and_aggregate<std::vector<std::tuple<Label, size_t, PositionCoords>>>(
+        call_rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers, nullptr, cut);
     assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
-    return results;
+
+    // Without a CoordToHeader mapping, the label refers to a whole annotation
+    // column rather than a single indexed sequence, so num_kmers_in_target is
+    // undefined.
+    std::vector<std::tuple<Label, size_t, PositionCoords, size_t>> with_lengths;
+    with_lengths.reserve(results.size());
+    for (auto &[label, count, coords] : results) {
+        with_lengths.emplace_back(std::move(label), count, std::move(coords), 0);
+    }
+    return with_lengths;
 }
 
 std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>>
@@ -907,52 +1513,49 @@ AnnotatedDBG::get_overlapping_reads(const std::vector<std::vector<row_index>> &q
     return result;
 }
 
-std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>
+std::vector<std::tuple<Label, size_t, PresenceRuns>>
 AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
                                        size_t num_top_labels,
                                        double discovery_fraction,
-                                       double presence_fraction) const {
+                                       double presence_fraction,
+                                       size_t *num_passed,
+                                       bool header_labels, SearchCut *cut) const {
+    if (cut)
+        *cut = {};
     assert(discovery_fraction >= 0.);
     assert(discovery_fraction <= 1.);
     assert(presence_fraction >= 0.);
     assert(presence_fraction <= 1.);
     assert(check_compatibility());
 
+    if (num_passed)
+        *num_passed = 0;
+
     if (sequence.size() < dbg_.get_k())
         return {};
 
     size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
 
-    if (discovery_fraction == 1.) {
-        auto label_counts = get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction);
-        std::vector<std::tuple<Label, size_t, sdsl::bit_vector>> presence_vectors;
+    // the shortcut ranks with get_top_labels, which reports no count and ranks headers when
+    // a CoordToHeader mapping is loaded
+    if (discovery_fraction == 1. && !num_passed && (header_labels || !coord_to_header_)) {
+        auto label_counts = get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction, false, cut);
+        std::vector<std::tuple<Label, size_t, PresenceRuns>> presence_vectors;
         presence_vectors.reserve(label_counts.size());
+        // every position marked: one run
+        PresenceRuns all(num_kmers);
+        all.add_run(0, num_kmers);
+        all.shrink();
         for (auto&& [label, count] : label_counts) {
-            presence_vectors.emplace_back(
-                std::move(label),
-                count,
-                sdsl::bit_vector(num_kmers, true)
-            );
+            presence_vectors.emplace_back(std::move(label), count, all);
         }
         return presence_vectors;
     }
 
-    if (coord_to_header_) {
-        auto kmer_coord_res = get_kmer_coordinates(sequence, num_top_labels,
-                                                   discovery_fraction, presence_fraction);
-        std::vector<std::tuple<Label, size_t, sdsl::bit_vector>> result;
-        result.reserve(kmer_coord_res.size());
-        for (auto &[label, count, coords] : kmer_coord_res) {
-            assert(coords.size() == sequence.size() - dbg_.get_k() + 1);
-            result.emplace_back(std::move(label), count, coords.size());
-            auto &mask = std::get<2>(result.back());
-            for (size_t i = 0; i < coords.size(); ++i) {
-                if (coords[i].size())
-                    mask[i] = true;
-            }
-        }
-        assert(same_results(result, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
-        return result;
+    if (coord_to_header_ && header_labels) {
+        return get_header_results<PresenceRuns>(sequence, num_top_labels,
+                                                discovery_fraction, presence_fraction,
+                                                false, num_passed, cut);
     }
 
     // kmers in the graph and their positions in the query sequence
@@ -967,9 +1570,12 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
 
     const auto &matrix = annotator_->get_matrix();
     auto get_results = [&](const auto &enumerate_rows) {
-        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, sdsl::bit_vector>>>(
-            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
-        assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
+        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, PresenceRuns>>>(
+            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers,
+            num_passed, cut);
+        // get_top_labels ranks headers when a CoordToHeader mapping is loaded
+        assert(coord_to_header_ || same_results(results, get_top_labels(sequence, num_top_labels,
+                                                                         discovery_fraction, presence_fraction)));
         return results;
     };
 
@@ -1008,131 +1614,29 @@ bool AnnotatedSequenceGraph::check_compatibility() const {
     return graph_->max_index() == annotator_->num_objects();
 }
 
-
-/**
- * Helper functions for score_kmer_presence_mask
- */
-
-std::array<AlignedVector<size_t>, 2>
-tabulate_score(const sdsl::bit_vector &presence, size_t correction = 0) {
-    std::array<AlignedVector<size_t>, 2> table;
-    table[0].reserve(presence.size());
-    table[1].reserve(presence.size());
-
-    if (!presence.size())
-        return table;
-
-    bool last_block = presence[0];
-    size_t last_size = 1;
-    size_t i = 1;
-
-    if (presence.size() >= 64) {
-        const auto word = *presence.data();
-        if (!word || word == 0xFFFFFFFFFFFFFFFF) {
-            last_size = 64;
-            i = 64;
-        }
-    }
-
-    for ( ; i < presence.size(); ++i) {
-        if (!(i & 0x3F) && i + 64 <= presence.size()) {
-            // if at a word boundary and the next word is either all zeros or
-            // all ones
-            const uint64_t word = presence.get_int(i);
-            if (!word || word == 0xFFFFFFFFFFFFFFFF) {
-                if ((!word && last_block) || (word == 0xFFFFFFFFFFFFFFFF && !last_block)) {
-                    table[last_block].push_back(last_size + correction);
-                    last_block = !last_block;
-                    last_size = 0;
-                }
-
-                last_size += 64;
-                i += 63;
-                continue;
-            }
-        }
-
-        if (last_block == presence[i]) {
-            ++last_size;
-        } else {
-            table[last_block].push_back(last_size + correction);
-            last_block = !last_block;
-            last_size = 1;
-        }
-    }
-
-    table[last_block].push_back(last_size);
-
-    assert(std::accumulate(table[0].begin(), table[0].end(), size_t(0))
-         + std::accumulate(table[1].begin(), table[1].end(), size_t(0))
-         - correction * (table[0].size() + table[1].size() - 1)
-        == presence.size());
-
-    assert(std::accumulate(table[1].begin(), table[1].end(), size_t(0))
-         - correction * (table[1].size() - last_block)
-        == sdsl::util::cnt_one_bits(presence));
-
-#ifndef NDEBUG
-    if (correction == 1) {
-        std::array<AlignedVector<size_t>, 2> check;
-
-        size_t cnt = 1;
-        for (size_t i = 0; i < presence.size(); ++i) {
-            if (i < presence.size() - 1) {
-                ++cnt;
-                if (presence[i] != presence[i + 1]) {
-                    check[presence[i]].push_back(cnt);
-                    cnt = 1;
-                }
-            } else {
-                check[presence[i]].push_back(cnt);
-            }
-        }
-
-        assert(check[0] == table[0]);
-        assert(check[1] == table[1]);
-    }
-#endif // NDEBUG
-
-    return table;
+std::string encode_presence_mask(const sdsl::bit_vector &mask) {
+    return encode_presence_mask(PresenceRuns(mask));
 }
 
-int32_t AnnotatedDBG
-::score_kmer_presence_mask(const sdsl::bit_vector &kmer_presence_mask,
-                           int32_t match_score,
-                           int32_t mismatch_score) const {
-    if (!kmer_presence_mask.size())
-        return 0;
-
-    const size_t k = dbg_.get_k();
-    const int32_t kmer_adjust = 3;
-
-    const size_t sequence_length = kmer_presence_mask.size() + k - 1;
-    const int32_t SNP_t = k + kmer_adjust;
-
-    auto score_counter = tabulate_score(autocorrelate(kmer_presence_mask, kmer_adjust), 1);
-
-    double score = std::accumulate(score_counter[1].begin(),
-                                   score_counter[1].end(), 0) * match_score;
-    if (score == 0)
-        return 0;
-
-    if (score_counter[0].empty())
-        return score * sequence_length / kmer_presence_mask.size();
-
-    for (double count : score_counter[0]) {
-        // A penalty function used in BIGSI
-        double min_N_snps = count / SNP_t;
-        double max_N_snps = std::max(count - SNP_t + 1, min_N_snps);
-        double mean_N_snps = max_N_snps * 0.05 + min_N_snps;
-
-        assert(count >= mean_N_snps);
-
-        double mean_penalty = mean_N_snps * mismatch_score;
-        score += (count - mean_penalty) * match_score - mean_penalty;
+std::string encode_presence_mask(const PresenceRuns &mask) {
+    std::string result;
+    size_t pos = 0;
+    mask.call_runs([&](size_t begin, size_t end) {
+        assert(begin < end && end <= mask.size());
+        assert(begin > pos || !begin);
+        if (begin > pos) {
+            result += 'o';
+            result += std::to_string(begin - pos);
+        }
+        result += 'x';
+        result += std::to_string(end - begin);
+        pos = end;
+    });
+    if (pos < mask.size()) {
+        result += 'o';
+        result += std::to_string(mask.size() - pos);
     }
-
-    return std::max(score * sequence_length / kmer_presence_mask.size(), 0.);
+    return result;
 }
 
 } // namespace graph

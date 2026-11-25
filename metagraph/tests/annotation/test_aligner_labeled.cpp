@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <random>
 #include <string_view>
 #include <unordered_set>
 
@@ -8,10 +9,12 @@
 #include "../test_helpers.hpp"
 #include "test_annotated_dbg_helpers.hpp"
 
+#include "annotation/coord_to_header.hpp"
 #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
 #include "annotation/annotation_converters.hpp"
 #include "common/seq_tools/reverse_complement.hpp"
 #include "graph/alignment/aligner_labeled.hpp"
+#include "graph/alignment/annotation_buffer.hpp"
 #include "graph/representation/canonical_dbg.hpp"
 #include "kmer/alphabets.hpp"
 #include "seq_io/sequence_io.hpp"
@@ -124,6 +127,79 @@ TYPED_TEST(LabeledAlignerTest, GetTracesWithRow) {
     EXPECT_EQ(ref, obs);
 }
 
+TYPED_TEST(LabeledAlignerTest, CachedColumnSetsKeepTheirAddress) {
+    // The labeled extender holds references to cached column sets while it
+    // caches new ones, so caching must never move the existing sets.
+    size_t k = 4;
+    const std::vector<std::string> sequences { "GCAAT", "AATGCTT" };
+    const std::vector<std::string> labels { "A", "B" };
+
+    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
+                                       typename TypeParam::second_type>(k, sequences, labels);
+    const auto &graph = anno_graph->get_graph();
+    AnnotationBuffer buffer(graph, anno_graph->get_annotator());
+
+    auto path = map_to_nodes_sequentially(graph, sequences[1]);
+    ASSERT_EQ(sequences[1].size() - k + 1, path.size());
+    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(path));
+    buffer.fetch_queued_annotations();
+
+    const auto *node_labels = buffer.get_labels(path.front());
+    ASSERT_TRUE(node_labels);
+    const auto node_labels_copy = *node_labels;
+
+    size_t first = buffer.cache_column_set(AnnotationBuffer::Columns{ 0, 1 });
+    const auto &first_set = buffer.get_cached_column_set(first);
+
+    // enough new sets to reallocate any contiguous storage several times
+    for (AnnotationBuffer::Columns::value_type i = 2; i < 10'000; ++i) {
+        buffer.cache_column_set(AnnotationBuffer::Columns{ i });
+    }
+
+    EXPECT_EQ(&first_set, &buffer.get_cached_column_set(first));
+    EXPECT_EQ((AnnotationBuffer::Columns{ 0, 1 }), first_set);
+    EXPECT_EQ(node_labels, buffer.get_labels(path.front()));
+    EXPECT_EQ(node_labels_copy, *node_labels);
+}
+
+#if ! _PROTEIN_GRAPH
+TYPED_TEST(LabeledAlignerTest, FetchBothStrandsInOneBatch) {
+    // Queue the forward path of a sequence and then its reverse complement in
+    // the same batch. On CANONICAL graphs, the reverse-complement nodes map to
+    // the forward nodes queued just before, and the buffer grows (and may
+    // reallocate) while it registers them. Every node must get its labels.
+    size_t k = 21;
+    std::mt19937 rng(42);
+    std::string sequence(5000, 'A');
+    for (char &c : sequence) {
+        c = "ACGT"[rng() % 4];
+    }
+    std::string rc_sequence = sequence;
+    reverse_complement(rc_sequence.begin(), rc_sequence.end());
+
+    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
+                                       typename TypeParam::second_type>(
+        k, { sequence }, { "A" }, DeBruijnGraph::CANONICAL
+    );
+    const auto &graph = anno_graph->get_graph();
+    AnnotationBuffer buffer(graph, anno_graph->get_annotator());
+
+    auto path = map_to_nodes_sequentially(graph, sequence);
+    auto rc_path = map_to_nodes_sequentially(graph, rc_sequence);
+    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(path));
+    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(rc_path));
+    buffer.fetch_queued_annotations();
+
+    for (const auto *nodes : { &path, &rc_path }) {
+        for (auto node : *nodes) {
+            ASSERT_NE(DeBruijnGraph::npos, node);
+            const auto *labels = buffer.get_labels(node);
+            ASSERT_TRUE(labels) << node;
+            EXPECT_EQ(1u, labels->size()) << node;
+        }
+    }
+}
+#endif  // ! _PROTEIN_GRAPH
 
 TYPED_TEST(LabeledAlignerTest, SimpleLinearGraph) {
     size_t k = 4;
@@ -168,6 +244,50 @@ TYPED_TEST(LabeledAlignerTest, SimpleLinearGraph) {
             EXPECT_TRUE(found) << alignment;
         }
     }
+}
+
+TYPED_TEST(LabeledAlignerTest, MapWithoutExtension) {
+    size_t k = 4;
+    /*
+        A    A    B    B    B    B
+        GCAA-CAAT-AATG-ATGC-TGCT-GCTT
+    */
+    const std::vector<std::string> sequences { "GCAAT", "AATGCTT" };
+    const std::vector<std::string> labels { "A", "B" };
+
+    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
+                                       typename TypeParam::second_type>(k, sequences, labels);
+
+    DBGAlignerConfig config;
+    config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -1, -1);
+    config.min_exact_match = 0.5;
+    LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
+    const auto &label_encoder = anno_graph->get_annotator().get_label_encoder();
+
+    std::vector<std::optional<LabeledAligner<>::LabelMapping>> mappings;
+    aligner.map_batch({ { "B", "TAATGCTTA" }, { "AB", "GCAATGCTT" }, { "none", "CCCCCCCC" } },
+        [&](const std::string &, auto&& mapping) { mappings.push_back(std::move(mapping)); }
+    );
+    ASSERT_EQ(3u, mappings.size());
+
+    // AATGCTT is B's, covered in full
+    ASSERT_TRUE(mappings[0]);
+    EXPECT_FALSE(mappings[0]->orientation);
+    ASSERT_EQ(1u, mappings[0]->labels.size());
+    EXPECT_EQ("B", label_encoder.decode(mappings[0]->labels[0]));
+    EXPECT_EQ(7u, mappings[0]->num_matches);
+    EXPECT_EQ(1u, mappings[0]->query_begin);
+    EXPECT_EQ(8u, mappings[0]->query_end);
+
+    // GCAAT (A) covers 5 characters, AATGCTT (B) covers 7
+    ASSERT_TRUE(mappings[1]);
+    ASSERT_EQ(1u, mappings[1]->labels.size());
+    EXPECT_EQ("B", label_encoder.decode(mappings[1]->labels[0]));
+    EXPECT_EQ(7u, mappings[1]->num_matches);
+    EXPECT_EQ(2u, mappings[1]->query_begin);
+    EXPECT_EQ(9u, mappings[1]->query_end);
+
+    EXPECT_FALSE(mappings[2]);
 }
 
 TYPED_TEST(LabeledAlignerTest, SimpleTangleGraph) {
@@ -345,6 +465,326 @@ TYPED_TEST(LabeledAlignerTest, SimpleTangleGraphCoordsMiddle) {
     }
 }
 
+// Fixture for the end-to-end CoordToHeader alignment tests. Builds a
+// DBGSuccinct + ColumnCompressed annotation where all sequences share a
+// single label (simulating --anno-filename), with distinct coordinate
+// offsets so the k-mer coord axis spans the full column.
+//
+// DNA-only: tests use the DNA scoring matrix and short ACGT sequences. The
+// functionality under test (CoordToHeader formatting) is alphabet-agnostic
+// and exercised separately by `LabeledAlignerProteinCoordTest` in protein
+// builds.
+#if ! _PROTEIN_GRAPH
+class LabeledAlignerCoordTest : public ::testing::Test {
+  protected:
+    static constexpr size_t k = 5;
+    std::unique_ptr<AnnotatedDBG> anno_graph;
+    DBGAlignerConfig config;
+
+    void SetUp() override {
+        config.max_seed_length = std::numeric_limits<size_t>::max();
+        config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -1, -1);
+    }
+
+    void build(const std::vector<std::string> &sequences,
+               const std::vector<uint64_t> &coord_starts) {
+        std::vector<std::string> labels(sequences.size(), "file");
+        anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
+            k, sequences, labels, DeBruijnGraph::BASIC, /*coordinates=*/true, coord_starts
+        );
+    }
+
+    AlignmentResults align(const std::string &query) {
+        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
+        return aligner.align(query);
+    }
+};
+
+TEST_F(LabeledAlignerCoordTest, CrossBoundary) {
+    // Two sequences sharing the boundary 4-mer 'ACGT'. Literal seq1+seq2
+    // duplicates the shared 'ACGT', but the graph path does not (spells
+    // seq1 + seq2[k-1:] = 20 nt). The aligner soft-clips the first 8
+    // query bases and takes the higher-scoring 16 nt cross-boundary run
+    // starting at seq1 k-mer 4 (8S16= vs the alternative 12=12S).
+    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
+
+    auto alignments = align("AAAAACGTACGTACGTTTTTTTTT");
+    //                       SSSSSSSS================
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("8S16=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-12", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerCoordTest, CrossBoundaryThreeSequences) {
+    // Three sequences chained by shared boundary 4-mers (ACGT, AGCT).
+    // Query spells the 24 nt cross-boundary path from seq1 k-mer 4
+    // through all of seq2 and seq3; their boundary 4-mers overlap.
+    build({
+        "GCGCTTCGACGT",   // ends 'ACGT'
+        "ACGTATGCAGCT",   // starts 'ACGT', ends 'AGCT'
+        "AGCTGGGCGCAT",   // starts 'AGCT'
+    }, { 0, 8, 16 });
+
+    auto alignments = align("TTCGACGTATGCAGCTGGGCGCAT");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("24=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-12;seq3/12:1-12", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerCoordTest, CrossBoundaryThreeSequencesWithIndels) {
+    // Same graph as the ThreeSequences test. Query has 'AA' inserted and
+    // one 'G' deleted vs the 24-nt ref path; aligner deterministically
+    // picks CIGAR '13=2I3=1D7='. The ref-path spelling (and per-header
+    // split) is identical to the non-indel case.
+    build({
+        "GCGCTTCGACGT",
+        "ACGTATGCAGCT",
+        "AGCTGGGCGCAT",
+    }, { 0, 8, 16 });
+    config.min_exact_match = 0.0;
+
+    auto alignments = align("TTCGACGTATGCAAAGCT"/*G*/"GGCGCAT");
+    //                       =============II===   D   =======
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("13=2I3=1D7=", aln.get_cigar().to_string());
+    EXPECT_EQ("TTCGACGTATGCAGCTGGGCGCAT", aln.get_sequence());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-12;seq3/12:1-12", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerCoordTest, ThreeSequencesPartialCoverage) {
+    // Three sequences share the 7-mer 'CGTACGT' in their middles. A query
+    // matching just the shared 7-mer yields one alignment whose coord
+    // tuple holds three starts — one per sequence — so format_coords
+    // reports a partial range in the middle of each.
+    build({
+        "TTCGTACGTAAA",
+        "AACGTACGTCCC",
+        "GGCGTACGTGGG",
+    }, { 0, 8, 16 });
+
+    auto alignments = align("CGTACGT");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("7=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(3u, aln.label_coordinates[0].size());
+    EXPECT_EQ(2u,  aln.label_coordinates[0][0]);
+    EXPECT_EQ(10u, aln.label_coordinates[0][1]);
+    EXPECT_EQ(18u, aln.label_coordinates[0][2]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
+    EXPECT_EQ("seq1/12:3-9;seq2/12:3-9;seq3/12:3-9", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerCoordTest, CrossBoundaryReverseComplement) {
+    // rc of the CrossBoundary query. label_coordinates and sequence_
+    // stay in fwd-strand space, so format_coords emits the same ranges
+    // as the non-rc case.
+    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
+
+    auto alignments = align("AAAAAAAAACGTACGTACGTTTTT");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_TRUE(aln.get_orientation());
+    EXPECT_EQ("8S16=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-12", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerCoordTest, CrossBoundaryWithIndel) {
+    // Same graph as CrossBoundary. Query has extra bases inserted near
+    // the seq1/seq2 boundary; aligner deterministically picks CIGAR
+    // '12=4I8=1S' — ref-path spelling length = 20 nt.
+    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
+    config.min_exact_match = 0.0;
+
+    auto alignments = align("AAAAACGTACGTCACGTTTTTTTTT");
+    //                       ============IIII========S
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("12=4I8=1S", aln.get_cigar().to_string());
+    EXPECT_EQ(20u, aln.get_sequence().size());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(0u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:1-12;seq2/12:1-12", alignments[0].format_coords(cth, k));
+}
+#endif  // ! _PROTEIN_GRAPH
+
+// Protein-alphabet equivalents of the basic CoordToHeader cases. Use BLOSUM62
+// scoring and amino-acid sequences with letters not present in DNA so the
+// chainer's seed pattern differs from the DNA fixture's corner cases.
+#if _PROTEIN_GRAPH
+class LabeledAlignerProteinCoordTest : public ::testing::Test {
+  protected:
+    static constexpr size_t k = 5;
+    std::unique_ptr<AnnotatedDBG> anno_graph;
+    DBGAlignerConfig config;
+
+    void SetUp() override {
+        config.max_seed_length = std::numeric_limits<size_t>::max();
+        config.score_matrix = DBGAlignerConfig::score_matrix_blosum62;
+    }
+
+    void build(const std::vector<std::string> &sequences,
+               const std::vector<uint64_t> &coord_starts) {
+        std::vector<std::string> labels(sequences.size(), "file");
+        anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
+            k, sequences, labels, DeBruijnGraph::BASIC, /*coordinates=*/true, coord_starts
+        );
+    }
+
+    AlignmentResults align(const std::string &query) {
+        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
+        return aligner.align(query);
+    }
+};
+
+TEST_F(LabeledAlignerProteinCoordTest, CrossBoundary) {
+    // Two amino-acid sequences sharing the boundary 4-mer 'MNPQ'. Exact-match
+    // query spans the seq1/seq2 boundary; format_coords splits it across
+    // both per-sequence ranges.
+    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
+
+    auto alignments = align("EEEEMNPQRRRR");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("12=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-8", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerProteinCoordTest, SharedKmerMultipleLabels) {
+    // Two amino-acid sequences sharing an internal 5-mer 'MNPQR'. Query of
+    // exactly that 5-mer matches both sequences; the resulting alignment's
+    // coord tuple has two entries (one per occurrence) and format_coords
+    // emits a partial range for each header.
+    build({ "EEEMNPQRSSSS", "WWWMNPQRTTTT" }, { 0, 8 });
+
+    auto alignments = align("MNPQR");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("5=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(2u, aln.label_coordinates[0].size());
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:4-8;seq2/12:4-8", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerProteinCoordTest, CrossBoundaryWithMismatch) {
+    // Same graph as CrossBoundary, with a single R→K substitution after the
+    // boundary. R/K is +2 in BLOSUM62 (conservative substitution) but the
+    // CIGAR still reports it as a mismatch. format_coords output is
+    // unchanged from the exact case — coords are reference-relative.
+    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
+    config.min_exact_match = 0.0;
+
+    auto alignments = align("EEEEMNPQKRRR");
+    //                       ========X===
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("8=1X3=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-8", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerProteinCoordTest, SoftClipPrefix) {
+    // Query has a 4-aa 'C' prefix that scores very poorly against the graph
+    // (BLOSUM62 C/E = -4), so the aligner soft-clips it instead of matching
+    // through. The remaining 12 aa span the seq1/seq2 boundary, exact match.
+    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
+
+    auto alignments = align("CCCCEEEEMNPQRRRR");
+    //                       SSSS============
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("4S12=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:5-12;seq2/12:1-8", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerProteinCoordTest, CrossBoundaryWithInsertion) {
+    // Same graph as CrossBoundary. Query inserts 5 'C' between the MNPQ
+    // boundary and the R-stretch. BLOSUM62 C/R = -3, so 5 mismatches
+    // (-15) score worse than gap-open + 4 ext (-5 + -8 = -13); the
+    // aligner picks the insertion. The reference path is unchanged
+    // (20 aa), so format_coords emits the full per-sequence ranges.
+    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
+    config.min_exact_match = 0.0;
+
+    auto alignments = align("EEEEEEEEMNPQCCCCCRRRRRRRR");
+    //                       ============IIIII========
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("12=5I8=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(1u, aln.label_coordinates[0].size());
+    EXPECT_EQ(0u, aln.label_coordinates[0][0]);
+
+    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
+    EXPECT_EQ("seq1/12:1-12;seq2/12:1-12", alignments[0].format_coords(cth, k));
+}
+
+TEST_F(LabeledAlignerProteinCoordTest, ThreeSequencesPartialCoverage) {
+    // Three sequences share the 5-mer 'MNPQR' at the same internal offset.
+    // A 5-aa query matches each of them; the alignment carries a 3-entry
+    // coord tuple that format_coords splits into one partial range per
+    // header (analog of the DNA `ThreeSequencesPartialCoverage`).
+    build({
+        "EEMNPQRSAYYY",
+        "VVMNPQRWLLLL",
+        "GGMNPQRDIIII",
+    }, { 0, 8, 16 });
+
+    auto alignments = align("MNPQR");
+    ASSERT_EQ(1u, alignments.size());
+    const auto &aln = alignments[0];
+    EXPECT_EQ("5=", aln.get_cigar().to_string());
+    ASSERT_EQ(1u, aln.label_coordinates.size());
+    ASSERT_EQ(3u, aln.label_coordinates[0].size());
+
+    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
+    EXPECT_EQ("seq1/12:3-7;seq2/12:3-7;seq3/12:3-7", alignments[0].format_coords(cth, k));
+}
+#endif  // _PROTEIN_GRAPH
+
 TYPED_TEST(LabeledAlignerTest, SimpleTangleGraphCoordsCycle) {
     // TODO: for now, not implemented for other annotators
     if constexpr(!std::is_same_v<typename TypeParam::second_type, annot::ColumnCompressed<>>
@@ -460,6 +900,77 @@ TEST(LabeledAlignerTest, SimpleTangleGraphSuffixSeed) {
 }
 
 #if ! _PROTEIN_GRAPH
+TEST(LabeledAlignerTest, SubkSeedLabels) {
+    // ACGT occurs only within the first k-1 characters of B, so the only k-mer
+    // ending with it is a source dummy k-mer. TGCA occurs only at the end of B.
+    size_t k = 5;
+    const std::vector<std::string> sequences { "TTACGAAA", "ACGTTGCA" };
+    const std::vector<std::string> labels { "A", "B" };
+    const std::vector<std::pair<std::string, std::string>> queries {
+        { "ACGT", "B" }, { "TACGA", "A" }, { "CGTTG", "B" }, { "TGCA", "B" }
+    };
+
+    // coordinates are only used on BASIC graphs
+    for (auto [mode, coordinates] : { std::make_pair(DeBruijnGraph::BASIC, false),
+                                      std::make_pair(DeBruijnGraph::BASIC, true),
+                                      std::make_pair(DeBruijnGraph::CANONICAL, false),
+                                      std::make_pair(DeBruijnGraph::PRIMARY, false) }) {
+        auto anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
+                k, sequences, labels, mode, coordinates);
+
+        // as in align_to_graph, unmask the dummy k-mers so that seeds can match
+        // them (in BASIC mode, ACGT is matched only by a source dummy k-mer)
+        if (mode == DeBruijnGraph::BASIC) {
+            const_cast<DBGSuccinct&>(
+                dynamic_cast<const DBGSuccinct&>(anno_graph->get_graph())
+            ).reset_mask();
+        }
+
+        DBGAlignerConfig config;
+        config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -1, -1);
+        config.min_seed_length = 3;
+        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
+        const auto &label_encoder = anno_graph->get_annotator().get_label_encoder();
+
+        for (const auto &[query, label] : queries) {
+            bool found = false;
+            for (const auto &alignment : aligner.align(query)) {
+                // every label of an alignment, including a partial one, must
+                // contain its sequence on either strand
+                std::string sequence(alignment.get_sequence());
+                std::string sequence_rc = sequence;
+                reverse_complement(sequence_rc.begin(), sequence_rc.end());
+                std::vector<std::string> alignment_labels;
+                if (coordinates) {
+                    ASSERT_EQ(alignment.label_columns.size(),
+                              alignment.label_coordinates.size()) << query;
+                }
+                for (size_t i = 0; i < alignment.label_columns.size(); ++i) {
+                    alignment_labels.emplace_back(label_encoder.decode(alignment.label_columns[i]));
+                    const std::string &labeled = sequences[alignment_labels.back() == "A" ? 0 : 1];
+                    EXPECT_TRUE(labeled.find(sequence) != std::string::npos
+                                    || labeled.find(sequence_rc) != std::string::npos)
+                        << mode << " " << query << " " << alignment;
+                    if (!coordinates)
+                        continue;
+
+                    // each label holds one sequence, so a coordinate is the
+                    // position of the aligned sequence in it
+                    ASSERT_FALSE(alignment.label_coordinates[i].empty()) << query;
+                    for (int64_t coord : alignment.label_coordinates[i]) {
+                        ASSERT_GE(coord, 0) << query << " " << alignment;
+                        EXPECT_EQ(sequence, labeled.substr(coord, sequence.size()))
+                            << query << " " << alignment;
+                    }
+                }
+                found |= (sequence == query || sequence_rc == query)
+                    && alignment_labels == std::vector<std::string>{ label };
+            }
+            EXPECT_TRUE(found) << mode << " " << coordinates << " " << query;
+        }
+    }
+}
+
 TYPED_TEST(LabeledAlignerTest, CanonicalTangleGraph) {
     size_t k = 5;
     /*   B     B                AB    AB
@@ -514,6 +1025,38 @@ TYPED_TEST(LabeledAlignerTest, CanonicalTangleGraph) {
                 EXPECT_TRUE(found) << alignment;
             }
         }
+    }
+}
+
+TYPED_TEST(LabeledAlignerTest, CanonicalBackwardExtensionMismatch) {
+    size_t k = 31;
+    const std::vector<std::string> sequences {
+        "CTGGGCCCCCATCTCAGGCCCCCCTTCCTGGGGGTGCCCTCGGCTCTG"
+    };
+    const std::vector<std::string> labels { "A" };
+
+    // the first character of the query is a mismatch, which is resolved
+    // during the backward extension of the seed
+    std::string query = "TGGCCCCCATCTCAGGCCCCCCTTCCTGGGGGTGCCCTCGGCTCTGT";
+
+    for (DeBruijnGraph::Mode mode : { DeBruijnGraph::CANONICAL, DeBruijnGraph::PRIMARY }) {
+        auto anno_graph = build_anno_graph<typename TypeParam::first_type,
+                                           typename TypeParam::second_type>(
+            k, sequences, labels, mode
+        );
+
+        DBGAlignerConfig config;
+        config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -3, -3);
+        config.left_end_bonus = 5;
+        config.right_end_bonus = 5;
+        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
+
+        auto alignments = aligner.align(query);
+        ASSERT_EQ(1u, alignments.size()) << mode;
+        EXPECT_EQ(std::string("GGGCCCCCATCTCAGGCCCCCCTTCCTGGGGGTGCCCTCGGCTCTG"),
+                  alignments[0].get_sequence()) << mode;
+        EXPECT_EQ(std::vector<std::string>{ "A" },
+                  get_alignment_labels(*anno_graph, alignments[0])) << mode;
     }
 }
 #endif

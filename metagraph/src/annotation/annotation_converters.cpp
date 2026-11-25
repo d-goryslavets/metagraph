@@ -138,7 +138,7 @@ void convert<RowFlatAnnotator, std::string>(ColumnCompressed<std::string>&& anno
     annotator.get_label_encoder().serialize(out);
     out.close();
 
-    RowFlat<>::serialize(call_rows, num_columns, num_rows, num_set_bits, fname, true);
+    RowFlat<>::serialize(fname, call_rows, num_columns, num_rows, num_set_bits);
 }
 
 template <>
@@ -376,34 +376,60 @@ void convert_to_row_diff<RowDiffRowFlatAnnotator>(
     uint64_t num_rows = columns.at(0)->size();
     uint64_t num_columns = columns.size();
 
-    RowFlat<>::serialize([&](auto callback) { utils::call_rows(columns, callback); },
-                         num_columns, num_rows, num_set_bits, fname, true);
+    RowFlat<>::serialize(fname, [&](auto callback) { utils::call_rows(columns, callback); },
+                         num_columns, num_rows, num_set_bits);
     logger->trace("Annotation converted");
 }
 
 
-template <>
-void convert_to_row_diff<RowDiffRowFlatAnnotator>(const RowDiffBRWTAnnotator &anno,
-                                                  const std::string &outfbase) {
-    const auto &fname = utils::make_suffix(outfbase, RowDiffRowFlatAnnotator::kExtension);
+// Writes the standard RowDiff serialization header to |fname|:
+// label_encoder + "v2.0" + anchor + fork_succ. The file is created (or
+// truncated if it already exists), written, and closed so subsequent
+// target-specific writers can reopen and append the body.
+template <class Anno>
+static void write_row_diff_header(const std::string &fname, const Anno &anno) {
     std::ofstream out = utils::open_new_ofstream(fname);
     if (!out.good())
         throw std::ofstream::failure("Can't write to " + fname);
-
     anno.get_label_encoder().serialize(out);
-
-    // serialize RowDiff<RowFlat<>>
     out.write("v2.0", 4);
     anno.get_matrix().anchor().serialize(out);
     anno.get_matrix().fork_succ().serialize(out);
-    out.close();
+}
 
-    RowFlat<>::serialize([&](auto callback) { anno.get_matrix().diffs().call_rows(callback); },
-                         anno.get_matrix().diffs().num_columns(),
-                         anno.get_matrix().diffs().num_rows(),
-                         anno.get_matrix().diffs().num_relations(),
-                         fname, true);
+// Reformat an already-built `RowDiff<...>` annotator into another `RowDiff<...>`
+// representation. The on-disk header (label encoder + version + anchor +
+// fork_succ) is identical across `Target` types, so the body — produced by
+// `Source::base_matrix_type::call_rows` and consumed by
+// `Target::base_matrix_type::serialize` — is the only piece that varies.
+template <class Target, class Source>
+static void convert_row_diff_repr(const Source &anno, const std::string &outfbase) {
+    const auto &fname = utils::make_suffix(outfbase, Target::kExtension);
+    write_row_diff_header(fname, anno);
+
+    const auto &diffs = anno.get_matrix().diffs();
+    Target::binary_matrix_type::base_matrix_type::serialize(fname,
+        [&](auto callback) { diffs.call_rows(callback); },
+        diffs.num_columns(), diffs.num_rows(), diffs.num_relations());
     logger->trace("Annotation converted");
+}
+
+template <>
+void convert_to_row_diff<RowDiffRowFlatAnnotator>(const RowDiffBRWTAnnotator &anno,
+                                                  const std::string &outfbase) {
+    convert_row_diff_repr<RowDiffRowFlatAnnotator>(anno, outfbase);
+}
+
+template <>
+void convert_to_row_diff<RowDiffDiskAnnotator>(const RowDiffBRWTAnnotator &anno,
+                                               const std::string &outfbase) {
+    convert_row_diff_repr<RowDiffDiskAnnotator>(anno, outfbase);
+}
+
+template <>
+void convert_to_row_diff<RowDiffDiskAnnotator>(const RowDiffRowFlatAnnotator &anno,
+                                               const std::string &outfbase) {
+    convert_row_diff_repr<RowDiffDiskAnnotator>(anno, outfbase);
 }
 
 template <>
@@ -500,10 +526,8 @@ std::unique_ptr<MultiBRWTAnnotator> convert_to_BRWT<MultiBRWTAnnotator>(
             },
             num_threads
         );
-        if (!success) {
-            logger->error("Can't load annotation columns");
+        if (!success)
             exit(1);
-        }
     };
     return convert_to_BRWT(linkage, num_parallel_nodes, num_threads,
                            tmp_path, get_columns, std::move(column_names));
@@ -531,10 +555,8 @@ convert_to_BRWT<RowDiffBRWTAnnotator>(const std::vector<std::string> &annotation
             },
             num_threads
         );
-        if (!success) {
-            logger->error("Can't load annotation columns");
+        if (!success)
             exit(1);
-        }
     };
 
     std::unique_ptr<MultiBRWTAnnotator> annotator
@@ -760,10 +782,8 @@ convert_to_RbBRWT<RbBRWTAnnotator>(const std::vector<std::string> &annotation_fi
             },
             num_threads
         );
-        if (!success) {
-            logger->error("Can't load annotation columns");
+        if (!success)
             exit(1);
-        }
     };
 
     auto matrix = convert_to_RainbowBRWT(call_columns, max_brwt_arity);
@@ -808,10 +828,8 @@ void convert_batch_to_row_disk(
             num_threads
     );
 
-    if (!success) {
-        logger->error("Can't load annotation columns");
+    if (!success)
         exit(1);
-    }
 
     // this must be done after loading all columns
     // to keep their order correct
@@ -875,8 +893,9 @@ void merge_row_disk_annotations(const std::vector<std::string> &files,
         LEncoder le;
         matrices[j] = std::make_unique<RowDisk>();
 
-        sdsl::mmap_ifstream in(files[j], std::ios::binary);
-        if (!le.load(in)) {
+        // RowDisk::load needs a stream from open_ifstream to recover the file name.
+        std::unique_ptr<std::ifstream> in = utils::open_ifstream(files[j], true);
+        if (!le.load(*in)) {
             logger->error("Can't load label encoder from {}", files[j]);
             exit(1);
         }
@@ -890,7 +909,7 @@ void merge_row_disk_annotations(const std::vector<std::string> &files,
         }
 
         offsets[j + 1] = le.size();
-        if (!matrices[j]->load(in)) {
+        if (!matrices[j]->load(*in)) {
             logger->error("Can't load matrix from {}", files[j]);
             exit(1);
         }
@@ -982,7 +1001,7 @@ void convert_to_row_disk(
     if (!files.size())
         return;
 
-    assert(utils::ends_with(result_fname, file_extension));
+    assert(result_fname.ends_with(file_extension));
 
     double density_prediction = 0.01; // TODO: predict it better?
 
@@ -1435,7 +1454,7 @@ void merge_row_compressed(const std::vector<std::string> &filenames,
     std::vector<std::unique_ptr<StreamRows<>>> streams;
 
     for (auto filename : filenames) {
-        if (!utils::ends_with(filename, RowCompressed<>::kExtension))
+        if (!filename.ends_with(RowCompressed<>::kExtension))
             throw std::runtime_error("Can't merge annotations of mixed types");
 
         label_encoders.emplace_back(RowCompressed<>::read_label_encoder(filename));
@@ -1466,7 +1485,6 @@ void merge_brwt(const std::vector<std::string> &filenames,
     for (auto filename : filenames) {
         MultiBRWTAnnotator annotator;
         if (!annotator.load(filename)) {
-            logger->error("Cannot load annotations from file '{}'", filename);
             exit(1);
         }
 
@@ -1685,7 +1703,7 @@ template <class Annotator>
 StaticBinRelAnnotator<TupleCSCMatrix<typename Annotator::binary_matrix_type>, std::string>
 load_coords(Annotator&& anno, const std::vector<std::string> &files) {
     std::vector<bit_vector_smart> delimiters(anno.num_labels());
-    std::vector<sdsl::int_vector<>> column_values(anno.num_labels());
+    std::vector<sdsl::packed_vector_view<0>> column_values(anno.num_labels());
 
     #pragma omp parallel for num_threads(get_num_threads()) schedule(dynamic)
     for (size_t i = 0; i < files.size(); ++i) {

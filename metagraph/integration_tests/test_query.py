@@ -2,6 +2,7 @@ import unittest
 from parameterized import parameterized, parameterized_class
 import subprocess
 import itertools
+import json
 from subprocess import PIPE
 from tempfile import TemporaryDirectory
 import glob
@@ -12,7 +13,9 @@ from base import PROTEIN_MODE, DNA_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, 
 import hashlib
 import platform
 import re
+import shutil
 import psutil
+import sys
 
 
 """Test graph construction"""
@@ -136,7 +139,7 @@ class TestQuery(TestingBase):
         cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa',
                          cls.tempdir.name + '/graph',
                          20, cls.graph_repr, 'basic',
-                         '--mask-dummy' if cls.mask_dummy else '')
+                         '--mask-dummy --in-ram' if cls.mask_dummy else '')
 
         stats_graph = cls._get_stats(f'{cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}')
         assert(stats_graph['returncode'] == 0)
@@ -425,7 +428,7 @@ class TestQueryTinyLinear(TestingBase):
             cls.graph_repr = 'succinct'
             cls.mask_dummy = True
 
-        cls._build_graph(cls.fasta_graph, cls.tempdir.name + '/graph', 5, cls.graph_repr, 'basic', '--mask-dummy')
+        cls._build_graph(cls.fasta_graph, cls.tempdir.name + '/graph', 5, cls.graph_repr, 'basic', '--mask-dummy --in-ram')
 
         stats_graph = cls._get_stats(f'{cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}')
         assert(stats_graph['returncode'] == 0)
@@ -505,7 +508,7 @@ class TestQuery1Column(TestingBase):
         cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa',
                          cls.tempdir.name + '/graph',
                          20, cls.graph_repr, 'basic',
-                         '--mask-dummy' if cls.mask_dummy else '')
+                         '--mask-dummy --in-ram' if cls.mask_dummy else '')
 
         stats_graph = cls._get_stats(cls.tempdir.name + '/graph' + graph_file_extension[cls.graph_repr])
         assert(stats_graph['returncode'] == 0)
@@ -691,7 +694,7 @@ class TestQueryCounts(TestingBase):
             cls.mask_dummy = True
 
         cls._build_graph((cls.fasta_file_1, cls.fasta_file_2), cls.tempdir.name + '/graph',
-                         cls.k, cls.graph_repr, 'basic', '--mask-dummy' if cls.mask_dummy else '')
+                         cls.k, cls.graph_repr, 'basic', '--mask-dummy --in-ram' if cls.mask_dummy else '')
 
         stats_graph = cls._get_stats(f'{cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}')
         assert(stats_graph['returncode'] == 0)
@@ -871,7 +874,7 @@ class TestQueryCanonical(TestingBase):
         cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa',
                          cls.tempdir.name + '/graph',
                          20, cls.graph_repr, 'canonical',
-                         '--mask-dummy' if cls.mask_dummy else '')
+                         '--mask-dummy --in-ram' if cls.mask_dummy else '')
 
         stats_graph = cls._get_stats(f'{cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}')
         assert(stats_graph['returncode'] == 0)
@@ -979,7 +982,7 @@ class TestQueryPrimary(TestingBase):
         cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa',
                          cls.tempdir.name + '/graph',
                          20, cls.graph_repr, 'primary',
-                         '--mask-dummy' if cls.mask_dummy else '')
+                         '--mask-dummy --in-ram' if cls.mask_dummy else '')
 
         stats_graph = cls._get_stats(f'{cls.tempdir.name}/graph{graph_file_extension[cls.graph_repr]}')
         assert(stats_graph['returncode'] == 0)
@@ -1160,8 +1163,11 @@ class TestCoordToHeader(TestingBase):
 
         res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
         self.assertEqual(res.returncode, 0)
+        # `/N` after each header is the target sequence's k-mer count (k=5,
+        # so len(seq) - 4): seq1 GTATCGATCG -> 6, seq2 GCTAGCTAGCTAGCTA -> 12,
+        # seq3 ATCG...TTTTT (28bp) -> 24.
         self.assertEqual(res.stdout.decode(),
-                         '0\tquery1\t<seq1>:0-1-5\t<seq3>:1-4:1-0-3\n1\tquery2\t<seq2>:0-0-3:0-4-7:0-8-11\n')
+                         '0\tquery1\t<seq1>/6:0-1-5\t<seq3>/24:1-4:1-0-3\n1\tquery2\t<seq2>/12:0-0-3:0-4-7:0-8-11\n')
 
         # Query in the basic mode, without mapping to headers
         res = subprocess.run([query_command + ' --no-coord-mapping'], shell=True, stdout=PIPE, stderr=PIPE)
@@ -1171,6 +1177,67 @@ class TestCoordToHeader(TestingBase):
             f'1\tquery2\t<{self.tempdir.name}/test_sequences.fa>:0-7-10:0-11-14:0-15-18\n'
         )
         self.assertEqual(res.stdout.decode(), expected_output)
+
+    def test_query_coords_json_kmers_in_target(self):
+        """JSON output should expose `kmers_in_target` so callers can compute the fraction of the target covered."""
+        graph_base = self.tempdir.name + '/graph'
+        graph = self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr]
+        anno_base = self.tempdir.name + '/annotation'
+        anno = anno_base + anno_file_extension[self.anno_repr]
+        self._build_graph(self.test_fa, graph_base, k=5, repr=self.graph_repr, mode='basic')
+        self._annotate_graph(self.test_fa, graph, anno_base, self.anno_repr, anno_type='filename')
+        self.index_headers(graph, anno_base, self.test_fa)
+
+        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords --json \
+                         -i {graph} -a {anno} --min-kmers-fraction-label 0.0 \
+                         {self.query_fa}' + MMAP_FLAG
+        res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+
+        # k=5; seq1 GTATCGATCG -> 6, seq2 GCTAGCTAGCTAGCTA -> 12, seq3 (28bp) -> 24.
+        expected_lengths = {'seq1': 6, 'seq2': 12, 'seq3': 24}
+
+        # The JSON writer pretty-prints with newlines, so parse the stream of objects.
+        decoder = json.JSONDecoder()
+        def parse_records(text):
+            records = []
+            idx = 0
+            while idx < len(text):
+                while idx < len(text) and text[idx].isspace():
+                    idx += 1
+                if idx >= len(text):
+                    break
+                record, end = decoder.raw_decode(text, idx)
+                records.append(record)
+                idx = end
+            return records
+
+        records = parse_records(res.stdout.decode())
+        self.assertEqual(len(records), 2)
+        # Pin the multi-target case explicitly: query1 hits seq1 and seq3
+        # (shared ATCGATCG), query2 hits seq2 only. Mirrors the TSV
+        # expectation in test_query_coords.
+        by_name = {record['seq_description']: record for record in records}
+        self.assertEqual(set(by_name), {'query1', 'query2'})
+        self.assertEqual({r['sample'] for r in by_name['query1']['results']},
+                         {'seq1', 'seq3'})
+        self.assertEqual({r['sample'] for r in by_name['query2']['results']},
+                         {'seq2'})
+        for record in records:
+            for result in record['results']:
+                self.assertIn('kmers_in_target', result,
+                              f"Expected kmers_in_target field in {result}")
+                self.assertEqual(result['kmers_in_target'], expected_lengths[result['sample']])
+
+        # With --no-coord-mapping, the label refers to a whole annotation column
+        # rather than a single indexed sequence, so the field is omitted.
+        res = subprocess.run([query_command + ' --no-coord-mapping'],
+                             shell=True, stdout=PIPE, stderr=PIPE)
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+        for record in parse_records(res.stdout.decode()):
+            for result in record['results']:
+                self.assertNotIn('kmers_in_target', result,
+                                 "kmers_in_target must only appear when CoordToHeader is loaded")
 
     @parameterized.expand(['', '-p 4', '--separately', '-p 4 --separately'])
     def test_multiple_files(self, extra_flags):
@@ -1262,9 +1329,11 @@ class TestCoordToHeader(TestingBase):
         self.assertEqual(len(output), 3, "Output should contain two query results")
         self.assertEqual(output[-1], "", "Output should contain two query results")
         self.assertEqual(output[0].split('\t')[:2], ["0", "query1"])
-        self.assertEqual(set(output[0].split('\t')[2:]), {"<seq1>:0-1-5", "<seq3>:1-4:1-0-3", "<seq4>:0-0-4:1-5-8:1-9-12"})
+        # `/N` after each header is the target sequence's k-mer count (k=5):
+        # seq1 (10 nt)->6, seq3 (34 nt)->30, seq4 (17 nt)->13, seq2 (16 nt)->12.
+        self.assertEqual(set(output[0].split('\t')[2:]), {"<seq1>/6:0-1-5", "<seq3>/30:1-4:1-0-3", "<seq4>/13:0-0-4:1-5-8:1-9-12"})
         self.assertEqual(output[1].split('\t')[:2], ["1", "query2"])
-        self.assertEqual(set(output[1].split('\t')[2:]), {"<seq2>:0-0-3:0-4-7:0-8-11", "<seq3>:0-28-29"})
+        self.assertEqual(set(output[1].split('\t')[2:]), {"<seq2>/12:0-0-3:0-4-7:0-8-11", "<seq3>/30:0-28-29"})
 
     def test_multiple_files_bad(self):
         # Check that query fails when Annotation and CoordToHeaders are incompatible
@@ -1346,21 +1415,23 @@ class TestCoordToHeader(TestingBase):
                     out = sum((part.split(extra_split_by) for part in out), [])
                 self.assertEqual(set(out), expected_output)
 
+        # `/N` after each header is the target sequence's k-mer count (k=5):
+        # seq1 TATCGATC (8 nt)->4, seq2 GTATCGATCGATCGATCG (18 nt)->14, seq3 ATCGATCG (8 nt)->4.
         test_stdout('--num-top-labels 1',
-            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
+            '0\tquery1\t<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
         test_stdout('--num-top-labels 2',
-            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13\t<seq3>:1-0-3:5-0-3:9-0-3')
+            '0\tquery1\t<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13\t<seq3>/4:1-0-3:5-0-3:9-0-3')
         # Without filtering by --num-top-labels, the matches are not sorted
         test_stdout('--min-kmers-fraction-label 0.5',
-            {'0', 'query1', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3', '<seq1>:0-0-3:5-1-3:9-1-3'})
+            {'0', 'query1', '<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>/4:1-0-3:5-0-3:9-0-3', '<seq1>/4:0-0-3:5-1-3:9-1-3'})
         test_stdout('--min-kmers-fraction-label 1.0',
-            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
+            '0\tquery1\t<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
         test_stdout('--min-kmers-fraction-graph 1.0',
-            {'0', 'query1', '<seq1>:0-0-3:5-1-3:9-1-3', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3'})
+            {'0', 'query1', '<seq1>/4:0-0-3:5-1-3:9-1-3', '<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>/4:1-0-3:5-0-3:9-0-3'})
         test_stdout('--min-kmers-fraction-label 0.0',
-            {'0', 'query1', '<seq1>:0-0-3:5-1-3:9-1-3', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3'})
+            {'0', 'query1', '<seq1>/4:0-0-3:5-1-3:9-1-3', '<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>/4:1-0-3:5-0-3:9-0-3'})
         test_stdout('',
-            {'0', 'query1', '<seq1>:0-0-3:5-1-3:9-1-3', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3'})
+            {'0', 'query1', '<seq1>/4:0-0-3:5-1-3:9-1-3', '<seq2>/14:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>/4:1-0-3:5-0-3:9-0-3'})
 
         # --num-top-labels is not used in the labels mode
         test_stdout('--num-top-labels 1', {'0', 'query1', 'seq2', 'seq3', 'seq1'}, mode='labels', extra_split_by=':')
@@ -1401,18 +1472,24 @@ class TestCoordToHeader(TestingBase):
         test_stdout('--num-top-labels 3', {'0', 'query1', '<seq2>:37', '<seq3>:12', '<seq1>:10'}, mode='counts-sum')
 
         test_stdout('--num-top-labels 1',
-            '0\tquery1\t<seq2>:13:1111111111111:17', mode='signature')
+            '0\tquery1\t<seq2>:13:x13:17', mode='signature')
         test_stdout('--min-kmers-fraction-label 0.5',
-            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
+            {'0', 'query1', '<seq2>:13:x13:17', '<seq3>:12:o1x12:16', '<seq1>:10:x4o1x3o1x3o1:15'}, mode='signature')
         test_stdout('--min-kmers-fraction-label 1.0',
-            '0\tquery1\t<seq2>:13:1111111111111:17', mode='signature')
+            '0\tquery1\t<seq2>:13:x13:17', mode='signature')
         test_stdout('--min-kmers-fraction-graph 1.0',
-            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
+            {'0', 'query1', '<seq2>:13:x13:17', '<seq3>:12:o1x12:16', '<seq1>:10:x4o1x3o1x3o1:15'}, mode='signature')
         test_stdout('',
-            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
+            {'0', 'query1', '<seq2>:13:x13:17', '<seq3>:12:o1x12:16', '<seq1>:10:x4o1x3o1x3o1:15'}, mode='signature')
         test_stdout('--num-top-labels 2',
-            '0\tquery1\t<seq2>:13:1111111111111:17\t<seq3>:12:0111111111111:16', mode='signature')
+            '0\tquery1\t<seq2>:13:x13:17\t<seq3>:12:o1x12:16', mode='signature')
         test_stdout('--num-top-labels 3',
+            {'0', 'query1', '<seq2>:13:x13:17', '<seq3>:12:o1x12:16', '<seq1>:10:x4o1x3o1x3o1:15'}, mode='signature')
+
+        # --verbose-output switches the presence mask back to the full binary string
+        test_stdout('--num-top-labels 1 --verbose-output',
+            '0\tquery1\t<seq2>:13:1111111111111:17', mode='signature')
+        test_stdout('--min-kmers-fraction-label 0.5 --verbose-output',
             {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
 
     @parameterized.expand(['labels', 'matches', 'counts', 'counts-sum', 'coords', 'signature'])
@@ -1472,6 +1549,14 @@ class TestCoordToHeader(TestingBase):
                     # Replace the file labels with the corresponding headers
                     for i, (header, _) in enumerate(sequences, 1):
                         output_without = output_without.replace(self.tempdir.name + f'/file_{i}.fa', header)
+
+                    if query_mode == 'coords':
+                        # The with-mapping path emits the per-sequence k-mer
+                        # count after the header (e.g., `<seq1>/14:0-0-3`).
+                        # Without mapping the label is per-file and has no
+                        # per-sequence length, so strip the `/N` suffix before
+                        # comparing.
+                        output_with = re.sub(r'(<[^>]+>)/\d+', r'\1', output_with)
 
                     if query_mode == 'labels':
                         output_with = output_with.split('\t')[-1].split(':')
@@ -1539,8 +1624,414 @@ class TestCoordToHeader(TestingBase):
                 for i, (header, _) in enumerate(sequences, 1):
                     output_without = output_without.replace(self.tempdir.name + f'/file_{i}.fa', header)
 
+                if query_mode == 'coords':
+                    # The with-mapping path emits the per-sequence k-mer count
+                    # after the header (e.g., `<seq1>/14:0-0-3`). Strip it for
+                    # comparison since the without-mapping path has no
+                    # per-sequence length.
+                    output_with = re.sub(r'(<[^>]+>)/\d+', r'\1', output_with)
+
                 # Should have same results
                 self.assertEqual(output_with, output_without)
+
+
+class TestLoadErrorMessages(TestingBase):
+    """For every graph and annotation file extension, verify that when a
+    non-existent file is passed the CLI exits non-zero AND the offending
+    path appears in stderr. Regression guard for the class of bugs where a
+    loader fails silently or only prints a generic 'cannot load' message
+    with no path, leaving the user guessing which file is broken."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Build one valid graph + one valid column annotation that we can pair
+        # against a deliberately-bogus counterpart in each test case.
+        cls.graph_path = cls.tempdir.name + '/graph.dbg'
+        cls.anno_base = cls.tempdir.name + '/annotation'
+        cls.anno_path = cls.anno_base + '.column.annodbg'
+        cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa', cls.graph_path,
+                         6, 'succinct')
+        cls._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
+                            cls.graph_path, cls.anno_base, 'column')
+
+    def _run_expecting_failure(self, cmd):
+        res = subprocess.run(cmd, shell=True, stdout=PIPE, stderr=PIPE, timeout=60)
+        return res.returncode, res.stderr.decode(errors='replace')
+
+    def _assert_error_line_contains_path(self, stderr, path):
+        """The offending path must appear on a line tagged '[error]', not just
+        somewhere in the log. An info-level mention of the path doesn't count."""
+        error_lines = [l for l in stderr.splitlines() if '[error]' in l]
+        self.assertTrue(
+            any(path in l for l in error_lines),
+            msg=(f"no [error] line mentions path '{path}'.\n"
+                 f"[error] lines:\n" + '\n'.join(error_lines) + '\n'
+                 f"full stderr:\n{stderr}'"))
+
+    def _assert_error_line_mentions_permissions(self, stderr, path):
+        """For permission-denied failures, the [error] line that names the
+        file must also tell the user that the problem is about read rights."""
+        self._assert_error_line_contains_path(stderr, path)
+        error_lines = [l for l in stderr.splitlines()
+                       if '[error]' in l and path in l]
+        self.assertTrue(
+            any('permission' in l.lower() for l in error_lines),
+            msg=(f"no [error] line for '{path}' mentions permissions.\n"
+                 + '\n'.join(error_lines)))
+
+    @parameterized.expand([(ext,) for ext in set(graph_file_extension.values())])
+    def test_missing_graph_mentions_path(self, graph_ext):
+        missing = self.tempdir.name + '/does_not_exist' + graph_ext
+        rc, stderr = self._run_expecting_failure(f'{METAGRAPH} stats {missing}')
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, missing)
+
+    @parameterized.expand([(ext,) for ext in set(anno_file_extension.values())])
+    def test_missing_annotation_mentions_path(self, anno_ext):
+        missing = self.tempdir.name + '/does_not_exist' + anno_ext
+        rc, stderr = self._run_expecting_failure(
+            f'{METAGRAPH} stats -a {missing} {self.graph_path}')
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, missing)
+
+    # RowDiff<ColumnMajor> annotations keep their anchor bitmap and fork-
+    # successor bitmap in side-car files (.anchors and .rd_succ) next to
+    # the graph. If either is missing, the annotation load aborts via
+    # IRowDiff::load_anchor / load_fork_succ — we want the offending
+    # side-car path on an [error] line too.
+    def _prepare_row_diff_annotation(self):
+        """Build a RowDiff<ColumnMajor> annotation and return (graph, anno, anchor, rd_succ)."""
+        anno_base = self.tempdir.name + '/rd'
+        anno_path = anno_base + '.row_diff.annodbg'
+        anchor_path = self.graph_path + '.anchors'
+        rd_succ_path = self.graph_path + '.rd_succ'
+        # Build a column annotation and transform to row_diff (stages 0, 1, 2).
+        self._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
+                             self.graph_path, anno_base, 'column')
+        for stage in (0, 1, 2):
+            cmd = (f'{METAGRAPH} transform_anno -p 2 --anno-type row_diff '
+                   f'-i {self.graph_path} -o {anno_base} '
+                   f'{anno_base}.column.annodbg --row-diff-stage {stage}')
+            self._run_command(cmd, f'RowDiff stage {stage}', shell=True)
+        return anno_path, anchor_path, rd_succ_path
+
+    def _query_with_anno(self, anno_path):
+        query_fa = self.tempdir.name + '/q.fa'
+        with open(query_fa, 'w') as f:
+            f.write('>q\nACGTACGT\n')
+        return self._run_expecting_failure(
+            f'{METAGRAPH} query -i {self.graph_path} -a {anno_path} {query_fa}')
+
+    def test_missing_anchor_file_mentions_path(self):
+        anno_path, anchor_path, _ = self._prepare_row_diff_annotation()
+        os.remove(anchor_path)
+        rc, stderr = self._query_with_anno(anno_path)
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, anchor_path)
+
+    def test_missing_fork_succ_file_mentions_path(self):
+        anno_path, _, rd_succ_path = self._prepare_row_diff_annotation()
+        os.remove(rd_succ_path)
+        rc, stderr = self._query_with_anno(anno_path)
+        self.assertNotEqual(0, rc, msg=stderr)
+        self._assert_error_line_contains_path(stderr, rd_succ_path)
+
+    # Corrupt-file coverage is intentionally weaker than the missing-file
+    # case: we only assert the process exits non-zero. Checking for a
+    # proper [error] line with the file path would fail today because
+    # several loaders mishandle garbage input (hash graphs call exit(1)
+    # from deep in `initialize_graph`, BRWT hits SIGFPE on certain byte
+    # patterns, and various annotation types let exceptions escape
+    # without a contextual log). Those defects warrant their own PR.
+    # The exit-code check at least guards against the worst failure
+    # mode — silently accepting garbage as a valid file.
+    @parameterized.expand([(ext,) for ext in set(graph_file_extension.values())])
+    def test_corrupt_graph_fails(self, graph_ext):
+        corrupt = self.tempdir.name + '/corrupt' + graph_ext
+        with open(corrupt, 'wb') as f:
+            f.write(b'\xff' * 1024)
+        rc, stderr = self._run_expecting_failure(f'{METAGRAPH} stats {corrupt}')
+        self.assertNotEqual(0, rc,
+            msg=f"loading corrupt '{corrupt}' silently succeeded.\n{stderr}")
+
+    @parameterized.expand([(ext,) for ext in set(anno_file_extension.values())])
+    def test_corrupt_annotation_fails(self, anno_ext):
+        # 0xFF bytes (not zeros): every length-prefix in these formats reads
+        # as a uint64 of 0xFF…FF ~ 2^64, so the loader either tries an
+        # impossible allocation or trips an sdsl sanity check. A file full of
+        # zeros, by contrast, is a structurally valid "empty annotation" for
+        # several formats (ColumnCompressed, RowCompressed, RowDiff,
+        # ColumnCoord), and those loaders accept it cleanly on macOS — so the
+        # zero-byte payload would silently pass the test on one platform and
+        # fail on another depending on stdlib/sdsl behaviour.
+        corrupt = self.tempdir.name + '/corrupt' + anno_ext
+        with open(corrupt, 'wb') as f:
+            f.write(b'\xff' * 1024)
+        rc, stderr = self._run_expecting_failure(
+            f'{METAGRAPH} stats -a {corrupt} {self.graph_path}')
+        self.assertNotEqual(0, rc,
+            msg=f"loading corrupt '{corrupt}' silently succeeded.\n{stderr}")
+
+    # Permission-denied tests: a valid file (copy of a working one) with its
+    # read bits stripped. Loader must fail with an [error] line that both
+    # names the file and mentions "permissions" so the user knows what to fix.
+    # Skipped when running as root since chmod 000 doesn't restrict root's
+    # access.
+    @unittest.skipIf(os.geteuid() == 0, "chmod 000 has no effect when running as root")
+    @parameterized.expand([(ext,) for ext in set(graph_file_extension.values())])
+    def test_unreadable_graph_mentions_permissions(self, graph_ext):
+        unreadable = self.tempdir.name + '/unreadable' + graph_ext
+        shutil.copy(self.graph_path, unreadable)
+        os.chmod(unreadable, 0o000)
+        try:
+            rc, stderr = self._run_expecting_failure(f'{METAGRAPH} stats {unreadable}')
+            self.assertNotEqual(0, rc, msg=stderr)
+            self._assert_error_line_mentions_permissions(stderr, unreadable)
+        finally:
+            os.chmod(unreadable, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod 000 has no effect when running as root")
+    @parameterized.expand([(ext,) for ext in set(anno_file_extension.values())])
+    def test_unreadable_annotation_mentions_permissions(self, anno_ext):
+        unreadable = self.tempdir.name + '/unreadable' + anno_ext
+        shutil.copy(self.anno_path, unreadable)
+        os.chmod(unreadable, 0o000)
+        try:
+            rc, stderr = self._run_expecting_failure(
+                f'{METAGRAPH} stats -a {unreadable} {self.graph_path}')
+            self.assertNotEqual(0, rc, msg=stderr)
+            self._assert_error_line_mentions_permissions(stderr, unreadable)
+        finally:
+            os.chmod(unreadable, 0o644)
+
+
+# Runs a command with its stdout to a file and prints its return code and peak resident set
+# size in bytes (getrusage of the waited-for child: KiB on Linux, bytes on macOS)
+PEAK_RSS = """
+import resource, subprocess, sys
+with open(sys.argv[1], 'wb') as out:
+    rc = subprocess.run(sys.argv[2:], stdout=out, stderr=subprocess.DEVNULL).returncode
+peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+print(rc, peak if sys.platform == 'darwin' else peak * 1024)
+"""
+
+
+class TestQueryPositionsHeldSparsely(TestingBase):
+    """The per-position query modes (signature, counts, coords) on a coordinate index with a
+    record mapping (.seqs) hold each returned record's values at the positions it matches
+    only. A query made of many records' first k-mers returns every record, each matched at
+    one position, so a value per k-mer of the query and record would take more than 1 GiB in
+    each mode; the query stays far below that and writes every record's value."""
+    k = 31
+    record_length = 60
+    num_records = 16700        # signature: 16,700 records x 517,670 k-mers / 8 > 1 GiB
+    num_records_values = 2500  # counts, coords: 2,500 x 77,470 k-mers x 8 B (or more) > 1 GiB
+    max_peak_bytes = 512 * 1024 ** 2
+
+    @classmethod
+    def setUpClass(cls):
+        import random
+        cls.tempdir = TemporaryDirectory()
+        rng = random.Random(5)
+        # a record's first base differs from the base after the previous record's first k-mer,
+        # so that the query's k-mers across the junction do not continue the previous record
+        cls.records = []
+        for _ in range(cls.num_records):
+            record = ''.join(rng.choice('ACGT') for _ in range(cls.record_length))
+            if cls.records and record[0] == cls.records[-1][cls.k]:
+                record = ('A' if record[0] != 'A' else 'C') + record[1:]
+            cls.records.append(record)
+        cls.fasta = cls.tempdir.name + '/records.fa'
+        with open(cls.fasta, 'w') as f:
+            for i, record in enumerate(cls.records):
+                f.write(f'>rec{i}\n{record}\n')
+        # one query of every record's first k-mer, one of the first records' only
+        cls.queries = {}
+        for name, n in (('all', cls.num_records), ('first', cls.num_records_values)):
+            cls.queries[name] = cls.tempdir.name + f'/query_{name}.fa'
+            with open(cls.queries[name], 'w') as f:
+                f.write('>q\n' + ''.join(record[:cls.k] for record in cls.records[:n]) + '\n')
+
+        cls.graph = cls.tempdir.name + '/graph' + graph_file_extension['succinct']
+        cls.anno_base = cls.tempdir.name + '/annotation'
+        cls.anno = cls.anno_base + anno_file_extension['row_diff_brwt_coord']
+        cls._build_graph(cls.fasta, cls.tempdir.name + '/graph', cls.k, 'succinct', 'basic')
+        cls._annotate_graph(cls.fasta, cls.graph, cls.anno_base, 'row_diff_brwt_coord',
+                            anno_type='filename')
+        res = subprocess.run([f'{METAGRAPH} annotate --anno-filename --index-header-coords '
+                              f'-i {cls.graph} -o {cls.anno_base} {cls.fasta}'],
+                             shell=True, stdout=PIPE, stderr=PIPE)
+        assert res.returncode == 0, res.stderr.decode()
+        assert os.path.exists(cls.anno_base + '.seqs')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tempdir.cleanup()
+
+    def _query(self, mode, query, num_records):
+        out = self.tempdir.name + f'/out_{mode}.tsv'
+        command = [METAGRAPH, 'query', '--query-mode', mode, '--min-kmers-fraction-label', '0',
+                   '--num-top-labels', str(num_records), '-i', self.graph, '-a', self.anno,
+                   self.queries[query]]
+        res = subprocess.run([sys.executable, '-c', PEAK_RSS, out] + command,
+                             stdout=PIPE, stderr=PIPE)
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+        rc, peak = (int(x) for x in res.stdout.decode().split())
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(1, len(lines))
+        fields = lines[0].split('\t')
+        self.assertEqual(['0', 'q'], fields[:2])
+        # every record once, each matched at the position of its first k-mer
+        values = {}
+        for field in fields[2:]:
+            label, value = field[1:].split('>', 1)
+            self.assertNotIn(label, values)
+            values[label] = value
+        self.assertEqual(num_records, len(values))
+        num_kmers = num_records * self.k - self.k + 1
+        print(f'[ {mode} ] {num_records} records x {num_kmers} k-mers: peak RSS '
+              f'{peak / 1024 ** 2:.0f} MiB', flush=True)
+        return values, num_kmers, peak
+
+    def test_signature(self):
+        values, num_kmers, peak = self._query('signature', 'all', self.num_records)
+        for i in range(self.num_records):
+            position = i * self.k
+            after = num_kmers - position - 1
+            mask = (f'o{position}' if position else '') + 'x1' + (f'o{after}' if after else '')
+            count, presence, score = values[f'rec{i}'][1:].split(':')
+            self.assertEqual(('1', mask), (count, presence), i)
+            int(score)
+        self.assertGreater(self.num_records * num_kmers / 8, 1024 ** 3)
+        self.assertLess(peak, self.max_peak_bytes)
+
+    def test_counts(self):
+        values, num_kmers, peak = self._query('counts', 'first', self.num_records_values)
+        for i in range(self.num_records_values):
+            self.assertEqual(f':{i * self.k}=1', values[f'rec{i}'], i)
+        self.assertGreater(self.num_records_values * num_kmers * 8, 1024 ** 3)
+        self.assertLess(peak, self.max_peak_bytes)
+
+    def test_coords(self):
+        values, num_kmers, peak = self._query('coords', 'first', self.num_records_values)
+        in_target = self.record_length - self.k + 1
+        for i in range(self.num_records_values):
+            self.assertEqual(f'/{in_target}:{i * self.k}-0', values[f'rec{i}'], i)
+        # a coordinate list (24 bytes) per k-mer and record
+        self.assertGreater(self.num_records_values * num_kmers * 24, 1024 ** 3)
+        self.assertLess(peak, self.max_peak_bytes)
+
+
+class TestQueryRepeatedKmerDecodedOnce(TestingBase):
+    """The coords query mode decodes each distinct annotation row of the query's k-mers once,
+    not once per query position, and keeps the coordinates of a repeated row only for the
+    returned records. A record with one A^31, a record of 4,000 separate A-runs (31 to 40
+    bases) and a record of a long poly-A run (25,000 occurrences of A^31), as
+    row_diff_brwt_coord with a record mapping (.seqs) and, each record in a file (column) of
+    its own, without one; a query with 10,000 poly-A k-mers and one k-mer unique to the short
+    record returns that record at --num-top-labels 1, regardless of column order. A copy of
+    the row per position would take 10,000 x 25,001 x 8 B = 2 GB, and the coordinates of the
+    separate A-runs at every position, kept for all records, about 10,000 x 4,000 x 16 B;
+    the query stays far below both and writes the expected bytes."""
+    k = 31
+    long_run = 25000      # occurrences of A^31 in the long record
+    separate_runs = 4000  # A-runs of 31 to 40 bases in another record
+    query_kmers = 10000
+    flank = 40            # the short record's A^31 is at its coordinate 40
+    max_peak_bytes = 512 * 1024 ** 2
+
+    @classmethod
+    def setUpClass(cls):
+        import random
+        cls.tempdir = TemporaryDirectory()
+        rng = random.Random(55)
+        # flanks without an A, so that the short record holds A^31 once
+        short = (''.join(rng.choice('CGT') for _ in range(cls.flank)) + 'A' * cls.k
+                 + ''.join(rng.choice('CGT') for _ in range(cls.flank)))
+        cls.short_kmers = len(short) - cls.k + 1
+        separate = ''.join(rng.choice('CGT') + 'A' * rng.randint(cls.k, cls.k + 9)
+                           + rng.choice('CGT') for _ in range(cls.separate_runs))
+        records = {'a': ('rec_a', short), 'y': ('rec_y', separate),
+                   'z': ('rec_z', 'A' * (cls.k + cls.long_run - 1))}
+        cls.fasta = {}
+        for name, (header, sequence) in records.items():
+            cls.fasta[name] = cls.tempdir.name + f'/{name}.fa'
+            with open(cls.fasta[name], 'w') as f:
+                f.write(f'>{header}\n{sequence}\n')
+        cls.both = cls.tempdir.name + '/both.fa'
+        with open(cls.both, 'w') as f:
+            for header, sequence in records.values():
+                f.write(f'>{header}\n{sequence}\n')
+        cls.query = cls.tempdir.name + '/query.fa'
+        with open(cls.query, 'w') as f:
+            # The unique k-mer breaks the tie independently of parallel column insertion.
+            f.write('>q\n' + short[:cls.k] + 'N'
+                    + 'A' * (cls.k + cls.query_kmers - 1) + '\n')
+
+        cls.graph = cls.tempdir.name + '/graph' + graph_file_extension['succinct']
+        cls._build_graph(cls.both, cls.tempdir.name + '/graph', cls.k, 'succinct', 'basic')
+        # with a record mapping: both records in one column
+        cls.anno_base = cls.tempdir.name + '/records'
+        cls.anno = cls.anno_base + anno_file_extension['row_diff_brwt_coord']
+        cls._annotate_graph(cls.both, cls.graph, cls.anno_base, 'row_diff_brwt_coord',
+                            anno_type='filename')
+        res = subprocess.run([f'{METAGRAPH} annotate --anno-filename --index-header-coords '
+                              f'-i {cls.graph} -o {cls.anno_base} {cls.both}'],
+                             shell=True, stdout=PIPE, stderr=PIPE)
+        assert res.returncode == 0, res.stderr.decode()
+        assert os.path.exists(cls.anno_base + '.seqs')
+        # without one: a column per record's file
+        cls.columns_base = cls.tempdir.name + '/columns'
+        cls.columns = cls.columns_base + anno_file_extension['row_diff_brwt_coord']
+        cls._annotate_graph([cls.fasta['a'], cls.fasta['y'], cls.fasta['z']], cls.graph,
+                            cls.columns_base,
+                            'row_diff_brwt_coord', anno_type='filename')
+        assert not os.path.exists(cls.columns_base + '.seqs')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tempdir.cleanup()
+
+    def _query(self, anno):
+        out = self.tempdir.name + '/out.tsv'
+        command = [METAGRAPH, 'query', '--query-mode', 'coords', '--min-kmers-fraction-label', '0',
+                   '--num-top-labels', '1', '-i', self.graph, '-a', anno, self.query]
+        res = subprocess.run([sys.executable, '-c', PEAK_RSS, out] + command,
+                             stdout=PIPE, stderr=PIPE)
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+        rc, peak = (int(x) for x in res.stdout.decode().split())
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(1, len(lines))
+        fields = lines[0].split('\t')
+        self.assertEqual(['0', 'q'], fields[:2])
+        self.assertEqual(3, len(fields))
+        label, value = fields[2][1:].split('>', 1)
+        print(f'[ coords ] {self.query_kmers} positions of one row of {self.long_run + 1} '
+              f'coordinates: peak RSS {peak / 1024 ** 2:.0f} MiB', flush=True)
+        # a copy of the row per position
+        self.assertGreater(self.query_kmers * (self.long_run + 1) * 8, 1024 ** 3)
+        self.assertLess(peak, self.max_peak_bytes)
+        return label, value
+
+    def _ranges(self):
+        # One unique k-mer, then the short record's A^31 at every poly-A query position.
+        return '0-0:' + ':'.join(f'{p + self.k + 1}-{self.flank}'
+                                for p in range(self.query_kmers))
+
+    def test_coords_by_record(self):
+        label, value = self._query(self.anno)
+        self.assertEqual('rec_a', label)
+        self.assertEqual(f'/{self.short_kmers}:' + self._ranges(), value)
+
+    def test_coords_by_column(self):
+        label, value = self._query(self.columns)
+        self.assertEqual(self.fasta['a'], label)
+        self.assertEqual(':' + self._ranges(), value)
 
 
 if __name__ == '__main__':

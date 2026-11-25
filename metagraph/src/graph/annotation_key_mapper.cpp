@@ -1,0 +1,43 @@
+#include "annotation_key_mapper.hpp"
+
+#include <algorithm>
+#include <cassert>
+#include <stdexcept>
+
+#include "representation/canonical_dbg.hpp"
+#include "representation/hash/dbg_sshash.hpp"
+
+namespace mtg::graph {
+
+AnnotationKeyMapper::AnnotationKeyMapper(const DeBruijnGraph &graph)
+      : graph_(graph), mode_(graph.get_mode()),
+        canonical_(dynamic_cast<const CanonicalDBG*>(&graph)),
+        sshash_(dynamic_cast<const DBGSSHash*>(&graph)) {
+    if (mode_ == DeBruijnGraph::PRIMARY)
+        throw std::invalid_argument("Wrap PRIMARY graphs in CanonicalDBG before mapping annotations");
+}
+
+auto AnnotationKeyMapper::canonical_key(node_index node, std::string_view kmer) const -> node_index {
+    if (canonical_)
+        return canonical_->get_base_node(node);
+    if (sshash_)
+        return sshash_->get_base_node(node);
+    assert(kmer.size() == graph_.get_k());
+    return *graph_.node_range(kmer).begin();
+}
+
+auto AnnotationKeyMapper::keys(std::span<const node_index> nodes,
+                                std::string_view sequence) const -> std::vector<node_index> {
+    if (nodes.empty())
+        return {};
+    if (needs_sequence()) {
+        assert(sequence.size() == nodes.size() + graph_.get_k() - 1);
+        return map_to_nodes(graph_, sequence);
+    }
+    std::vector<node_index> result(nodes.size());
+    std::transform(nodes.begin(), nodes.end(), result.begin(),
+                   [&](node_index node) { return key(node); });
+    return result;
+}
+
+} // namespace mtg::graph

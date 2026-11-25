@@ -10,6 +10,7 @@
 #include "graph/alignment/dbg_aligner.hpp"
 #include "graph/alignment/aligner_labeled.hpp"
 #include "graph/annotated_dbg.hpp"
+#include "annotation/int_matrix/base/int_matrix.hpp"
 #include "graph/graph_extensions/node_first_cache.hpp"
 #include "seq_io/sequence_io.hpp"
 #include "config/config.hpp"
@@ -200,12 +201,10 @@ std::string sequence_to_gfa_path(const std::string &seq,
     // We need to print the id of the last unitig even in the case that
     // this unitig is not completely covered by the query sequence.
     while (config->output_compacted && !is_unitig_end_node.count(last_node_to_print)) {
-        uint64_t unique_next_node;
-        graph.adjacent_outgoing_nodes(
-            last_node_to_print,
-            [&](uint64_t node) { unique_next_node = node; }
-        );
-        last_node_to_print = unique_next_node;
+        // a node inside a unitig has exactly one outgoing node
+        const auto next_nodes = graph.adjacent_outgoing_nodes(last_node_to_print);
+        assert(next_nodes.size() == 1);
+        last_node_to_print = next_nodes[0];
     }
     nodes_on_path += fmt::format("{}+,", last_node_to_print);
 
@@ -254,7 +253,9 @@ void gfa_map_files(const Config *config,
 std::string format_alignment(const std::string &header,
                              const AlignmentResults &paths,
                              const DeBruijnGraph &graph,
-                             const Config &config) {
+                             const Config &config,
+                             const annot::LabelEncoder<> *encoder,
+                             const annot::CoordToHeader *cth) {
     std::string sout;
     if (!config.output_json) {
         sout += fmt::format("{}\t{}", header, paths.get_query());
@@ -263,6 +264,21 @@ std::string format_alignment(const std::string &header,
         } else {
             for (const auto &path : paths) {
                 sout += fmt::format("\t{}", path);
+                // labels/coordinates only ever come from a labeled aligner,
+                // which always supplies the encoder. cth is the optional refinement.
+                if (path.label_coordinates.size()) {
+                    assert(encoder);
+                    sout += "\t" + (cth ? path.format_coords(*cth, graph.get_k())
+                                        : path.format_coords(*encoder));
+                } else if (path.label_columns.size()) {
+                    assert(encoder);
+                    std::vector<std::string> labels;
+                    labels.reserve(path.label_columns.size());
+                    for (auto col : path.label_columns) {
+                        labels.emplace_back(encoder->decode(col));
+                    }
+                    sout += fmt::format("\t{}", fmt::join(labels, ";"));
+                }
             }
             sout += "\n";
         }
@@ -275,7 +291,9 @@ std::string format_alignment(const std::string &header,
         for (size_t i = 0; i < paths.size(); ++i) {
             const auto &path = paths[i];
 
-            Json::Value json_line = path.to_json(graph.get_k(), secondary, header);
+            Json::Value json_line = path.to_json(graph.get_k(), secondary, header,
+                                                 /*label=*/{}, encoder, cth,
+                                                 config.align_output_path);
             sout += fmt::format("{}\n", Json::writeString(builder, json_line));
             secondary = true;
         }
@@ -289,6 +307,24 @@ std::string format_alignment(const std::string &header,
     return sout;
 }
 
+// header, strand, labels, number of query characters covered by their seeds,
+// and the query range they span
+static std::string format_mapping(const std::string &header,
+                                  const std::optional<LabeledAligner<>::LabelMapping> &mapping,
+                                  const annot::LabelEncoder<> &encoder) {
+    if (!mapping)
+        return fmt::format("{}\t*\t*\t0\t*\t*\n", header);
+
+    std::vector<std::string> labels;
+    labels.reserve(mapping->labels.size());
+    for (auto column : mapping->labels) {
+        labels.emplace_back(encoder.decode(column));
+    }
+    return fmt::format("{}\t{}\t{}\t{}\t{}\t{}\n", header,
+                       mapping->orientation ? '-' : '+', fmt::join(labels, ";"),
+                       mapping->num_matches, mapping->query_begin, mapping->query_end);
+}
+
 int align_to_graph(Config *config) {
     assert(config);
 
@@ -296,10 +332,21 @@ int align_to_graph(Config *config) {
 
     assert(config->infbase.size());
 
-    // initialize graph
-    auto graph = load_critical_dbg(config->infbase);
+    // For graph-only outputs/queries, avoid starting annotation loading.
+    const bool graph_only_path = config->outfbase.ends_with(".gfa")
+                                 || config->map_sequences;
+    std::shared_ptr<DeBruijnGraph> graph;
+    std::future<std::unique_ptr<AnnotatedDBG>> anno_dbg_future;
+    if (graph_only_path) {
+        graph = load_critical_dbg(config->infbase);
+    } else {
+        // Load graph and annotation in parallel for alignment mode.
+        auto loaded = load_graph_with_async_annotation(*config);
+        graph = loaded.first.get();
+        anno_dbg_future = std::move(loaded.second);
+    }
 
-    if (utils::ends_with(config->outfbase, ".gfa")) {
+    if (config->outfbase.ends_with(".gfa")) {
         gfa_map_files(config, files, *graph);
         return 0;
     }
@@ -323,10 +370,11 @@ int align_to_graph(Config *config) {
         if (!config->alignment_length) {
             config->alignment_length = graph->get_k();
         } else if (config->alignment_length > graph->get_k()) {
-            logger->warn("Mapping to k-mers longer than k is not supported");
+            logger->warn("--align-length exceeds the graph's k. Using k={} for mapping.", graph->get_k());
             config->alignment_length = graph->get_k();
         } else if (config->alignment_length != graph->get_k() && !dbg_succ) {
-            logger->error("Matching k-mers shorter than k only supported for succinct graphs");
+            logger->error("--align-length below the graph's k requires a succinct graph. "
+                          "Omit --align-length to map at the graph's k.");
             exit(1);
         }
 
@@ -347,16 +395,27 @@ int align_to_graph(Config *config) {
 
     DBGAlignerConfig aligner_config = initialize_aligner_config(*config, *graph);
 
+    assert(config->infbase_annotators.size() <= 1);
     std::unique_ptr<AnnotatedDBG> anno_dbg;
-    if (config->infbase_annotators.size()) {
-        assert(config->infbase_annotators.size() == 1);
-        anno_dbg = initialize_annotated_dbg(graph, *config);
+    if (anno_dbg_future.valid())
+        anno_dbg = anno_dbg_future.get();
+
+    // Chaining needs the coordinates of the seeds, which the aligner uses only
+    // with an annotation with coordinates on a BASIC-mode graph.
+    if (config->alignment_chain
+            && (graph->get_mode() != DeBruijnGraph::BASIC || !anno_dbg
+                || !dynamic_cast<const annot::matrix::MultiIntMatrix*>(
+                        &anno_dbg->get_annotator().get_matrix()))) {
+        logger->error("--align-chain requires a BASIC-mode graph and an annotation "
+                      "with coordinates (e.g., annotate --coordinates, then "
+                      "transform_anno --anno-type column_coord)");
+        return 1;
     }
 
     auto wrap_graph = [&](auto graph) {
         if (graph->get_mode() == DeBruijnGraph::PRIMARY) {
-            graph = std::make_shared<CanonicalDBG>(graph);
             logger->trace("Primary graph wrapped into canonical");
+            return std::shared_ptr<DeBruijnGraph>(CanonicalDBG::with_node_first_cache(graph));
         }
 
         // If backwards traversal on DBGSuccinct will be needed, then add a cache
@@ -364,7 +423,7 @@ int align_to_graph(Config *config) {
         if (dbg_succ)
             graph->add_extension(std::make_shared<NodeFirstCache>(*dbg_succ));
 
-        return graph;
+        return std::shared_ptr<DeBruijnGraph>(graph);
     };
 
     // if using a small number of threads, use a shared cache for all threads
@@ -431,9 +490,29 @@ int align_to_graph(Config *config) {
                     aligner = std::make_unique<DBGAligner<>>(*aln_graph, aligner_config);
                 }
 
+                const annot::LabelEncoder<> *encoder = nullptr;
+                const annot::CoordToHeader *cth = nullptr;
+                if (anno_dbg) {
+                    encoder = &anno_dbg->get_annotator().get_label_encoder();
+                    cth = anno_dbg->get_coord_to_header();
+                }
+
+                if (config->align_map_only) {
+                    assert(anno_dbg);
+                    dynamic_cast<const LabeledAligner<>&>(*aligner).map_batch(batch,
+                        [&](const std::string &header,
+                            std::optional<LabeledAligner<>::LabelMapping>&& mapping) {
+                            auto res = format_mapping(header, mapping, *encoder);
+                            std::lock_guard<std::mutex> lock(print_mutex);
+                            *out << res;
+                        }
+                    );
+                    return;
+                }
+
                 aligner->align_batch(batch,
                     [&](const std::string &header, AlignmentResults&& paths) {
-                        const auto &res = format_alignment(header, paths, *graph, *config);
+                        auto res = format_alignment(header, paths, *graph, *config, encoder, cth);
                         std::lock_guard<std::mutex> lock(print_mutex);
                         *out << res;
                     }

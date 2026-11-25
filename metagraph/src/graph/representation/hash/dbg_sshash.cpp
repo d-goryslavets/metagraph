@@ -1,6 +1,10 @@
 #include "dbg_sshash.hpp"
 
+#include <memory>
+#include <optional>
 #include <type_traits>
+
+#include <sdsl/memory_management.hpp>
 
 #include <streaming_query.hpp>
 #include <progress_bar.hpp>
@@ -9,7 +13,7 @@
 
 // sshash template implementations
 #include <src/dictionary.cpp>
-#include <src/build.cpp>
+#include <src/builder/build.cpp>
 #include <src/query.cpp>
 #include <src/info.cpp>
 
@@ -18,18 +22,14 @@
 #include "common/logger.hpp"
 #include "common/algorithms.hpp"
 #include "common/threads/threading.hpp"
+#include "common/utils/file_utils.hpp"
+#include "common/unix_tools.hpp"
 #include "kmer/kmer_extractor.hpp"
+#include "seq_io/sequence_io.hpp"
 
 
 namespace mtg {
 namespace graph {
-
-#if _PROTEIN_GRAPH
-static constexpr uint16_t bits_per_char = sshash::aa_uint_kmer_t<uint64_t>::bits_per_char;
-#else
-static constexpr uint16_t bits_per_char = sshash::dna_uint_kmer_t<uint64_t>::bits_per_char;
-#endif
-
 
 const std::string DBGSSHash::alphabet_ = kmer::KmerExtractor2Bit().alphabet;
 
@@ -48,25 +48,27 @@ DBGSSHash::DBGSSHash(size_t k, Mode mode) : k_(k), num_nodes_(0), mode_(mode) {
     if (mode == PRIMARY)
         mode_ = CANONICAL;
 
-    size_t odd_k = (k_ | 1);
-
-    if (odd_k * bits_per_char <= 64) {
+    if (k_ <= kmer_t<KmerInt64>::max_k) {
         dict_.emplace<sshash::dictionary<kmer_t<KmerInt64>, sshash::decoded_offsets>>();
-    } else if (odd_k * bits_per_char <= 128) {
+    } else if (k_ <= kmer_t<KmerInt128>::max_k) {
         dict_.emplace<sshash::dictionary<kmer_t<KmerInt128>, sshash::decoded_offsets>>();
-    } else if (odd_k * bits_per_char <= 256) {
+    } else if (k_ <= kmer_t<KmerInt256>::max_k) {
         dict_.emplace<sshash::dictionary<kmer_t<KmerInt256>, sshash::decoded_offsets>>();
     } else {
-        common::logger->error("k too big: {} > {}", odd_k, 256 / bits_per_char);
+        common::logger->error("k too big: {} > {}", k_, kmer_t<KmerInt256>::max_k);
         throw std::length_error("k fail");
     }
 }
 
-std::pair<bit_vector_smart, bit_vector_smart> generate_succ_pred(const DBGSSHash& graph,
-                                                                 uint64_t num_nodes) {
+// Also reports whether the input had duplicate k-mers. SSHash requires each k-mer (and,
+// for canonical graphs, its reverse complement) to occur at most once. Otherwise,
+// a k-mer gets several node indexes, only one of which can be found by a lookup.
+std::tuple<bit_vector_smart, bit_vector_smart, bool>
+generate_succ_pred(const DBGSSHash& graph, uint64_t num_nodes) {
     sdsl::bit_vector succ_is_next(num_nodes + 1, false);
     sdsl::bit_vector pred_is_prev(num_nodes + 1, false);
     bool with_rc = (graph.get_mode() != DBGSSHash::BASIC);
+    std::atomic<bool> has_duplicates(false);
 
     std::visit(
             [&](const auto& dict) {
@@ -84,7 +86,7 @@ std::pair<bit_vector_smart, bit_vector_smart> generate_succ_pred(const DBGSSHash
 
 #pragma omp parallel for num_threads(get_num_threads()) schedule(static)
                 for (DBGSSHash::node_index begin = 0; begin <= num_nodes; begin += BS) {
-                    DBGSSHash::node_index end = std::min(begin + BS, num_nodes);
+                    DBGSSHash::node_index end = std::min(begin + BS, num_nodes + 1);
 
                     bool last_single_outdeg = false;
                     kmer_t kmer;
@@ -96,6 +98,11 @@ std::pair<bit_vector_smart, bit_vector_smart> generate_succ_pred(const DBGSSHash
                             std::string string_kmer = graph.get_node_sequence(node);
                             kmer = sshash::util::string_to_uint_kmer<kmer_t>(
                                     string_kmer.c_str(), graph.get_k());
+                            // a k-mer reached from its predecessor was already found at
+                            // this node by the neighbour lookup, so check only the others
+                            if (dict.lookup(kmer, with_rc).kmer_id
+                                    != graph_index_to_sshash(node))
+                                has_duplicates.store(true, std::memory_order_relaxed);
                         }
 
                         last_single_outdeg = false;
@@ -118,7 +125,9 @@ std::pair<bit_vector_smart, bit_vector_smart> generate_succ_pred(const DBGSSHash
                             }
                         }
 
-                        if (next == node + 1) {
+                        // in canonical mode, num_nodes + 1 is the reverse complement of
+                        // node 1, not the next forward node
+                        if (node < num_nodes && next == node + 1) {
                             assert(found_fw);
                             succ_is_next[node] = true;
                             last_single_outdeg = true;
@@ -155,11 +164,40 @@ std::pair<bit_vector_smart, bit_vector_smart> generate_succ_pred(const DBGSSHash
             },
             graph.data());
 
-    return std::make_pair(bit_vector_smart(std::move(succ_is_next)),
-                          bit_vector_smart(std::move(pred_is_prev)));
+    return std::make_tuple(bit_vector_smart(std::move(succ_is_next)),
+                           bit_vector_smart(std::move(pred_is_prev)),
+                           has_duplicates.load());
 }
 
-DBGSSHash::DBGSSHash(const std::string& input_filename, size_t k, Mode mode, size_t num_chars)
+// Total length of the sequences in a FASTA file, read like SSHash reads it:
+// gzipped if the name ends with .gz, plain otherwise
+static uint64_t count_input_chars(const std::string& input_filename) {
+    using namespace seq_io;
+
+    std::ifstream file(input_filename, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("Cannot read SSHash input " + input_filename);
+
+    boost::iostreams::filtering_istream in;
+    if (std::string_view(input_filename).ends_with(".gz"))
+        in.push(boost::iostreams::gzip_decompressor(), 1 << 20);
+    in.push(file, 1 << 20);
+
+    std::unique_ptr<kseq_t, decltype(&kseq_destroy)> read_stream(
+            kseq_init(compFile::open_read(in)), kseq_destroy);
+    uint64_t num_chars = 0;
+    while (kseq_read(read_stream.get()) >= 0) {
+        num_chars += read_stream->seq.l;
+    }
+    return num_chars;
+}
+
+DBGSSHash::DBGSSHash(const std::string& input_filename,
+                     size_t k,
+                     Mode mode,
+                     size_t num_chars,
+                     double ram_limit_gb,
+                     std::pair<sdsl::bit_vector, sdsl::bit_vector> *succ_pred)
     : DBGSSHash(k, mode) {
     if (k <= 1)
         throw std::domain_error("k must be at least 2");
@@ -170,9 +208,18 @@ DBGSSHash::DBGSSHash(const std::string& input_filename, size_t k, Mode mode, siz
     sshash::build_configuration build_config;
     build_config.k = k;
 
+    // the minimizer length depends on the input size, so count it if not given
+    bool num_chars_counted = !num_chars;
+    if (num_chars_counted) {
+        Timer timer;
+        num_chars = count_input_chars(input_filename);
+        common::logger->trace("Counted {} characters in {} in {} sec",
+                              num_chars, input_filename, timer.elapsed());
+    }
+
     // use a value of m recommended here:
     // https://twitter.com/giulio_pibiri/status/1803417277213114501
-    // otherwise, use the next odd value greater than or equal to floor(k / 2)
+    // for an empty input, use the next odd value greater than or equal to floor(k / 2)
     build_config.m
             = std::min({ (num_chars > 0
                                   ? uint64_t(ceil(log(static_cast<double>(num_chars))
@@ -187,16 +234,59 @@ DBGSSHash::DBGSSHash(const std::string& input_filename, size_t k, Mode mode, siz
                                  dict_),
                          uint64_t(k - 2) })
             | 1;
+    common::logger->info("SSHash minimizer length m = {} for {} input characters ({})",
+                         build_config.m, num_chars,
+                         num_chars_counted ? "counted" : "given");
 
     build_config.verbose = common::get_verbose();
     build_config.num_threads = get_num_threads();
-    build_config.canonical = mode != BASIC;
+    // SSHash writes its minimizer tuples to sorted runs of ~RAM / (2 * threads) bytes
+    // each, so a larger budget means fewer and longer runs to merge
+    double ram_limit_GiB = ram_limit_gb * 1e9 / (1ull << 30);
+    if (std::isfinite(ram_limit_GiB) && ram_limit_GiB > build_config.ram_limit_in_GiB)
+        build_config.ram_limit_in_GiB = std::ceil(ram_limit_GiB);
+    build_config.allow_reverse_complement_duplicates = mode == BASIC;
+    // BASIC graphs look up k-mers on the forward strand only. Strand-specific
+    // keys avoid scanning heavy buckets for them. Other modes keep the v6 format.
+    build_config.preserve_orientation = mode == BASIC;
 
-    std::visit([&](auto& d) { d.build(input_filename, build_config); }, dict_);
+    // put SSHash's temp files under --disk-swap (default: ./) and clean them up
+    auto tmp_dir = utils::create_temp_dir(utils::get_swap_path(), "sshash");
+    build_config.tmp_dirname = tmp_dir.string();
+    try {
+        std::visit([&](auto& d) { d.build(input_filename, build_config); }, dict_);
+    } catch (...) {
+        utils::remove_temp_dir(tmp_dir);
+        throw;
+    }
+    utils::remove_temp_dir(tmp_dir);
 
     num_nodes_ = dict_size();
 
-    std::tie(succ_is_next_, pred_is_prev_) = generate_succ_pred(*this, num_nodes_);
+    if (succ_pred) {
+        if (succ_pred->first.size() != num_nodes_ + 1 || succ_pred->second.size() != num_nodes_ + 1)
+            throw std::invalid_argument("succ/pred bitmaps do not match the SSHash graph");
+#ifndef NDEBUG
+        auto [succ, pred, has_duplicates] = generate_succ_pred(*this, num_nodes_);
+        assert(!has_duplicates);
+        for (uint64_t i = 0; i <= num_nodes_; ++i) {
+            assert(succ[i] == succ_pred->first[i]);
+            assert(pred[i] == succ_pred->second[i]);
+        }
+#endif
+        succ_is_next_ = bit_vector_smart(std::move(succ_pred->first));
+        pred_is_prev_ = bit_vector_smart(std::move(succ_pred->second));
+        return;
+    }
+
+    bool has_duplicates;
+    std::tie(succ_is_next_, pred_is_prev_, has_duplicates) = generate_succ_pred(*this, num_nodes_);
+    if (has_duplicates) {
+        std::string message = "SSHash input " + input_filename + " contains duplicate"
+                " k-mers. Build from unitigs instead, e.g., from 'metagraph transform --to-fasta'";
+        common::logger->error(message);
+        throw std::invalid_argument(message);
+    }
 }
 
 std::string DBGSSHash::file_extension() const {
@@ -208,104 +298,101 @@ void DBGSSHash::add_sequence(std::string_view sequence,
     throw std::logic_error("adding sequences not supported");
 }
 
+namespace {
+
+// Maps k-mers with sshash::streaming_query (with_rc) or a rolling k-mer (basic).
+// With |oriented|, k-mers matched in reverse-complement orientation map to
+// their reverse-complement nodes.
 template <bool with_rc, class Dict>
-void map_to_nodes_with_rc_impl(const DBGSSHash& graph,
-                               const Dict& dict,
-                               std::string_view sequence,
-                               const std::function<void(sshash::lookup_result)>& callback,
-                               const std::function<bool()>& terminate) {
-    size_t k = graph.get_k();
-    size_t n = sequence.size();
-    if (terminate() || n < k)
-        return;
-
-    if (!dict.num_kmers()) {
-        for (size_t i = 0; i + k <= sequence.size() && !terminate(); ++i) {
-            callback(sshash::lookup_result());
-        }
-        return;
-    }
-
+class SSHashNodeStream final : public NodeStream {
     using kmer_t = typename Dict::kmer_type;
 
-    if (with_rc) {
-        auto parser = sshash::streaming_query<Dict, true>(&dict);
-        for (size_t i = 0; i + k <= sequence.size() && !terminate(); ++i) {
-            auto ret_val = parser.lookup(sequence.data() + i);
-            assert(sshash::equal_lookup_result(ret_val,
-                                               dict.lookup(sequence.data() + i, with_rc)));
-            callback(ret_val);
-        }
-    } else {
-        std::vector<bool> invalid_char(n);
-        for (size_t i = 0; i < n; ++i) {
-            invalid_char[i] = !kmer_t::is_valid(sequence[i]);
-        }
-
-        auto invalid_kmer = utils::drag_and_mark_segments(invalid_char, true, k);
-
-        bool begin = true;
-        kmer_t uint_kmer;
-        for (size_t i = 0; i + k <= n && !terminate(); ++i) {
-            sshash::lookup_result ret_val;
-            if (invalid_kmer[i + k - 1]) {
-                begin = true;
-                callback(ret_val);
-                continue;
+  public:
+    SSHashNodeStream(const DBGSSHash &graph, const Dict &dict,
+                     std::string_view sequence, bool oriented)
+          : graph_(graph), dict_(dict), seq_(sequence), k_(graph.get_k()),
+            end_(sequence.size() >= k_ ? sequence.size() - k_ + 1 : 0),
+            oriented_(oriented) {
+        if constexpr (with_rc) {
+            // an empty dictionary has no valid parameters for a query
+            if (dict.num_kmers())
+                parser_.emplace(&dict);
+        } else {
+            std::vector<bool> invalid_char(seq_.size());
+            for (size_t i = 0; i < seq_.size(); ++i) {
+                invalid_char[i] = !kmer_t::is_valid(seq_[i]);
             }
+            invalid_kmer_ = utils::drag_and_mark_segments(invalid_char, true, k_);
+        }
+    }
 
-            if (begin) {
-                begin = false;
-                uint_kmer = sshash::util::string_to_uint_kmer<kmer_t>(sequence.data() + i, k);
+    size_t next(std::span<node_index> out) override {
+        size_t n = std::min(out.size(), end_ - i_);
+        if (!dict_.num_kmers()) {
+            std::fill(out.begin(), out.begin() + n, DeBruijnGraph::npos);
+        } else {
+            for (size_t j = 0; j < n; ++j) {
+                out[j] = lookup(i_ + j);
+            }
+        }
+        i_ += n;
+        return n;
+    }
+
+  private:
+    const DBGSSHash &graph_;
+    const Dict &dict_;
+    std::string_view seq_;
+    size_t k_;
+    size_t end_;
+    bool oriented_;
+    size_t i_ = 0;
+    std::optional<sshash::streaming_query<Dict>> parser_;
+    std::vector<bool> invalid_kmer_;
+    kmer_t uint_kmer_;
+    bool begin_ = true;
+
+    node_index lookup(size_t i) {
+        sshash::lookup_result res;
+        if constexpr (with_rc) {
+            res = parser_->lookup(seq_.data() + i);
+            // Direct dictionary lookup assumes a valid alphabet. Streaming
+            // lookup also accepts ambiguous bases and returns no match.
+            assert(!sshash::util::is_valid<kmer_t>(seq_.data() + i, k_)
+                   || sshash::equal_lookup_result(res, dict_.lookup(seq_.data() + i, true)));
+        } else {
+            if (invalid_kmer_[i + k_ - 1]) {
+                begin_ = true;
+                return DeBruijnGraph::npos;
+            }
+            if (begin_) {
+                begin_ = false;
+                uint_kmer_ = sshash::util::string_to_uint_kmer<kmer_t>(seq_.data() + i, k_);
             } else {
-                uint_kmer.drop_char();
-                uint_kmer.set(k - 1, kmer_t::char_to_uint(sequence[i + k - 1]));
+                uint_kmer_.drop_char();
+                uint_kmer_.set(k_ - 1, kmer_t::char_to_uint(seq_[i + k_ - 1]));
             }
-            ret_val = dict.lookup(uint_kmer, with_rc);
-
-            assert(sshash::equal_lookup_result(ret_val,
-                                               dict.lookup(sequence.data() + i, with_rc)));
-            callback(ret_val);
+            res = dict_.lookup(uint_kmer_, false);
+            assert(sshash::equal_lookup_result(res, dict_.lookup(seq_.data() + i, false)));
         }
+        node_index node = sshash_to_graph_index(res.kmer_id);
+        assert(!node || graph_.in_graph(node));
+        return oriented_ && node && res.kmer_orientation < 0
+                ? graph_.reverse_complement(node)
+                : node;
     }
-}
+};
 
-template <bool with_rc>
-void DBGSSHash::map_to_nodes_with_rc(std::string_view sequence,
-                                     const std::function<void(node_index, bool)>& callback,
-                                     const std::function<bool()>& terminate) const {
-    std::visit(
-            [&](const auto& dict) {
-                map_to_nodes_with_rc_impl<with_rc>(
-                        *this, dict, sequence,
-                        [&](sshash::lookup_result res) {
-                            auto node = sshash_to_graph_index(res.kmer_id);
-                            assert(!node || in_graph(node));
-                            callback(node, res.kmer_orientation < 0);
-                        },
-                        terminate);
-            },
-            dict_);
-}
+} // namespace
 
-template void
-DBGSSHash::map_to_nodes_with_rc<true>(std::string_view,
-                                      const std::function<void(node_index, bool)>&,
-                                      const std::function<bool()>&) const;
-template void
-DBGSSHash::map_to_nodes_with_rc<false>(std::string_view,
-                                       const std::function<void(node_index, bool)>&,
-                                       const std::function<bool()>&) const;
-
-void DBGSSHash::map_to_nodes(std::string_view sequence,
-                             const std::function<void(node_index)>& callback,
-                             const std::function<bool()>& terminate) const {
-    if (mode_ == BASIC) {
-        map_to_nodes_sequentially(sequence, callback, terminate);
-    } else {
-        map_to_nodes_with_rc<true>(
-                sequence, [&](node_index node, bool) { callback(node); }, terminate);
-    }
+std::unique_ptr<NodeStream>
+DBGSSHash::node_stream(std::string_view sequence, bool sequential) const {
+    return std::visit([&](const auto &dict) -> std::unique_ptr<NodeStream> {
+        using Dict = std::decay_t<decltype(dict)>;
+        if (mode_ == BASIC)
+            return std::make_unique<SSHashNodeStream<false, Dict>>(*this, dict, sequence, false);
+        return std::make_unique<SSHashNodeStream<true, Dict>>(*this, dict, sequence, sequential);
+    }, dict_);
 }
 
 DBGSSHash::node_index DBGSSHash::reverse_complement(node_index node) const {
@@ -327,29 +414,39 @@ DBGSSHash::node_index DBGSSHash::reverse_complement(node_index node) const {
     return str_kmer != rc_str_kmer ? node + dict_size() : node;
 }
 
+DBGSSHash::node_index DBGSSHash::get_base_node(node_index node) const {
+    if (node == npos)
+        return npos;
+
+    assert(in_graph(node));
+    return node > dict_size() ? node - dict_size() : node;
+}
+
 uint64_t DBGSSHash::num_nodes() const {
     return mode_ != CANONICAL ? dict_size() : dict_size() * 2;
 }
 
-void DBGSSHash::map_to_nodes_sequentially(std::string_view sequence,
-                                          const std::function<void(node_index)>& callback,
-                                          const std::function<bool()>& terminate) const {
-    if (mode_ != BASIC) {
-        map_to_nodes_with_rc<true>(
-                sequence,
-                [&](node_index n, bool revcompl) {
-                    callback(n && revcompl ? reverse_complement(n) : n);
-                },
-                terminate);
-    } else {
-        map_to_nodes_with_rc<false>(
-                sequence, [&](node_index node, bool) { callback(node); }, terminate);
-    }
-}
-
 DBGSSHash::node_index DBGSSHash::traverse(node_index node, char next_char) const {
     assert(in_graph(node));
-    // TODO: if a node is in the middle of a unitig, then we only need to check the next node index
+    // Fast path: if successor is the next index, just check if the character matches
+    if (node < succ_is_next_.size()) {
+        if (succ_is_next_[node]) {
+            if (get_last_char(node + 1) == next_char)
+                return node + 1;
+            else
+                return npos; // degree-1 node, but character doesn't match
+        }
+    } else {
+        node_index rev_comp = reverse_complement(node);
+        if (pred_is_prev_[rev_comp]) {
+            --rev_comp;
+            if (complement(get_first_char(rev_comp)) == next_char)
+                return reverse_complement(rev_comp);
+            else
+                return npos;
+        }
+    }
+    // Slow path: full MPHF lookup
     return kmer_to_node(get_node_sequence(node).substr(1) + next_char);
 }
 
@@ -528,70 +625,70 @@ template void DBGSSHash::call_incoming_kmers_with_rc<false>(
         node_index,
         const std::function<void(node_index, char, bool)>&) const;
 
-void DBGSSHash::call_outgoing_kmers(node_index node,
-                                    const OutgoingEdgeCallback& callback) const {
+DeBruijnGraph::Edges DBGSSHash::outgoing_kmers(node_index node) const {
+    Edges edges;
     if (mode_ != BASIC) {
         call_outgoing_kmers_with_rc<true>(node, [&](node_index next, char c, bool revcompl) {
-            callback(revcompl ? reverse_complement(next) : next, c);
+            edges.emplace_back(revcompl ? reverse_complement(next) : next, c);
         });
     } else {
         call_outgoing_kmers_with_rc<false>(node, [&](node_index next, char c, bool) {
-            callback(next, c);
+            edges.emplace_back(next, c);
         });
     }
+    return edges;
 }
 
-void DBGSSHash::adjacent_outgoing_nodes(node_index node,
-                                        const std::function<void(node_index)>& callback) const {
+DeBruijnGraph::Nodes DBGSSHash::adjacent_outgoing_nodes(node_index node) const {
+    Nodes nodes;
     if (mode_ != BASIC) {
         adjacent_outgoing_nodes_with_rc<true>(node, [&](node_index next, bool revcompl) {
-            callback(revcompl ? reverse_complement(next) : next);
+            nodes.push_back(revcompl ? reverse_complement(next) : next);
         });
     } else {
         adjacent_outgoing_nodes_with_rc<false>(node, [&](node_index next, bool) {
-            callback(next);
+            nodes.push_back(next);
         });
     }
+    return nodes;
 }
 
-void DBGSSHash::call_incoming_kmers(node_index node,
-                                    const IncomingEdgeCallback& callback) const {
+DeBruijnGraph::Edges DBGSSHash::incoming_kmers(node_index node) const {
+    Edges edges;
     if (mode_ != BASIC) {
         call_incoming_kmers_with_rc<true>(node, [&](node_index prev, char c, bool revcompl) {
-            callback(revcompl ? reverse_complement(prev) : prev, c);
+            edges.emplace_back(revcompl ? reverse_complement(prev) : prev, c);
         });
     } else {
         call_incoming_kmers_with_rc<false>(node, [&](node_index prev, char c, bool) {
-            callback(prev, c);
+            edges.emplace_back(prev, c);
         });
     }
+    return edges;
 }
 
-void DBGSSHash::adjacent_incoming_nodes(node_index node,
-                                        const std::function<void(node_index)>& callback) const {
+DeBruijnGraph::Nodes DBGSSHash::adjacent_incoming_nodes(node_index node) const {
+    Nodes nodes;
     if (mode_ != BASIC) {
         adjacent_incoming_nodes_with_rc<true>(node, [&](node_index prev, bool revcompl) {
-            callback(revcompl ? reverse_complement(prev) : prev);
+            nodes.push_back(revcompl ? reverse_complement(prev) : prev);
         });
     } else {
         adjacent_incoming_nodes_with_rc<false>(node, [&](node_index prev, bool) {
-            callback(prev);
+            nodes.push_back(prev);
         });
     }
+    return nodes;
 }
 
 size_t DBGSSHash::outdegree(node_index node) const {
     assert(in_graph(node));
-    size_t res = 0;
-    adjacent_outgoing_nodes(node, [&](node_index) { ++res; });
-    return res;
+    return adjacent_outgoing_nodes(node).size();
 }
 
 size_t DBGSSHash::indegree(node_index node) const {
     assert(in_graph(node));
-    size_t res = 0;
-    adjacent_incoming_nodes(node, [&](node_index) { ++res; });
-    return res;
+    return adjacent_incoming_nodes(node).size();
 }
 
 void DBGSSHash::call_nodes(const std::function<void(node_index)>& callback,
@@ -732,6 +829,13 @@ bool DBGSSHash::load(std::istream& in) {
     num_nodes_ = num_nodes;
 
     if (num_nodes_) {
+        // Enable zero-copy mmap if the stream is backed by an mmap'd file
+        auto *mmap_stream = dynamic_cast<sdsl::shared_mapper_ifstream*>(&in);
+        if (mmap_stream && mmap_stream->mapper()) {
+            const auto &mapping = mmap_stream->mapper();
+            loader.set_mmap(reinterpret_cast<const uint8_t *>(mapping->data()),
+                            mapping->size(), mapping);
+        }
         std::visit([&](auto& d) { d.visit(loader); }, dict_);
         succ_is_next_.load(in);
         pred_is_prev_.load(in);
@@ -742,8 +846,8 @@ bool DBGSSHash::load(std::istream& in) {
 
 bool DBGSSHash::load(const std::string& filename) {
     std::string suffixed_filename = utils::make_suffix(filename, kExtension);
-    std::ifstream fin(suffixed_filename, std::ios::binary);
-    return load(fin);
+    auto fin = utils::open_ifstream(suffixed_filename);
+    return load(*fin);
 }
 
 } // namespace graph

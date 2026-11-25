@@ -1,17 +1,16 @@
 #include <vector>
 #include <unordered_set>
 
+#include <sdsl/int_vector.hpp>
 #include "gtest/gtest.h"
 
 #include "cli/query.hpp"
+#include "graph/annotated_dbg.hpp"
 #include "common/vector.hpp"
 #include "common/utils/template_utils.hpp"
 
 
 namespace mtg::cli {
-/**
- * Split long contigs into overlapping segments for better work balancing.
- */
 void split_contigs_for_rebalancing(size_t k,
                                    size_t kmers_per_seq,
                                    std::vector<std::pair<std::string, std::vector<uint64_t>>> *contigs);
@@ -142,6 +141,42 @@ TEST(split_contigs_for_rebalancing, exact_multiple_of_chunk_steps) {
 
     ASSERT_EQ(3u, contigs.size());
     expect_contig_string_set_eq(contigs, { "abcdefg", "fghijkl", "klmnopq" });
+}
+
+
+sdsl::bit_vector make_bv(std::initializer_list<uint8_t> bits) {
+    sdsl::bit_vector bv(bits.size());
+    size_t i = 0;
+    for (uint8_t b : bits) bv[i++] = b;
+    return bv;
+}
+
+TEST(encode_presence_mask, all_zeros) {
+    EXPECT_EQ("o8", graph::encode_presence_mask(make_bv({0,0,0,0,0,0,0,0})));
+}
+
+TEST(encode_presence_mask, all_ones) {
+    EXPECT_EQ("x8", graph::encode_presence_mask(make_bv({1,1,1,1,1,1,1,1})));
+}
+
+TEST(encode_presence_mask, leading_run) {
+    EXPECT_EQ("x3o2x2o1", graph::encode_presence_mask(make_bv({1,1,1,0,0,1,1,0})));
+}
+
+TEST(encode_presence_mask, leading_gap) {
+    EXPECT_EQ("o3x5", graph::encode_presence_mask(make_bv({0,0,0,1,1,1,1,1})));
+}
+
+TEST(encode_presence_mask, single_bits_alternating) {
+    EXPECT_EQ("x1o1x1o1x1o1x1o1", graph::encode_presence_mask(make_bv({1,0,1,0,1,0,1,0})));
+}
+
+TEST(encode_presence_mask, single_bit_at_each_end) {
+    EXPECT_EQ("x1o6x1", graph::encode_presence_mask(make_bv({1,0,0,0,0,0,0,1})));
+}
+
+TEST(encode_presence_mask, empty) {
+    EXPECT_EQ("", graph::encode_presence_mask(sdsl::bit_vector(0)));
 }
 
 } // namespace

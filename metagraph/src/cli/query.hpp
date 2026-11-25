@@ -15,6 +15,7 @@
 
 #include "common/vector.hpp"
 #include "graph/alignment/alignment.hpp"
+#include "graph/annotated_dbg.hpp"
 
 namespace mtg {
 
@@ -48,20 +49,15 @@ using StringGenerator = std::function<void(std::function<void(const std::string 
 std::vector<std::string>
 collapse_coord_ranges(const std::vector<SmallVector<uint64_t>> &tuples);
 
+// The same ranges for the coordinates per query position that |coords| stands for
+std::vector<std::string>
+collapse_coord_ranges(const graph::PositionCoords &coords);
 
 /**
- * Construct a query graph and augment it with neighboring paths around it
- * if `config` is specified.
- * @param anno_graph annotated de Bruijn graph (the index)
- * @param call_sequences generate sequences to be queried against anno_graph
- * @param num_threads number of threads to use
- * @param config a pointer to a Config to determine parameters of the hull
+ * Format the runs of one nonzero k-mer count as '<i>=<v>' for a run of one position
+ * and '<i>-<j>=<v>' otherwise, in order of position (runs of zeros are left out).
  */
-std::unique_ptr<graph::AnnotatedDBG>
-construct_query_graph(const graph::AnnotatedDBG &anno_graph,
-                      StringGenerator call_sequences,
-                      size_t num_threads,
-                      const Config &config);
+std::vector<std::string> count_run_strings(const graph::CountRuns &counts);
 
 
 // Simple struct to wrap a query sequence
@@ -93,12 +89,14 @@ class SeqSearchResult {
     typedef std::string Label;
     typedef std::vector<Label> LabelVec;
     typedef std::vector<std::pair<Label, size_t>> LabelCountVec;
-    typedef std::vector<std::tuple<Label, size_t, sdsl::bit_vector>> LabelSigVec;
-    typedef std::vector<std::tuple<Label, size_t, std::vector<size_t>>> LabelCountAbundancesVec;
-    typedef std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>> LabelCountCoordsVec;
+    typedef std::vector<std::tuple<Label, size_t, graph::PresenceRuns>> LabelSigVec;
+    typedef std::vector<std::tuple<Label, size_t, graph::CountRuns>> LabelCountAbundancesVec;
+    // (label, num_kmer_matches, kmer_coordinates, num_kmers_in_target). The last
+    // element is 0 when no CoordToHeader mapping is loaded (the label refers to
+    // a whole annotation column rather than a single indexed sequence).
+    typedef std::vector<std::tuple<Label, size_t, graph::PositionCoords, size_t>> LabelCountCoordsVec;
     typedef std::vector<std::tuple<std::string, Label, uint64_t, uint64_t>> LabelOverlappingReads;
 
-    // add here LabelOverlappingReads
     typedef std::variant<LabelVec,
                          LabelCountVec,
                          LabelSigVec,
@@ -108,8 +106,10 @@ class SeqSearchResult {
 
     // JSON Field Keys
     static constexpr auto SEQ_DESCRIPTION_JSON_FIELD = "seq_description";
+    static constexpr auto LABEL_SAMPLE_FIELD = "sample";
     static constexpr auto KMER_COUNT_FIELD = "kmer_count";
     static constexpr auto KMER_COORDINATE_FIELD = "kmer_coords";
+    static constexpr auto KMERS_IN_TARGET_FIELD = "kmers_in_target";
     static constexpr auto SIGNATURE_FIELD = "signature";
     static constexpr auto KMER_ABUNDANCE_FIELD = "kmer_abundances";
     static constexpr auto SCORE_JSON_FIELD = "score";
@@ -129,10 +129,11 @@ class SeqSearchResult {
      */
     SeqSearchResult(QuerySequence&& sequence,
                     result_type&& result,
-                    std::optional<Alignment>&& alignment = {})
+                    std::optional<Alignment>&& alignment = {},
+                    std::optional<graph::SearchCut> cut = {})
           : sequence_(std::move(sequence)),
             alignment_(std::move(alignment)),
-            result_(std::move(result)) {}
+            cut_(cut), result_(std::move(result)) {}
 
     /** Const reference getters */
     const QuerySequence& get_sequence() const { return sequence_; }
@@ -144,12 +145,11 @@ class SeqSearchResult {
      * Returns a Json object representing the individual query result for the
      * represented sequence.
      *
-     * @param counts_kmers      should counts be labeled kmer (t) or label (f) counts?
-     * @param anno_graph        reference to annotated dbg for kmer presence mask scoring
      * @param verbose_output    do not collapse continuous ranges of coords (or counts)
+     * @param k                 k-mer length for kmer presence mask scoring
      * @return  Json::Value instance representing sequence result
      */
-    Json::Value to_json(bool verbose_output, const graph::AnnotatedDBG &anno_graph) const;
+    Json::Value to_json(bool verbose_output, size_t k) const;
 
     /**
      * Returns a string representing the individual query result for the represented sequence.
@@ -160,16 +160,17 @@ class SeqSearchResult {
      * @param delimiter             the delimiter between labels for that sequence
      * @param suppress_unlabeled    do not print seq_name if sequence is unlabeled
      * @param verbose_output        do not collapse continuous ranges of coords or counts
-     * @param anno_graph            reference to annotated dbg for kmer presence mask scoring
+     * @param k                     k-mer length for kmer presence mask scoring
      */
     std::string to_string(std::string delimiter,
                           bool suppress_unlabeled,
                           bool verbose_output,
-                          const graph::AnnotatedDBG &anno_graph) const;
+                          size_t k) const;
 
   private:
     QuerySequence sequence_;             // query sequence this result represents
     std::optional<Alignment> alignment_; // optional wrapper for alignment struct
+    std::optional<graph::SearchCut> cut_;
     result_type result_;                 // result vector of labels and additional info
 };
 
@@ -184,52 +185,25 @@ enum QueryMode {
     READS
 };
 
-class QueryExecutor {
-  public:
-    QueryExecutor(const Config &config,
-                  const graph::AnnotatedDBG &anno_graph,
-                  std::unique_ptr<graph::align::DBGAlignerConfig>&& aligner_config)
-      : config_(config), anno_graph_(anno_graph),
-        aligner_config_(std::move(aligner_config)) {}
-
-    /**
-     * Query sequences from a FASTA file on the stored QueryExecutor::anno_graph.
-     *
-     * Provide a callback which receives a reference to a SeqSearchResult instance which the
-     * callback function should use as desired (typically generate a string/JSON output).
-     *
-     * @param file_path     path to FASTA file
-     * @param callback      callback function
-     *
-     * @return the number of base pairs (characters) in query file
-     */
-    size_t query_fasta(const std::string &file_path,
-                       const std::function<void(const SeqSearchResult &)> &callback);
-
-    // TODO: add docstring
-    void query_reads(const std::string &file_path,
-                     const std::function<void(const std::string &, const SeqSearchResult &)> &callback);
-
-    static SeqSearchResult execute_query(QuerySequence&& sequence,
-                                         QueryMode query_mode,
-                                         size_t num_top_labels,
-                                         double discovery_fraction,
-                                         double presence_fraction,
-                                         uint64_t traversal_batch_size,
-                                         uint64_t column_batch_size,
-                                         uint64_t flank_length,
-                                         uint64_t max_query_distance,
-                                         const graph::AnnotatedDBG &anno_graph);
-
-  private:
-    const Config &config_;
-    const graph::AnnotatedDBG &anno_graph_;
-    std::unique_ptr<graph::align::DBGAlignerConfig> aligner_config_;
-
-    size_t batched_query_fasta(mtg::seq_io::FastaParser &fasta_parser,
-                               const std::function<void(const SeqSearchResult &)> &callback);
-};
-
+/**
+ * Query sequences from a FASTA file.
+ *
+ * Provide a callback which receives a reference to a SeqSearchResult instance which the
+ * callback function should use as desired (typically generate a string/JSON output).
+ *
+ * @param file_path     path to FASTA file
+ * @param callback      callback function
+ * @param config        config object
+ * @param anno_graph    annotated de Bruijn graph
+ * @param aligner_config alignment config
+ *
+ * @return the number of base pairs (characters) in query file
+ */
+size_t query_fasta(const std::string &file_path,
+                   const std::function<void(const SeqSearchResult &)> &callback,
+                   const Config &config,
+                   const graph::AnnotatedDBG &anno_graph,
+                   const graph::align::DBGAlignerConfig *aligner_config);
 
 int query_graph(Config *config);
 

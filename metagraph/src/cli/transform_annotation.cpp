@@ -1,8 +1,11 @@
 #include "transform_annotation.hpp"
 
+#include <filesystem>
+
 #include <progress_bar.hpp>
 
 #include "common/logger.hpp"
+#include "common/utils/file_utils.hpp"
 #include "common/unix_tools.hpp"
 #include "common/threads/threading.hpp"
 #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
@@ -10,6 +13,8 @@
 #include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
 #include "annotation/binary_matrix/multi_brwt/clustering.hpp"
 #include "annotation/annotation_converters.hpp"
+#include "annotation/annotation_remap.hpp"
+#include "load/load_graph.hpp"
 #include "config/config.hpp"
 #include "load/load_annotation.hpp"
 
@@ -29,7 +34,6 @@ typedef matrix::TupleCSCMatrix<matrix::BRWT> TupleBRWT;
 
 static const Eigen::IOFormat CSVFormat(Eigen::StreamPrecision,
                                        Eigen::DontAlignCols, " ", "\n");
-
 
 template <class T>
 matrix::LinkageMatrix cluster_columns(const std::vector<std::string> &files,
@@ -107,10 +111,8 @@ matrix::LinkageMatrix cluster_columns(const std::vector<std::string> &files,
     }
     subsampling_pool.join();
 
-    if (!success) {
-        logger->error("Could not load annotations");
+    if (!success)
         exit(1);
-    }
 
     // arrange the columns in their original order
     std::vector<T> subcolumns(subcolumn_ptrs.size());
@@ -188,8 +190,8 @@ auto parse_linkage_matrix(const std::string &filename){
 
             if (first == second || first >= merged || second >= merged) {
                 logger->error("Invalid format of the linkage matrix."
-                              " Indexes of parent clusters must be larger than"
-                              " indexes of the objects/clusters the include");
+                              " Child cluster indexes must be distinct, and the parent"
+                              " index must be larger than both child indexes.");
                 exit(1);
             }
 
@@ -314,6 +316,126 @@ int transform_annotation(Config *config) {
     Timer timer;
 
     /********************************************************/
+    /************** move rows to another graph **************/
+    /********************************************************/
+
+    if (config->remap_graph.size()) {
+        if (input_anno_type != Config::BRWT && input_anno_type != Config::RowDiffBRWT) {
+            logger->error("--remap-graph supports only {} and {} annotations",
+                          Config::annotype_to_string(Config::BRWT),
+                          Config::annotype_to_string(Config::RowDiffBRWT));
+            exit(1);
+        }
+
+        // Without --anno-type the input format is kept (checked in Config).
+        const bool convert = config->anno_type == Config::RowDiffRowFlat
+                                || config->anno_type == Config::RowDiffDisk;
+        if (convert && input_anno_type != Config::RowDiffBRWT) {
+            logger->error("--remap-graph can convert only {} annotations to {}",
+                          Config::annotype_to_string(Config::RowDiffBRWT),
+                          Config::annotype_to_string(config->anno_type));
+            exit(1);
+        }
+
+        // The row map is the expensive part, so keep it for a rerun. With disk swap
+        // it is built in and read from that file instead of being held in RAM.
+        const bool on_disk = !config->tmp_dir.empty();
+        const std::string row_map_fname = config->outfbase + ".rowmap";
+        sdsl::int_vector<> row_map;
+        uint64_t target_num_rows;
+
+        auto source = load_critical_dbg(config->remap_graph);
+        auto target = load_critical_dbg(config->infbase);
+        target_num_rows = target->max_index();
+
+        try {
+            if (std::filesystem::exists(row_map_fname)) {
+                logger->trace("Loading row map from {}", row_map_fname);
+                bool matches;
+                if (on_disk) {
+                    matches = check_row_map(*source, *target, row_map_fname);
+                } else {
+                    std::ifstream in(row_map_fname, std::ios::binary);
+                    row_map.load(in);
+                    matches = in.good() && check_row_map(*source, *target, row_map);
+                }
+                if (!matches) {
+                    throw std::runtime_error(fmt::format(
+                        "Row map {} does not match graphs {} and {}. Delete it and run again",
+                        row_map_fname, config->remap_graph, config->infbase));
+                }
+            } else {
+                logger->trace("Matching rows of {} to {}...", config->remap_graph, config->infbase);
+                const std::string tmp_fname = row_map_fname + ".tmp";
+                try {
+                    if (on_disk) {
+                        auto tmp_dir = utils::create_temp_dir(config->tmp_dir, "rowmap");
+                        try {
+                            map_rows_to_graph(*source, *target, tmp_fname, tmp_dir, get_num_threads());
+                        } catch (...) {
+                            utils::remove_temp_dir(tmp_dir);
+                            throw;
+                        }
+                        utils::remove_temp_dir(tmp_dir);
+                    } else {
+                        row_map = map_rows_to_graph(*source, *target, get_num_threads());
+                        std::ofstream out(tmp_fname, std::ios::binary);
+                        row_map.serialize(out);
+                        out.close();
+                        if (!out)
+                            throw std::runtime_error("Cannot write row map to " + tmp_fname);
+                    }
+                } catch (...) {
+                    std::error_code ec;
+                    std::filesystem::remove(tmp_fname, ec);
+                    throw;
+                }
+                std::filesystem::rename(tmp_fname, row_map_fname);
+                logger->trace("Row map saved to {} in {} sec", row_map_fname, timer.elapsed());
+            }
+        } catch (const std::exception &e) {
+            logger->error("{}", e.what());
+            exit(1);
+        }
+        target.reset();
+
+        auto annotation = initialize_annotation(files.at(0), *config);
+        if (!annotation->load(files.at(0))) {
+            logger->error("Cannot load annotation from {}", files.at(0));
+            exit(1);
+        }
+        logger->trace("Annotation loaded in {} sec", timer.elapsed());
+
+        std::unique_ptr<MultiLabelAnnotation<std::string>> remapped;
+        try {
+            remapped = on_disk
+                ? remap_annotation_rows(*annotation, *source, row_map_fname,
+                                        target_num_rows, get_num_threads())
+                : remap_annotation_rows(*annotation, *source, row_map,
+                                        target_num_rows, get_num_threads());
+        } catch (const std::exception &e) {
+            logger->error("{}", e.what());
+            exit(1);
+        }
+        annotation.reset();
+        row_map = sdsl::int_vector<>();
+        source.reset();
+
+        if (!convert) {
+            remapped->serialize(config->outfbase);
+        } else if (config->anno_type == Config::RowDiffRowFlat) {
+            convert_to_row_diff<RowDiffRowFlatAnnotator>(
+                    dynamic_cast<const RowDiffBRWTAnnotator &>(*remapped), config->outfbase);
+        } else {
+            convert_to_row_diff<RowDiffDiskAnnotator>(
+                    dynamic_cast<const RowDiffBRWTAnnotator &>(*remapped), config->outfbase);
+        }
+        logger->trace("Remapped annotation serialized to {} in {} sec",
+                      config->outfbase, timer.elapsed());
+        return 0;
+    }
+
+    /********************************************************/
     /***************** dump labels to text ******************/
     /********************************************************/
 
@@ -324,13 +446,11 @@ int transform_annotation(Config *config) {
 
         if (input_anno_type == Config::ColumnCompressed) {
             if (!dynamic_cast<ColumnCompressed<>&>(*annotation).merge_load(files)) {
-                logger->error("Cannot load annotations");
                 exit(1);
             }
         } else {
             // Load annotation from disk
             if (!annotation->load(files.at(0))) {
-                logger->error("Cannot load annotations from file '{}'", files.at(0));
                 exit(1);
             }
         }
@@ -373,8 +493,8 @@ int transform_annotation(Config *config) {
         while (instream.good() && !(instream >> old_name).eof()) {
             instream >> new_name;
             if (instream.fail() || instream.eof()) {
-                logger->error("Wrong format of the rules for renaming"
-                              " annotation columns passed in file '{}'",
+                logger->error("Invalid column-renaming rules in '{}'. "
+                              "Provide whitespace-separated pairs of old and new labels, ending with a newline.",
                               config->rename_instructions_file);
                 exit(1);
             }
@@ -388,7 +508,6 @@ int transform_annotation(Config *config) {
         // TODO: rename columns without loading the full annotation
         if (input_anno_type == Config::ColumnCompressed) {
             if (!dynamic_cast<ColumnCompressed<>&>(*annotation).merge_load(files)) {
-                logger->error("Cannot load annotations");
                 exit(1);
             } else {
                 logger->info("Annotation #objects: {}\t#labels: {}",
@@ -397,7 +516,6 @@ int transform_annotation(Config *config) {
         } else {
             // Load annotation from disk
             if (!annotation->load(files.at(0))) {
-                logger->error("Cannot load annotations from file '{}'", files.at(0));
                 exit(1);
             }
         }
@@ -435,7 +553,7 @@ int transform_annotation(Config *config) {
         uint64_t max_threshold = config->max_count;
         if (config->min_fraction > 0.0 || config->max_fraction < 1.0) {
             if (config->count_kmers) {
-                logger->error("--min-fraction and --max-fraction are ignored when --count-kmers is used. "
+                logger->error("--count-kmers requires --min-fraction 0 and --max-fraction 1. "
                               "Use --min-count and --max-count to filter by aggregated k-mer counts.");
                 exit(1);
             }
@@ -515,7 +633,6 @@ int transform_annotation(Config *config) {
             };
 
             if (!ColumnCompressed<>::merge_load(files, on_column, get_num_threads())) {
-                logger->error("Couldn't load annotations");
                 exit(1);
             }
         }
@@ -563,8 +680,6 @@ int transform_annotation(Config *config) {
     if (config->intersected_columns.size()) {
         ColumnCompressed<> base_columns(0);
         if (!base_columns.load(config->intersected_columns)) {
-            logger->error("Cannot load base columns from file '{}'",
-                          config->intersected_columns);
             exit(1);
         }
 
@@ -574,7 +689,6 @@ int transform_annotation(Config *config) {
             std::unique_ptr<MultiLabelAnnotation<std::string>> annotator
                     = initialize_annotation(file, *config);
             if (!annotator->load(file)) {
-                logger->error("Cannot load annotations from file '{}'", file);
                 exit(1);
             }
 
@@ -691,7 +805,6 @@ int transform_annotation(Config *config) {
             annotator = std::make_unique<ColumnCompressed<>>(0);
             logger->trace("Loading annotation from disk...");
             if (!annotator->merge_load(files)) {
-                logger->error("Cannot load annotations");
                 exit(1);
             }
             logger->trace("Annotation loaded in {} sec", timer.elapsed());
@@ -926,15 +1039,26 @@ int transform_annotation(Config *config) {
                 logger->trace("Serialized to {}", config->outfbase);
             }
         }
-    } else if (input_anno_type == Config::RowDiffBRWT && config->anno_type == Config::RowDiffRowFlat) {
-        if (files.size() != 1) {
-            logger->error("Can only convert row_diff_brwt annotations one at a time");
-            exit(1);
+    } else if ((input_anno_type == Config::RowDiffBRWT
+                    && (config->anno_type == Config::RowDiffRowFlat
+                            || config->anno_type == Config::RowDiffDisk))
+                || (input_anno_type == Config::RowDiffRowFlat
+                    && config->anno_type == Config::RowDiffDisk)) {
+        // `files.size() == 1` is enforced earlier in Config::Config().
+        assert(files.size() == 1);
+        if (input_anno_type == Config::RowDiffBRWT) {
+            RowDiffBRWTAnnotator annotator;
+            annotator.load(files[0]);
+            if (config->anno_type == Config::RowDiffRowFlat) {
+                convert_to_row_diff<RowDiffRowFlatAnnotator>(annotator, config->outfbase);
+            } else {
+                convert_to_row_diff<RowDiffDiskAnnotator>(annotator, config->outfbase);
+            }
+        } else {  // Config::RowDiffRowFlat -> Config::RowDiffDisk
+            RowDiffRowFlatAnnotator annotator;
+            annotator.load(files[0]);
+            convert_to_row_diff<RowDiffDiskAnnotator>(annotator, config->outfbase);
         }
-        RowDiffBRWTAnnotator annotator;
-        annotator.load(files[0]);
-
-        convert_to_row_diff<RowDiffRowFlatAnnotator>(annotator, config->outfbase);
         logger->trace("Serialized to {}", config->outfbase);
 
     } else {
@@ -964,7 +1088,6 @@ int merge_annotation(Config *config) {
     if (anno_type == Config::ColumnCompressed) {
         ColumnCompressed<> annotation(0, config->num_columns_cached);
         if (!annotation.merge_load(files)) {
-            logger->error("Cannot load annotations");
             exit(1);
         }
         annotation.serialize(config->outfbase);
@@ -1025,7 +1148,6 @@ int relax_multi_brwt(Config *config) {
     logger->trace("Loading annotator...");
 
     if (!annotator->load(fname)) {
-        logger->error("Cannot load annotations from file '{}'", files.at(0));
         exit(1);
     }
     logger->trace("Annotator loaded in {} sec", timer.elapsed());

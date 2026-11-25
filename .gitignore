@@ -21,6 +21,8 @@ database-cli
 *._*
 metagraph/build*
 metagraph/**/build*
+metagraph/api/python/pymetagraph/pymetagraph/_pymetagraph_core*
+*.egg-info
 .*.swp
 .ipynb_checkpoints
 *lsf.o*
@@ -29,6 +31,10 @@ metagraph/**/build*
 *.un~
 tags
 **/cmake-build-debug
+**/.snakemake/
 .idea
 .vscode
 metagraph/.vscode
+
+# Local shared writing-rule installation and generated package
+.writing/

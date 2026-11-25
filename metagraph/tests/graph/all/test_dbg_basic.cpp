@@ -1,8 +1,5 @@
 #include "gtest/gtest.h"
 
-#define private public
-#define protected public
-
 #include <set>
 
 #include "../../test_helpers.hpp"
@@ -15,8 +12,7 @@ namespace {
 using namespace mtg;
 using namespace mtg::test;
 
-const std::string test_data_dir = "../tests/data";
-const std::string test_dump_basename = test_data_dir + "/dump_test_graph";
+const std::string test_dump_basename = test_dump_dir() + "/dump_test_graph";
 
 const size_t kBitsPerCount = 8;
 
@@ -158,7 +154,9 @@ TYPED_TEST(DeBruijnGraphTest, Weighted) {
         auto &weights = *graph->template get_extension<NodeWeights>();
 
         for (const auto &sequence : sequences) {
-            graph->map_to_nodes(sequence, [&](auto node) { weights.add_weight(node, 1); });
+            for (auto node : map_to_nodes(*graph, sequence)) {
+                weights.add_weight(node, 1);
+            }
         }
 
         auto node_idx = graph->kmer_to_node(std::string(k, 'A'));
@@ -434,11 +432,52 @@ TYPED_TEST(DeBruijnGraphTest, get_node_sequence) {
     EXPECT_TRUE(check_graph_nodes(*graph));
 
     std::string mapped_query = "";
-    graph->map_to_nodes(query, [&](DeBruijnGraph::node_index node) {
+    for (DeBruijnGraph::node_index node : map_to_nodes(*graph, query)) {
         mapped_query += graph->get_node_sequence(node);
-    });
+    }
 
     EXPECT_EQ(query, mapped_query);
+}
+
+TYPED_TEST(DeBruijnGraphTest, NodeRange) {
+    size_t k = 5;
+    // longer than NodeRange::kChunkSize, with missing k-mers and an invalid character
+    std::string reference = "AGCTTCGAGGCCAATTGCATGCATCGATCGATCGGGATCCTAGCTAGCTTTAGGACCATGACGTACG"
+                            "TTGACCAGTCAGGTCAAGCTAGGCTA";
+    std::string query = reference.substr(0, 40) + "TTTTTNTTTTT" + reference.substr(20)
+                            + "ACGTACGTTTTTTTT";
+
+#if _PROTEIN_GRAPH
+    std::vector<DeBruijnGraph::Mode> modes { DeBruijnGraph::BASIC };
+#else
+    std::vector<DeBruijnGraph::Mode> modes { DeBruijnGraph::BASIC, DeBruijnGraph::CANONICAL,
+                                             DeBruijnGraph::PRIMARY };
+#endif
+    for (auto mode : modes) {
+        auto graph = build_graph<TypeParam>(k, { reference }, mode);
+        for (std::string_view seq : { std::string_view(query), std::string_view(query).substr(0, k - 1) }) {
+            for (bool sequential : { false, true }) {
+                std::vector<DeBruijnGraph::node_index> nodes;
+                for (auto node : graph->node_range(seq, sequential)) {
+                    nodes.push_back(node);
+                }
+                EXPECT_EQ(sequential ? map_to_nodes_sequentially(*graph, seq)
+                                     : map_to_nodes(*graph, seq), nodes)
+                    << "mode " << mode << ", sequential " << sequential;
+                if (!sequential)
+                    continue;
+                ASSERT_EQ(seq.size() >= k ? seq.size() - k + 1 : 0, nodes.size());
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    // some graphs require valid characters in kmer_to_node
+                    if (seq.substr(i, k).find('N') != std::string_view::npos)
+                        continue;
+
+                    EXPECT_EQ(graph->kmer_to_node(seq.substr(i, k)), nodes[i])
+                        << "mode " << mode << ", position " << i;
+                }
+            }
+        }
+    }
 }
 
 TYPED_TEST(DeBruijnGraphTest, CallStartNodes) {

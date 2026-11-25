@@ -9,12 +9,14 @@
 #include "common/threads/threading.hpp"
 #include "common/vectors/bit_vector_dyn.hpp"
 #include "common/vectors/vector_algorithm.hpp"
+#include "annotation/binary_matrix/row_disk/row_disk.hpp"
+#include "annotation/int_matrix/row_disk/coord_row_disk.hpp"
+#include "annotation/int_matrix/row_disk/int_row_disk.hpp"
 #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
 
-#define protected public
-#define private public
 #include "annotation/annotation_converters.hpp"
 #include "test_annotated_dbg_helpers.hpp"
+#include "dense_search_values.hpp"
 
 
 namespace {
@@ -28,16 +30,13 @@ void check_labels(const AnnotatedDBG &anno_graph,
                   const std::vector<std::string> labels_present,
                   const std::vector<std::string> labels_not_present) {
     std::set<SequenceGraph::node_index> indices;
-    anno_graph.get_graph().map_to_nodes(
-        sequence,
-        [&](const auto &index) {
-            ASSERT_NE(SequenceGraph::npos, index);
-            indices.insert(index);
-            EXPECT_EQ(labels_present.size(), anno_graph.get_labels(index).size());
-            EXPECT_EQ(convert_to_set(labels_present),
-                      convert_to_set(anno_graph.get_labels(index)));
-        }
-    );
+    for (const auto index : map_to_nodes(anno_graph.get_graph(), sequence)) {
+        ASSERT_NE(SequenceGraph::npos, index);
+        indices.insert(index);
+        EXPECT_EQ(labels_present.size(), anno_graph.get_labels(index).size());
+        EXPECT_EQ(convert_to_set(labels_present),
+                  convert_to_set(anno_graph.get_labels(index)));
+    }
 
     for (const auto &label : labels_present) {
         std::set<SequenceGraph::node_index> cur_indices;
@@ -71,7 +70,7 @@ std::vector<uint64_t> edge_to_row_idx(const bitmap &edge_mask) {
 
 TEST(AnnotatedDBG, ExtendGraphWithSimplePath) {
     for (size_t k = 1; k < 10; ++k) {
-        AnnotatedDBG anno_graph(std::make_shared<DBGSuccinct>(k + 1),
+        MutableAnnotatedDBG anno_graph(std::make_shared<DBGSuccinct>(k + 1),
                                 std::make_unique<annot::ColumnCompressed<>>(1));
 
         ASSERT_EQ(anno_graph.get_graph().num_nodes(),
@@ -119,7 +118,7 @@ TEST(AnnotatedDBG, ExtendGraphAddPath) {
         graph->add_sequence(seq_first);
 
         uint64_t num_nodes = graph->num_nodes();
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -188,7 +187,7 @@ TEST(AnnotatedDBG, Transform) {
         graph->add_sequence(seq_first);
 
         uint64_t num_nodes = graph->num_nodes();
-        auto anno_graph = std::make_unique<AnnotatedDBG>(
+        auto anno_graph = std::make_unique<MutableAnnotatedDBG>(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -224,7 +223,7 @@ TEST(AnnotatedDBG, Transform) {
 
         anno_graph->annotate_sequence(std::string(seq_second), { "Second" });
 
-        anno_graph = std::make_unique<AnnotatedDBG>(
+        anno_graph = std::make_unique<MutableAnnotatedDBG>(
             graph,
             std::unique_ptr<AnnotatedDBG::Annotator>(
                 annot::convert<annot::RowFlatAnnotator>(
@@ -272,7 +271,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPaths) {
         graph->add_sequence(seq_first);
 
         uint64_t num_nodes = graph->num_nodes();
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -383,7 +382,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPathsParallel) {
         uint64_t num_nodes = graph->num_nodes();
 
         ThreadPool thread_pool(10);
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -505,7 +504,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPathsWithoutDummy) {
         graph->mask_dummy_kmers(0, false);
 
         uint64_t num_nodes = graph->num_nodes();
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -624,7 +623,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPathsWithoutDummyParallel) {
         graph->mask_dummy_kmers(10, false);
 
         ThreadPool thread_pool(10);
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -752,7 +751,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPathsPruneDummy) {
         graph->add_sequence(seq_first);
         graph->mask_dummy_kmers(0, true);
 
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -869,7 +868,7 @@ TEST(AnnotatedDBG, ExtendGraphAddTwoPathsPruneDummyParallel) {
         graph->mask_dummy_kmers(10, true);
 
         ThreadPool thread_pool(10);
-        AnnotatedDBG anno_graph(
+        MutableAnnotatedDBG anno_graph(
             graph,
             std::make_unique<annot::ColumnCompressed<>>(graph->max_index())
         );
@@ -1285,7 +1284,7 @@ TYPED_TEST(AnnotatedDBGWithNTest, get_top_label_signatures) {
             percentages.emplace_back(0.0);
 
             for (size_t j = 1; j <= results[i].size(); ++j) {
-                auto label_counts = anno_graph->get_top_label_signatures(sequences[i], j);
+                auto label_counts = dense(anno_graph->get_top_label_signatures(sequences[i], j));
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 ASSERT_GE(j, label_counts.size());
 #if _DNA_GRAPH
@@ -1311,11 +1310,11 @@ TYPED_TEST(AnnotatedDBGWithNTest, get_top_label_signatures) {
                         continue;
 #endif
 
-                    auto label_counts = anno_graph->get_top_label_signatures(
+                    auto label_counts = dense(anno_graph->get_top_label_signatures(
                         sequences[i],
                         j,
                         percentages[m] + 1e-9
-                    );
+                    ));
                     ASSERT_GE(j, label_counts.size());
                     std::sort(label_counts.begin(), label_counts.end(), comp);
                     EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m),
@@ -1330,11 +1329,11 @@ TYPED_TEST(AnnotatedDBGWithNTest, get_top_label_signatures) {
                     continue;
 #endif
 
-                auto label_counts = anno_graph->get_top_label_signatures(
+                auto label_counts = dense(anno_graph->get_top_label_signatures(
                     sequences[i],
                     results[i].size() + 1,
                     percentages[m] + 1e-9
-                );
+                ));
                 ASSERT_GE(results[i].size() + 1, label_counts.size());
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m),
@@ -1349,22 +1348,22 @@ TYPED_TEST(AnnotatedDBGWithNTest, get_top_label_signatures) {
             size_t i = 2;
             size_t m = 2;
             for (size_t j = 2; j <= results[i].size(); ++j) {
-                auto label_counts = anno_graph->get_top_label_signatures(
+                auto label_counts = dense(anno_graph->get_top_label_signatures(
                     sequences[i],
                     j,
                     percentages[m] + 1e-9
-                );
+                ));
                 ASSERT_GE(j, label_counts.size());
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m - 1),
                           label_counts) << k << " " << i << " " << j << " " << m;
             }
 
-            auto label_counts = anno_graph->get_top_label_signatures(
+            auto label_counts = dense(anno_graph->get_top_label_signatures(
                 sequences[i],
                 results[i].size() + 1,
                 percentages[m] + 1e-9
-            );
+            ));
             ASSERT_GE(results[i].size() + 1, label_counts.size());
             std::sort(label_counts.begin(), label_counts.end(), comp);
             EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m - 1),
@@ -1513,7 +1512,7 @@ TYPED_TEST(AnnotatedDBGNoNTest, get_top_label_signatures) {
             percentages.emplace_back(0.0);
 
             for (size_t j = 1; j <= results[i].size(); ++j) {
-                auto label_counts = anno_graph->get_top_label_signatures(sequences[i], j);
+                auto label_counts = dense(anno_graph->get_top_label_signatures(sequences[i], j));
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 ASSERT_GE(j, label_counts.size());
                 if (k == 1 && i == 2 && j == 2) {
@@ -1533,11 +1532,11 @@ TYPED_TEST(AnnotatedDBGNoNTest, get_top_label_signatures) {
                     if (k == 1 && i == 2 && m == 2)
                         continue;
 
-                    auto label_counts = anno_graph->get_top_label_signatures(
+                    auto label_counts = dense(anno_graph->get_top_label_signatures(
                         sequences[i],
                         j,
                         percentages[m] + 1e-9
-                    );
+                    ));
                     ASSERT_GE(j, label_counts.size());
                     std::sort(label_counts.begin(), label_counts.end(), comp);
                     EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m),
@@ -1550,11 +1549,11 @@ TYPED_TEST(AnnotatedDBGNoNTest, get_top_label_signatures) {
                 if (k == 1 && i == 2 && m == 2)
                     continue;
 
-                auto label_counts = anno_graph->get_top_label_signatures(
+                auto label_counts = dense(anno_graph->get_top_label_signatures(
                     sequences[i],
                     results[i].size() + 1,
                     percentages[m] + 1e-9
-                );
+                ));
                 ASSERT_GE(results[i].size() + 1, label_counts.size());
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m),
@@ -1568,22 +1567,22 @@ TYPED_TEST(AnnotatedDBGNoNTest, get_top_label_signatures) {
             size_t i = 2;
             size_t m = 2;
             for (size_t j = 2; j <= results[i].size(); ++j) {
-                auto label_counts = anno_graph->get_top_label_signatures(
+                auto label_counts = dense(anno_graph->get_top_label_signatures(
                     sequences[i],
                     j,
                     percentages[m] + 1e-9
-                );
+                ));
                 ASSERT_GE(j, label_counts.size());
                 std::sort(label_counts.begin(), label_counts.end(), comp);
                 EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m - 1),
                           label_counts) << k << " " << i << " " << j << " " << m;
             }
 
-            auto label_counts = anno_graph->get_top_label_signatures(
+            auto label_counts = dense(anno_graph->get_top_label_signatures(
                 sequences[i],
                 results[i].size() + 1,
                 percentages[m] + 1e-9
-            );
+            ));
             ASSERT_GE(results[i].size() + 1, label_counts.size());
             std::sort(label_counts.begin(), label_counts.end(), comp);
             EXPECT_EQ(VectorSignature(results[i].begin(), results[i].begin() + m - 1),
@@ -1891,158 +1890,132 @@ TYPED_TEST(AnnotatedDBGNoNTest, get_top_labels) {
 }
 #endif
 
-TEST(AnnotatedDBG, score_kmer_presence_mask) {
-    auto anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(31, {}, {});
-    std::vector<std::pair<sdsl::bit_vector, int32_t>> results {
-       { sdsl::bit_vector(), 0},
-       { sdsl::bit_vector({
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }), 0 },
-       { sdsl::bit_vector({
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }), 97 },
-       { sdsl::bit_vector({
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1, 1, 1, 1, 1, 1, 1, 1, 1 }), 924 },
-       { sdsl::bit_vector({
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }), 0 },
-       { sdsl::bit_vector({
-          0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0,
-          1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-          1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1,
-          0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1,
-          0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1,
-          0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0,
-          1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0,
-          1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0,
-          0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0,
-          1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
-          0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0,
-          1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1,
-          1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0,
-          0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1,
-          1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1,
-          1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0,
-          0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0,
-          0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1,
-          0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1,
-          1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0,
-          0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0,
-          0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0,
-          0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0,
-          0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
-          1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1,
-          0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1,
-          0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1,
-          1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0,
-          1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0,
-          1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1,
-          0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1,
-          0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1,
-          0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0,
-          1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0,
-          0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1,
-          0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1 }), 869 },
-       { sdsl::bit_vector({
-          1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1,
-          0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0,
-          1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-          0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1,
-          0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0,
-          0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0,
-          0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0,
-          0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
-          0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1,
-          0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0,
-          1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0,
-          1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1,
-          1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0,
-          1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0,
-          0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1,
-          1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1,
-          1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0,
-          1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1,
-          1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1,
-          1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-          0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0,
-          1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-          1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0,
-          0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0,
-          0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0,
-          0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0,
-          0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1,
-          1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0,
-          1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0,
-          0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-          1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
-          1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1,
-          0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1,
-          1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1,
-          0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0,
-          1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1 }), 822 }
+// `RowDiff<RowDisk>` can load via either `sdsl::shared_mapper_ifstream` or
+// `utils::named_ifstream`. Verify both paths produce the same query results.
+TEST(RowDiffDiskAnnotatorTest, LoadConsistentAcrossMmapSettings) {
+    const std::vector<std::string> sequences {
+        std::string(80, 'A') + std::string(5, 'C'),
+        std::string(80, 'T') + std::string(5, 'G'),
+        std::string(80, 'G') + std::string(5, 'A'),
+    };
+    const std::vector<std::string> labels { "First", "Second", "Third" };
+    constexpr size_t k = 7;
+
+    const bool mmap_orig = utils::with_mmap();
+
+    utils::set_mmap(true);
+    auto anno_mmap = build_anno_graph<DBGSuccinct, annot::RowDiffDiskAnnotator>(
+            k, sequences, labels);
+
+    utils::set_mmap(false);
+    auto anno_plain = build_anno_graph<DBGSuccinct, annot::RowDiffDiskAnnotator>(
+            k, sequences, labels);
+
+    utils::set_mmap(mmap_orig);
+
+    ASSERT_NE(nullptr, anno_mmap);
+    ASSERT_NE(nullptr, anno_plain);
+
+    auto labels_per_node = [](const AnnotatedDBG &g, const std::string &seq) {
+        std::vector<std::set<std::string>> result;
+        for (auto idx : map_to_nodes(g.get_graph(), seq)) {
+            EXPECT_NE(SequenceGraph::npos, idx);
+            result.push_back(convert_to_set(g.get_labels(idx)));
+        }
+        return result;
     };
 
-    size_t i = 0;
-    for (const auto &[vector, score] : results) {
-        EXPECT_EQ(score, anno_graph->score_kmer_presence_mask(vector)) << i;
-        ++i;
+    for (const auto &seq : sequences) {
+        EXPECT_EQ(labels_per_node(*anno_mmap, seq),
+                  labels_per_node(*anno_plain, seq));
     }
+}
+
+// `IntRowDisk::load` supports both mmap and non-mmap paths; verify they
+// produce the same row reads from a freshly serialized matrix.
+TEST(IntRowDiskTest, LoadConsistentAcrossMmapSettings) {
+    using mtg::annot::matrix::IntRowDisk;
+    using mtg::annot::matrix::IntMatrix;
+    using mtg::annot::matrix::BinaryMatrix;
+
+    const std::string fname = test_dump_dir() + "/test_int_row_disk.bin";
+    { std::ofstream tmp(fname, std::ios::binary | std::ios::trunc); }
+
+    std::vector<IntMatrix::RowValues> input_rows = {
+        { { 0, 5 }, { 2, 7 } },
+        { { 1, 3 } },
+        { { 0, 1 }, { 1, 2 }, { 2, 4 } },
+    };
+    constexpr uint64_t num_set_bits = 6;
+    constexpr uint8_t  max_val = 7;
+    constexpr uint64_t num_cols = 3;
+
+    IntRowDisk::serialize(fname,
+        [&](std::function<void(const IntMatrix::RowValues &)> write_row) {
+            for (const auto &row : input_rows) write_row(row);
+        },
+        num_cols, input_rows.size(), num_set_bits, max_val);
+
+    auto query = [&](bool mmap) {
+        const bool orig = utils::with_mmap();
+        utils::set_mmap(mmap);
+        auto in = utils::open_ifstream(fname);
+        IntRowDisk d;
+        EXPECT_TRUE(d.load(*in));
+        std::vector<BinaryMatrix::Row> all_rows(input_rows.size());
+        std::iota(all_rows.begin(), all_rows.end(), 0u);
+        auto got = d.get_row_values(all_rows);
+        utils::set_mmap(orig);
+        return got;
+    };
+
+    EXPECT_EQ(input_rows, query(true));
+    EXPECT_EQ(input_rows, query(false));
+}
+
+// `CoordRowDisk::load` reads `num_attributes_` from the boundary stream
+// after loading `boundary_`; verify mmap on/off paths are consistent.
+TEST(CoordRowDiskTest, LoadConsistentAcrossMmapSettings) {
+    using mtg::annot::matrix::CoordRowDisk;
+    using mtg::annot::matrix::MultiIntMatrix;
+    using mtg::annot::matrix::BinaryMatrix;
+    using Tuple = MultiIntMatrix::Tuple;
+
+    const std::string fname = test_dump_dir() + "/test_coord_row_disk.bin";
+    { std::ofstream tmp(fname, std::ios::binary | std::ios::trunc); }
+
+    std::vector<MultiIntMatrix::RowTuples> input_rows = {
+        { { 0, Tuple{ 5, 8 } }, { 2, Tuple{ 7 } } },
+        { { 1, Tuple{ 3 } } },
+        { { 0, Tuple{ 1 } }, { 1, Tuple{ 2, 4 } } },
+    };
+    constexpr uint64_t num_set_bits    = 5;  // total (col, Tuple) pairs
+    constexpr uint64_t num_values      = 7;  // total tuple elements
+    constexpr uint64_t max_val         = 8;
+    constexpr uint64_t max_tuple_size  = 2;
+    constexpr uint64_t num_cols        = 3;
+
+    CoordRowDisk::serialize(fname,
+        [&](std::function<void(const MultiIntMatrix::RowTuples &)> write_row) {
+            for (const auto &row : input_rows) write_row(row);
+        },
+        num_cols, input_rows.size(), num_set_bits, num_values, max_val, max_tuple_size);
+
+    auto query = [&](bool mmap) {
+        const bool orig = utils::with_mmap();
+        utils::set_mmap(mmap);
+        auto in = utils::open_ifstream(fname);
+        CoordRowDisk d;
+        EXPECT_TRUE(d.load(*in));
+        std::vector<BinaryMatrix::Row> all_rows(input_rows.size());
+        std::iota(all_rows.begin(), all_rows.end(), 0u);
+        auto got = d.get_row_tuples(all_rows);
+        utils::set_mmap(orig);
+        return got;
+    };
+
+    EXPECT_EQ(input_rows, query(true));
+    EXPECT_EQ(input_rows, query(false));
 }
 
 } // namespace

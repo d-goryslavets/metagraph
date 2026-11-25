@@ -1,6 +1,8 @@
 #ifndef __BOSS_HPP__
 #define __BOSS_HPP__
 
+#include <memory>
+#include <span>
 #include <type_traits>
 
 #include "common/vectors/bit_vector.hpp"
@@ -81,6 +83,7 @@ class BOSS {
     // Traverse graph mapping k-mers from sequence to the graph edges
     // and run callback for each edge until the termination condition is satisfied
     // Invokes #callback with npos if a k-mer can't be mapped to the graph edges
+    // or if #skip returns true for it (#skip is called once per k-mer)
     void map_to_edges(std::string_view sequence,
                       const std::function<void(edge_index)> &callback,
                       const std::function<bool()> &terminate = ALWAYS_FALSE,
@@ -97,6 +100,35 @@ class BOSS {
     // |seq_encoded| must have no sentinels (zeros)
     std::vector<edge_index>
     map_to_edges(const std::vector<TAlphabet> &seq_encoded) const;
+
+    // Pull-based form of map_to_edges: each next() returns the edge of the next
+    // (k+1)-mer of |sequence|, or npos if it is missing, invalid, or skipped.
+    class EdgeStream {
+      public:
+        EdgeStream(const BOSS &boss, std::string_view sequence,
+                   std::function<bool()> skip = {});
+        // |seq_encoded| must have no sentinels (zeros) and outlive the stream
+        EdgeStream(const BOSS &boss, std::span<const TAlphabet> seq_encoded,
+                   std::function<bool()> skip = {});
+
+        EdgeStream(const EdgeStream&) = delete;
+        EdgeStream& operator=(const EdgeStream&) = delete;
+
+        bool done() const { return i_ + boss_->k_ + 1 > seq_.size(); }
+        edge_index next();
+
+      private:
+        EdgeStream(const BOSS &boss, std::vector<TAlphabet>&& seq_encoded,
+                   std::function<bool()> skip);
+
+        const BOSS *boss_;
+        std::vector<TAlphabet> owned_seq_;
+        std::span<const TAlphabet> seq_;
+        std::vector<bool> invalid_;
+        std::function<bool()> skip_;
+        size_t i_ = 0;
+        edge_index edge_ = 0;
+    };
 
     template <class... T>
     using Call = typename std::function<void(T...)>;
@@ -161,7 +193,7 @@ class BOSS {
         // make one traversal step
         edge = fwd(edge);
         // pick the row-diff successor
-        if (&rd_succ != last_ && !get_last(edge - 1)) {
+        if (&rd_succ != last_.get() && !get_last(edge - 1)) {
             while (!rd_succ[edge]) {
                 assert(edge > 0);
                 edge--;
@@ -496,31 +528,33 @@ class BOSS {
     static constexpr size_t kSentinel = '$';
 
   private:
+    friend struct BOSSConstructTestAccess;
+
     const mtg::kmer::KmerExtractorBOSS kmer_extractor_;
     const size_t bits_per_char_W_;
 
     // k-mer size
     size_t k_;
     // the bit array indicating the last outgoing edge of a node
-    bit_vector *last_;
+    std::unique_ptr<bit_vector> last_;
     // offsets for the boss edges with a given penultimate character
     // F_[c] points to the last boss edge with its penultimate character < c
     std::vector<edge_index> F_;
     // node offsets: NF_[c] = rank_last(F_[c]), a helper array
     std::vector<node_index> NF_;
     // the array containing the edge labels
-    wavelet_tree *W_;
+    std::unique_ptr<wavelet_tree> W_;
 
     State state = State::DYN;
 
     size_t indexed_suffix_length_ = 0;
     // Range (begin[i], end[i]) is represented as (select[2i+1]-2i, select[2i+2]-2i-1)
-    // Use sdsl::sd_vector<> instead of bit_vector_sd to ensure it's not inverted
+    // Use mtg::detail::sd_storage instead of bit_vector_sd to ensure it's not inverted
     // even if dense, so the select queries are fast.
-    sdsl::sd_vector<> indexed_suffix_ranges_;
-    sdsl::sd_vector<>::rank_1_type indexed_suffix_ranges_rk1_;
-    sdsl::sd_vector<>::select_1_type indexed_suffix_ranges_slct1_;
-    sdsl::sd_vector<>::select_0_type indexed_suffix_ranges_slct0_;
+    mtg::detail::sd_storage indexed_suffix_ranges_;
+    mtg::detail::sd_storage::rank_1_type indexed_suffix_ranges_rk1_;
+    mtg::detail::sd_storage::select_1_type indexed_suffix_ranges_slct1_;
+    mtg::detail::sd_storage::select_0_type indexed_suffix_ranges_slct0_;
 
     inline uint64_t get_suffix_range(uint64_t i) const { return indexed_suffix_ranges_slct1_(i + 1) - i; }
 
@@ -614,7 +648,7 @@ class BOSS {
      * Make suffix ranges strictly increasing and build a compressed sd_vector, where
      * select queries can be used to recover the original range values via get_suffix_range().
      */
-    static sdsl::sd_vector<> build_suffix_ranges_sd(std::vector<edge_index>&& ranges,
+    static mtg::detail::sd_storage build_suffix_ranges_sd(std::vector<edge_index>&& ranges,
                                                     uint64_t num_edges);
 
   public:

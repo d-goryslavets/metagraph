@@ -8,6 +8,7 @@
 #include <vector>
 #include <queue>
 #include <deque>
+#include <span>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -40,7 +41,7 @@ template <typename T>
 struct has_get_row_tuples_labelled<
     T,
     std::void_t<decltype(std::declval<const T&>().get_row_tuples_labelled(
-        std::declval<const std::vector<BinaryMatrix::Row>&>(),
+        std::declval<std::span<const BinaryMatrix::Row>>(),
         std::declval<const std::unordered_set<BinaryMatrix::Column>&>(),
         std::declval<size_t>()))>> : std::true_type {};
 
@@ -86,13 +87,10 @@ class TupleRowDiff : public ITupleRowDiff, public IRowDiff, public BinaryMatrix,
     TupleRowDiff(const graph::DeBruijnGraph *graph = nullptr, Args&&... args)
         : diffs_(std::forward<Args>(args)...) { graph_ = graph; }
 
-    TupleRowDiff() {}
-
-    // TupleRowDiff(const graph::DBGSuccinct *graph, BaseMatrix&& diff)
-    //     : diffs_(std::move(diff)) { graph_ = graph; }
-
-    std::vector<Row> get_column(Column j) const override;
-    std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows) const override;
+    std::vector<Row> get_column(Column column) const override {
+        return get_column_from_rows(*this, column);
+    }
+    std::vector<SetBitPositions> get_rows(std::span<const Row> rows) const override;
     RowTuples get_row_tuples(Row i) const;
 
     /** Returns all labeled traces that pass through a given row.
@@ -130,13 +128,20 @@ class TupleRowDiff : public ITupleRowDiff, public IRowDiff, public BinaryMatrix,
     // no deduplication: see class comment on RowDiff::get_rows_dict (speed vs limited size win)
     std::vector<SetBitPositions>
     get_rows_dict(std::vector<Row> *rows, size_t num_threads) const override;
-    std::vector<RowValues> get_row_values(const std::vector<Row> &rows,
+    std::vector<RowValues> get_row_values(std::span<const Row> rows,
                                           size_t num_threads = 1) const override;
-    std::vector<RowTuples> get_row_tuples(const std::vector<Row> &rows,
+    std::vector<RowTuples> get_row_tuples(std::span<const Row> rows,
                                           size_t num_threads = 1) const override;
+    bool get_row_tuples_cached(std::span<const Row> rows, RowDiffCache<RowTuples> &cache,
+                               std::vector<RowTuples> *out) const override {
+        *out = decode_rows_cached(rows, cache,
+            [this](std::span<const Row> rd_ids) { return diffs_.get_row_tuples(rd_ids, 1); },
+            add_diff, decode_diffs);
+        return true;
+    }
 
     // used in read extraction query to limit decompression to samples of interest only
-    std::vector<RowTuples> get_row_tuples_labelled(const std::vector<Row> &rows, 
+    std::vector<RowTuples> get_row_tuples_labelled(std::span<const Row> rows, 
                                                   const std::unordered_set<Column> &labels_of_interest, 
                                                   size_t num_threads = 1) const;
 
@@ -251,30 +256,11 @@ class TupleRowDiff : public ITupleRowDiff, public IRowDiff, public BinaryMatrix,
 
 
 template <class BaseMatrix>
-std::vector<BinaryMatrix::Row> TupleRowDiff<BaseMatrix>::get_column(Column j) const {
-    assert(graph_ && "graph must be loaded");
-    assert(diffs_.num_rows() == graph_->max_index());
-    assert(anchor_.size() == diffs_.num_rows() && "anchors must be loaded");
-
-    assert(!fork_succ_.size() || fork_succ_.size() == graph_->max_index() + 1);
-
-    // TODO: implement a more efficient algorithm
-    std::vector<Row> result;
-    graph_->call_nodes([&](auto node) {
-        auto i = graph::AnnotatedDBG::graph_to_anno_index(node);
-        SetBitPositions set_bits = get_rows({ i })[0];
-        if (std::binary_search(set_bits.begin(), set_bits.end(), j))
-            result.push_back(i);
-    });
-    return result;
-}
-
-template <class BaseMatrix>
 std::vector<BinaryMatrix::SetBitPositions>
-TupleRowDiff<BaseMatrix>::get_rows(const std::vector<Row> &row_ids) const {
+TupleRowDiff<BaseMatrix>::get_rows(std::span<const Row> row_ids) const {
     std::vector<SetBitPositions> rows(row_ids.size());
     call_rows(row_ids,
-        [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+        [this](std::span<const Row> rd_ids, size_t num_threads) {
             return diffs_.get_row_tuples(rd_ids, num_threads);
         },
         add_diff, decode_diffs,
@@ -289,7 +275,7 @@ std::vector<BinaryMatrix::SetBitPositions>
 TupleRowDiff<BaseMatrix>::get_rows_dict(std::vector<Row> *rows, size_t num_threads) const {
     std::vector<SetBitPositions> rows_dict(rows->size());
     call_rows(*rows,
-        [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+        [this](std::span<const Row> rd_ids, size_t num_threads) {
             return diffs_.get_row_tuples(rd_ids, num_threads);
         },
         add_diff, decode_diffs,
@@ -304,10 +290,10 @@ TupleRowDiff<BaseMatrix>::get_rows_dict(std::vector<Row> *rows, size_t num_threa
 
 template <class BaseMatrix>
 std::vector<MultiIntMatrix::RowValues>
-TupleRowDiff<BaseMatrix>::get_row_values(const std::vector<Row> &row_ids, size_t num_threads) const {
+TupleRowDiff<BaseMatrix>::get_row_values(std::span<const Row> row_ids, size_t num_threads) const {
     std::vector<RowValues> rows(row_ids.size());
     call_rows(row_ids,
-        [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+        [this](std::span<const Row> rd_ids, size_t num_threads) {
             return diffs_.get_row_tuples(rd_ids, num_threads);
         },
         add_diff, decode_diffs,
@@ -330,10 +316,10 @@ MultiIntMatrix::RowTuples TupleRowDiff<BaseMatrix>::get_row_tuples(Row row) cons
 
 template <class BaseMatrix>
 std::vector<MultiIntMatrix::RowTuples>
-TupleRowDiff<BaseMatrix>::get_row_tuples(const std::vector<Row> &row_ids, size_t num_threads) const {
+TupleRowDiff<BaseMatrix>::get_row_tuples(std::span<const Row> row_ids, size_t num_threads) const {
     std::vector<RowTuples> rows(row_ids.size());
     call_rows(row_ids,
-        [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+        [this](std::span<const Row> rd_ids, size_t num_threads) {
             return diffs_.get_row_tuples(rd_ids, num_threads);
         },
         add_diff, decode_diffs,
@@ -346,16 +332,16 @@ TupleRowDiff<BaseMatrix>::get_row_tuples(const std::vector<Row> &row_ids, size_t
 template <class BaseMatrix>
 std::vector<MultiIntMatrix::RowTuples>
 TupleRowDiff<BaseMatrix>::get_row_tuples_labelled(
-        const std::vector<Row> &row_ids,
+        std::span<const Row> row_ids,
         const std::unordered_set<Column> &labels_of_interest,
         size_t num_threads) const {
     if constexpr (has_get_row_tuples_labelled<BaseMatrix>::value) {
         std::vector<RowTuples> rows(row_ids.size());
         call_rows(row_ids,
-            [this, &labels_of_interest](const std::vector<Row> &rd_ids, size_t num_threads) {
+            [this, &labels_of_interest](std::span<const Row> rd_ids, size_t num_threads) {
                 return diffs_.get_row_tuples_labelled(rd_ids, labels_of_interest, num_threads);
             },
-            [this, &labels_of_interest](const RowTuples &diff, RowTuples *row) {
+            [&labels_of_interest](const RowTuples &diff, RowTuples *row) {
                 return add_diff_labelled(diff, row, labels_of_interest);
             },
             decode_diffs,
@@ -373,7 +359,12 @@ template <class BaseMatrix>
 bool TupleRowDiff<BaseMatrix>::load(std::istream &in) {
     std::string version(4, '\0');
     in.read(version.data(), 4);
-    return anchor_.load(in) && fork_succ_.load(in) && diffs_.load(in);
+    auto anchor_start = in.tellg();
+    if (!anchor_.load(in) || !fork_succ_.load(in))
+        return false;
+    // anchor_ / fork_succ_ are accessed randomly, hint the kernel.
+    utils::madvise_random_range(in, anchor_start, in.tellg() - anchor_start);
+    return diffs_.load(in);
 }
 
 template <class BaseMatrix>
@@ -528,16 +519,15 @@ std::unordered_set<BinaryMatrix::Column> TupleRowDiff<BaseMatrix>
     for (size_t query_row_i = 0; query_row_i < i.size() - 1; ++query_row_i) {
         graph::AnnotatedSequenceGraph::node_index row_to_graph = graph::AnnotatedSequenceGraph::anno_to_graph_index(i[query_row_i]);
         bool edge_to_next = false;
-        graph_->call_outgoing_kmers(row_to_graph, [&](auto next, char c) {
-                if (c == graph::boss::BOSS::kSentinel)
-                    return;
-                // add adjacent outgoing nodes to the stack for further traversal
-                Row next_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
-                if (next_to_anno == i[query_row_i + 1]) {
-                    edge_to_next = true;
-                    return;
-                }
-            } );
+        for (auto [next, c] : graph_->outgoing_kmers(row_to_graph)) {
+            if (c == graph::boss::BOSS::kSentinel)
+                continue;
+            Row next_to_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
+            if (next_to_anno == i[query_row_i + 1]) {
+                edge_to_next = true;
+                break;
+            }
+        }
         if (!edge_to_next) return {}; // no path in the graph matching the query
     }
 
@@ -835,14 +825,8 @@ void TupleRowDiff<BaseMatrix>
             auto cur_node = graph::AnnotatedSequenceGraph::anno_to_graph_index(it->second);
 
             // check if an edge exists between the current and next node
-            bool edge_exists = false;
-
-            graph_->adjacent_outgoing_nodes(prev_node, [&](auto adj_node) {
-                if (adj_node == cur_node) {
-                    edge_exists = true;
-                    return;
-                }
-            });
+            const auto next_nodes = graph_->adjacent_outgoing_nodes(prev_node);
+            bool edge_exists = std::ranges::find(next_nodes, cur_node) != next_nodes.end();
 
             bool contiguous = 
                 (cur_coord == (prev_coord + SHIFT)) && edge_exists;
@@ -874,14 +858,8 @@ void TupleRowDiff<BaseMatrix>
                 graph::AnnotatedSequenceGraph::anno_to_graph_index(rit->second);
 
             // check if an edge exists between the current and next rev node
-            bool edge_exists = false;
-
-            graph_->adjacent_incoming_nodes(prev_node_rev, [&](auto adj_node) {
-                if (adj_node == cur_node) {
-                    edge_exists = true;
-                    return;
-                }
-            });
+            const auto prev_nodes = graph_->adjacent_incoming_nodes(prev_node_rev);
+            bool edge_exists = std::ranges::find(prev_nodes, cur_node) != prev_nodes.end();
 
             bool contiguous = 
                 (cur_coord == (prev_coord_rev - SHIFT)) && edge_exists;
@@ -934,21 +912,11 @@ void TupleRowDiff<BaseMatrix>
             while (map.count(cur_c + shift_direction * SHIFT)) {
                 auto potential_boundary_node = graph::AnnotatedSequenceGraph::anno_to_graph_index(map.at(cur_c + shift_direction * SHIFT));
 
-                bool edge_exists = false;
+                const auto adj_nodes = forward
+                    ? graph_->adjacent_outgoing_nodes(boundary_node)
+                    : graph_->adjacent_incoming_nodes(boundary_node);
 
-                auto expand = [&](auto adj_node) {
-                    if (adj_node == potential_boundary_node) {
-                        edge_exists = true;
-                        return;
-                    }
-                };
-
-                if (forward)
-                    graph_->adjacent_outgoing_nodes(boundary_node, expand);
-                else
-                    graph_->adjacent_incoming_nodes(boundary_node, expand);
-
-                if (edge_exists) {
+                if (std::ranges::find(adj_nodes, potential_boundary_node) != adj_nodes.end()) {
                     boundary_node = potential_boundary_node;
                     update_boundary = true;
                     cur_c += shift_direction * SHIFT;
@@ -993,23 +961,22 @@ void TupleRowDiff<BaseMatrix>
         for (uint64_t c : coords) {
             auto boundary_node = graph::AnnotatedSequenceGraph::anno_to_graph_index(paths.at(col).at(c));
 
-            auto expand = [&](auto next, char c) {
-                if (c != graph::boss::BOSS::kSentinel) {
-                    Row next_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
+            const auto adj_kmers = forward
+                ? graph_->outgoing_kmers(boundary_node)
+                : graph_->incoming_kmers(boundary_node);
 
-                    // if there is at least one unvisited node at the branching point
-                    // we will traverse the graph more
-                    if (!visited.count(next_anno)) {
-                        queue.push_front(next_anno);
-                        traverse_more = true; // the read possibly is not fully traversed yet
-                    }
+            for (auto [next, edge_char] : adj_kmers) {
+                if (edge_char == graph::boss::BOSS::kSentinel)
+                    continue;
+
+                Row next_anno = graph::AnnotatedSequenceGraph::graph_to_anno_index(next);
+
+                // if there is at least one unvisited node at the branching point
+                // we will traverse the graph more
+                if (!visited.count(next_anno)) {
+                    queue.push_front(next_anno);
+                    traverse_more = true; // the read possibly is not fully traversed yet
                 }
-            };
-
-            if (forward) {
-                graph_->call_outgoing_kmers(boundary_node, expand);
-            } else {
-                graph_->call_incoming_kmers(boundary_node, expand);
             }
         }
         

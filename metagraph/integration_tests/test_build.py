@@ -5,6 +5,7 @@ from subprocess import PIPE
 from tempfile import TemporaryDirectory
 import glob
 import os
+import resource
 from base import PROTEIN_MODE, DNA_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, graph_file_extension
 
 
@@ -26,11 +27,21 @@ class TestBuild(TestingBase):
     def setUp(self):
         self.tempdir = TemporaryDirectory()
 
+    def test_default_k(self):
+        graph = os.path.join(self.tempdir.name, 'default')
+        fasta = os.path.join(TEST_DATA_DIR, 'genome.MT.fa')
+        subprocess.run(f'{METAGRAPH} build -o {graph} {fasta}', shell=True, check=True)
+        stats = self._get_stats(graph + '.dbg')
+        alphabet = os.path.basename(os.readlink(os.path.join(os.getcwd(), 'metagraph')))
+        expected = {'metagraph_DNA': '31', 'metagraph_DNA5': '21',
+                    'metagraph_DNA_CASE_SENSITIVE': '15', 'metagraph_Protein': '12'}
+        self.assertEqual(stats['k'], expected[alphabet])
+
     @parameterized.expand([repr for repr in BUILDS if not (repr == 'bitmap' and PROTEIN_MODE)])
     def test_simple_all_graphs(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy --graph {repr} --disk-swap {tmp_dir} -k 20 -o {outfile} {input}'.format(
+        construct_command = '{exe} build --mask-dummy --in-ram --graph {repr} --disk-swap {tmp_dir} -k 20 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
             tmp_dir=tmp_dir,
@@ -47,10 +58,36 @@ class TestBuild(TestingBase):
         self.assertEqual('591997', stats_graph['nodes (k)'])
         self.assertEqual('basic', stats_graph['mode'])
 
+    @parameterized.expand([('soft', False), ('soft_and_hard', True)])
+    @unittest.skipIf(PROTEIN_MODE, "Contigs from a DNA graph")
+    def test_sshash_low_open_file_limit(self, _, lower_hard):
+        """Each of 32 threads writes a sorted SSHash run, more than the limit allows open.
+        A low soft limit is raised at startup; a low hard limit needs SSHash's bounded merge."""
+        construct_command = f'{METAGRAPH} build -k 20 -o {self.tempdir.name}/graph \
+                                {TEST_DATA_DIR}/transcripts_1000.fa'
+        self.assertEqual(subprocess.run([construct_command], shell=True).returncode, 0)
+        transform_command = f'{METAGRAPH} transform --to-fasta -o {self.tempdir.name}/contigs \
+                                {self.tempdir.name}/graph.dbg'
+        self.assertEqual(subprocess.run([transform_command], shell=True).returncode, 0)
+
+        def lower_limit():
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (24, 24 if lower_hard else hard))
+
+        construct_command = f'{METAGRAPH} build --graph sshash -k 20 -p 32 \
+                                --disk-swap {self.tempdir.name} -o {self.tempdir.name}/graph \
+                                {self.tempdir.name}/contigs.fasta.gz'
+        res = subprocess.run([construct_command], shell=True, preexec_fn=lower_limit)
+        self.assertEqual(res.returncode, 0)
+
+        stats_graph = self._get_stats(self.tempdir.name + '/graph.sshashdbg')
+        self.assertEqual(stats_graph['returncode'], 0)
+        self.assertEqual('591997', stats_graph['nodes (k)'])
+
     @parameterized.expand(succinct_states)
-    def test_build_succinct_inplace(self, state):
+    def test_build_succinct_in_ram(self, state):
         construct_command = f'{METAGRAPH} build -k 20 --graph succinct --state {state} \
-                                            --inplace \
+                                            --in-ram \
                                             -o {self.tempdir.name}/graph \
                                             {TEST_DATA_DIR}/transcripts_1000.fa'
 
@@ -68,7 +105,7 @@ class TestBuild(TestingBase):
     def test_simple_bloom_graph(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy --graph {repr} --disk-swap {tmp_dir} -k 20 -o {outfile} {input}'.format(
+        construct_command = '{exe} build --mask-dummy --in-ram --graph {repr} --disk-swap {tmp_dir} -k 20 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
             tmp_dir=tmp_dir,
@@ -112,7 +149,7 @@ class TestBuild(TestingBase):
         """
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy \
+        construct_command = '{exe} build --mask-dummy --in-ram \
                 --graph {repr} --mode canonical -k 20 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
@@ -134,7 +171,7 @@ class TestBuild(TestingBase):
     def test_build_tiny_k(self, build):
         representation, tmp_dir = build_params[build]
 
-        args = [METAGRAPH, 'build', '--mask-dummy', '--graph', representation,
+        args = [METAGRAPH, 'build', '--mask-dummy --in-ram', '--graph', representation,
                 '-k', '2',
                 '--disk-swap', tmp_dir,
                 '-o', self.tempdir.name + '/graph',
@@ -156,7 +193,7 @@ class TestBuild(TestingBase):
     def test_build_tiny_k_canonical(self, build):
         representation, tmp_dir = build_params[build]
 
-        args = [METAGRAPH, 'build', '--mask-dummy', '--graph', representation, '--mode canonical',
+        args = [METAGRAPH, 'build', '--mask-dummy --in-ram', '--graph', representation, '--mode canonical',
                 '-k', '2',
                 '--disk-swap', tmp_dir,
                 '-o', self.tempdir.name + '/graph',
@@ -176,7 +213,7 @@ class TestBuild(TestingBase):
     def test_build_tiny_k_parallel(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = f'{METAGRAPH} build --mask-dummy --graph {representation} \
+        construct_command = f'{METAGRAPH} build --mask-dummy --in-ram --graph {representation} \
                                 -k 2 -p 100 --disk-swap {tmp_dir} \
                                 -o {self.tempdir.name}/graph \
                                 {TEST_DATA_DIR}/transcripts_1000.fa'
@@ -196,7 +233,7 @@ class TestBuild(TestingBase):
     def test_build_tiny_k_parallel_canonical(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = f'{METAGRAPH} build --mask-dummy --graph {representation} \
+        construct_command = f'{METAGRAPH} build --mask-dummy --in-ram --graph {representation} \
                                 --mode canonical \
                                 -k 2 -p 100 --disk-swap {tmp_dir} \
                                 -o {self.tempdir.name}/graph \
@@ -215,7 +252,7 @@ class TestBuild(TestingBase):
     def test_build_from_kmc(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy --graph {repr} --disk-swap {tmp_dir} -k 11 -o {outfile} {input}'.format(
+        construct_command = '{exe} build --mask-dummy --in-ram --graph {repr} --disk-swap {tmp_dir} -k 11 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
             tmp_dir=tmp_dir,
@@ -236,7 +273,7 @@ class TestBuild(TestingBase):
     def test_build_from_kmc_both(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy --graph {repr} --disk-swap {tmp_dir} -k 11 -o {outfile} {input}'.format(
+        construct_command = '{exe} build --mask-dummy --in-ram --graph {repr} --disk-swap {tmp_dir} -k 11 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
             tmp_dir=tmp_dir,
@@ -258,7 +295,7 @@ class TestBuild(TestingBase):
     def test_build_from_kmc_canonical(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy \
+        construct_command = '{exe} build --mask-dummy --in-ram \
                 --graph {repr} --disk-swap {tmp_dir} --mode canonical -k 11 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
@@ -281,7 +318,7 @@ class TestBuild(TestingBase):
     def test_build_from_kmc_both_canonical(self, build):
         representation, tmp_dir = build_params[build]
 
-        construct_command = '{exe} build --mask-dummy \
+        construct_command = '{exe} build --mask-dummy --in-ram \
                 --graph {repr} --disk-swap {tmp_dir} --mode canonical -k 11 -o {outfile} {input}'.format(
             exe=METAGRAPH,
             repr=representation,
@@ -306,7 +343,7 @@ class TestBuild(TestingBase):
 
         # Build chunks
         for suffix in ['$', 'A', 'C', 'G', 'T']:
-            construct_command = '{exe} build --mask-dummy --disk-swap {tmp_dir} \
+            construct_command = '{exe} build --mask-dummy --in-ram --disk-swap {tmp_dir} \
                                 --graph {repr} -k 11 --suffix {suffix} -o {outfile} {input}'.format(
                 exe=METAGRAPH,
                 repr=representation,
@@ -345,7 +382,7 @@ class TestBuild(TestingBase):
 
         # Build chunks
         for suffix in ['$', 'A', 'C', 'G', 'T']:
-            construct_command = '{exe} build --mask-dummy --disk-swap {tmp_dir} --graph {repr} --mode canonical -k 11 \
+            construct_command = '{exe} build --mask-dummy --in-ram --disk-swap {tmp_dir} --graph {repr} --mode canonical -k 11 \
                     --suffix {suffix} -o {outfile} {input}'.format(
                 exe=METAGRAPH,
                 repr=representation,

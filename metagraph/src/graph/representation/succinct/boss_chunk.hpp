@@ -18,6 +18,7 @@ namespace boss {
  */
 class BOSS::Chunk {
     friend BOSS;
+    friend struct BOSSConstructTestAccess;
 
   public:
     typedef uint8_t TAlphabet;
@@ -106,7 +107,7 @@ class BOSS::Chunk {
     std::vector<uint64_t> F_;
     sdsl::int_vector_buffer<> weights_;
     size_t indexed_suffix_length_ = 0;
-    sdsl::sd_vector<> indexed_suffix_ranges_;
+    mtg::detail::sd_storage indexed_suffix_ranges_;
 };
 
 } // namespace boss

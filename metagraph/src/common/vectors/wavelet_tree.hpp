@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cassert>
 
+#include <sdsl/packed_vector_view.hpp>
+#include <sdsl/rank_support_v.hpp>
+#include <sdsl/select_support_mcl.hpp>
 #include <sdsl/wt_huff.hpp>
 #include <dynamic/dynamic.hpp>
 
@@ -50,7 +53,7 @@ class wavelet_tree {
 class wavelet_tree_sdsl_augmented : public wavelet_tree {
   public:
     virtual ~wavelet_tree_sdsl_augmented() {}
-    virtual const sdsl::int_vector<>& data() const = 0;
+    virtual const sdsl::packed_vector_view<0>& data() const = 0;
 };
 
 
@@ -90,11 +93,11 @@ class wavelet_tree_sdsl_fast : public wavelet_tree_sdsl_augmented {
 
     void clear();
 
-    sdsl::int_vector<> to_vector() const { return int_vector_; }
-    const sdsl::int_vector<>& data() const { return int_vector_; }
+    sdsl::int_vector<> to_vector() const { return int_vector_.to_owned(); }
+    const sdsl::packed_vector_view<0>& data() const { return int_vector_; }
 
   private:
-    sdsl::int_vector<> int_vector_;
+    sdsl::packed_vector_view<0> int_vector_;
     t_wt_sdsl wwt_;
     std::vector<uint64_t> count_;
 };
@@ -134,11 +137,11 @@ class partite_vector : public wavelet_tree_sdsl_augmented {
 
     void clear();
 
-    sdsl::int_vector<> to_vector() const { return int_vector_; }
-    const sdsl::int_vector<>& data() const { return int_vector_; }
+    sdsl::int_vector<> to_vector() const { return int_vector_.to_owned(); }
+    const sdsl::packed_vector_view<0>& data() const { return int_vector_; }
 
   private:
-    sdsl::int_vector<> int_vector_;
+    sdsl::packed_vector_view<0> int_vector_;
     std::vector<t_bv> bitmaps_;
 };
 
@@ -190,7 +193,7 @@ class wavelet_tree_sdsl : public wavelet_tree {
 
     template <class Vector>
     wavelet_tree_sdsl(uint8_t logsigma, const Vector &vector)
-      : wavelet_tree_sdsl(logsigma, t_wt_sdsl(vector)) {}
+      : wavelet_tree_sdsl(logsigma, t_wt_sdsl(vector.begin(), vector.end())) {}
 
     wavelet_tree_sdsl(uint8_t logsigma, const t_wt_sdsl &wwt)
       : wavelet_tree_sdsl(logsigma, t_wt_sdsl(wwt)) {}
@@ -223,9 +226,19 @@ class wavelet_tree_sdsl : public wavelet_tree {
 };
 
 
-typedef wavelet_tree_sdsl<> wavelet_tree_stat;
+namespace mtg::detail {
+// The bit vector and its rank and select samples are views, so a load from a
+// mapped file shares them instead of copying.
+using wt_huff_stat = sdsl::wt_huff<
+        sdsl::packed_vector_view<1>,
+        sdsl::rank_support_v<1, 1, sdsl::packed_vector_view<1>, sdsl::packed_vector_view>,
+        sdsl::select_support_mcl<1, 1, sdsl::packed_vector_view<1>, sdsl::packed_vector_view>,
+        sdsl::select_support_mcl<0, 1, sdsl::packed_vector_view<1>, sdsl::packed_vector_view>>;
+} // namespace mtg::detail
 
-typedef wavelet_tree_sdsl<sdsl::wt_huff<sdsl::rrr_vector<63>>> wavelet_tree_small;
+typedef wavelet_tree_sdsl<mtg::detail::wt_huff_stat> wavelet_tree_stat;
+
+typedef wavelet_tree_sdsl<sdsl::wt_huff<mtg::detail::rrr_storage<63>>> wavelet_tree_small;
 
 typedef partite_vector<> wavelet_tree_fast;
 
